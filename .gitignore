@@ -1,0 +1,5 @@
+# built binary (repo root)
+/pdbmux
+# cross-compiled artifacts (e.g. pdbmux-linux-amd64)
+/pdbmux-*
+dist/

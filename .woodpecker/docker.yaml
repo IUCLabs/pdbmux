@@ -1,0 +1,33 @@
+# Build and push the pdbmux container image on a v* tag. pdbmux is a k8s-only
+# daemon (deployed via GitOps), so it ships as an image. Mirrors the estate
+# convention: the woodpeckerci/plugin-docker-buildx plugin pushes to the Gitea
+# registry using the droneci / DRONECI_PASSWORD credentials.
+when:
+  - event: tag
+    ref: refs/tags/v*
+
+steps:
+  - name: docker
+    image: woodpeckerci/plugin-docker-buildx
+    settings:
+      registry: git.example.com
+      repo: registry.example.com/example/pdbmux
+      dockerfile: Dockerfile
+      build_args:
+        VERSION: ${CI_COMMIT_TAG}
+      username: droneci
+      password:
+        from_secret: DRONECI_PASSWORD
+      tags:
+        - ${CI_COMMIT_TAG}
+        - latest
+    backend_options:
+      kubernetes:
+        serviceAccountName: default
+        resources:
+          requests:
+            memory: 1Gi
+            cpu: 1
+          limits:
+            memory: 2Gi
+            cpu: 2
