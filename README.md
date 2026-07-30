@@ -124,7 +124,7 @@ estate direction — it is not shipped as a per-VM RPM/systemd service. The imag
 is built and pushed on every `v*` tag (the release pipeline) to:
 
 ```
-registry.example.com/example/pdbmux:<tag>
+registry.example.com/internal/pdbmux:<tag>
 ```
 
 It is a minimal static (`CGO_ENABLED=0`) binary on a distroless base
