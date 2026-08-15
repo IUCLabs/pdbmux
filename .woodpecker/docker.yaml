@@ -1,6 +1,6 @@
 # Build and push the pdbmux container image on a v* tag. pdbmux is a k8s-only
 # daemon (deployed via GitOps), so it ships as an image. Mirrors the estate
-# convention: the woodpeckerci/plugin-docker-buildx plugin pushes to the
+# convention: the CA-baked plugin-docker-buildx image pushes to the
 # internal docker registry (unauthenticated in-cluster push).
 when:
   - event: tag
@@ -8,7 +8,7 @@ when:
 
 steps:
   - name: docker
-    image: woodpeckerci/plugin-docker-buildx
+    image: registry.example.com/internal/plugin-docker-buildx:latest
     settings:
       registry: registry.example.com
       repo: registry.example.com/internal/pdbmux
