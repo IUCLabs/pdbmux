@@ -23,7 +23,6 @@ func main() {
 		cfg        Config
 		configPath string
 		listen     string
-		primary    string
 		merge      string
 	)
 
@@ -43,9 +42,6 @@ func main() {
 		}
 		if cmd.Flags().Changed("listen") {
 			cfg.Listen = listen
-		}
-		if cmd.Flags().Changed("primary") {
-			cfg.Primary = primary
 		}
 		if cmd.Flags().Changed("merge") {
 			cfg.Merge = merge
@@ -70,7 +66,6 @@ func main() {
 	pf := root.PersistentFlags()
 	pf.StringVar(&configPath, "config", "", "Config file path (overrides PDBMUX_CONFIG and the default search path)")
 	pf.StringVar(&listen, "listen", defaultListen, "HTTP listen address (overrides config and PDBMUX_LISTEN)")
-	pf.StringVar(&primary, "primary", "", "Primary backend name for non-merged pass-through")
 	pf.StringVar(&merge, "merge", mergeFreshness, "Facts merge strategy: freshness or static")
 
 	serveCmd := &cobra.Command{
@@ -132,8 +127,8 @@ func runServer(cfg Config) error {
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
-	logger.Printf("listening on %s (merge=%s primary=%s backends=%d)",
-		cfg.Listen, cfg.Merge, cfg.Primary, len(cfg.Backends))
+	logger.Printf("listening on %s (merge=%s backends=%d)",
+		cfg.Listen, cfg.Merge, len(cfg.Backends))
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -163,9 +158,7 @@ func printConfig(cfg Config) {
 		fmt.Printf("config file  : none loaded (searched %s)\n", strings.Join(configSearchPaths(), ", "))
 	}
 	fmt.Printf("listen       : %s\n", cfg.Listen)
-	fmt.Printf("primary      : %s\n", cfg.Primary)
 	fmt.Printf("merge        : %s\n", cfg.Merge)
-	fmt.Printf("prefer       : %s\n", cfg.Prefer)
 	fmt.Printf("timeout      : %s\n", durationString(cfg.Timeout))
 	fmt.Printf("freshness_ttl: %s\n", durationString(cfg.FreshnessTTL))
 	fmt.Println("backends:")

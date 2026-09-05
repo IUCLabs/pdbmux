@@ -9,7 +9,7 @@ import (
 	"strings"
 )
 
-// results must be ordered by precedence; a key func returning ok=false means the record has no identity and is always kept.
+// The first backend in results holding a key supplies the record; a key func returning ok=false means the record has no identity and is always kept.
 func mergeUnion(results []backendResult, key func(record) (string, bool)) []json.RawMessage {
 	seen := make(map[string]bool)
 	out := []json.RawMessage{}
@@ -65,7 +65,7 @@ func parseOrderBy(s string) ([]orderField, error) {
 	return out, nil
 }
 
-// Each backend ordered only its own slice, so the union is re-sorted here; stable, so ties keep backend precedence.
+// Each backend ordered only its own slice, so the union is re-sorted here; stable, so ties keep the merged set's existing order.
 func sortRecords(recs []json.RawMessage, order []orderField) {
 	if len(order) == 0 || len(recs) < 2 {
 		return

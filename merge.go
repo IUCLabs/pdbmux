@@ -49,7 +49,7 @@ func parseTimestamp(s string) time.Time {
 	return time.Time{}
 }
 
-// results must be ordered by precedence: ties keep the earlier backend's record.
+// Ties keep the earlier backend's record — a deterministic tie-break, not a preference.
 func mergeNodes(results []backendResult) []json.RawMessage {
 	type pick struct {
 		raw json.RawMessage
@@ -81,7 +81,7 @@ func mergeNodes(results []backendResult) []json.RawMessage {
 // certname -> name of the backend holding that node's newest report.
 type freshness map[string]string
 
-// results must be ordered by precedence: ties keep the earlier backend.
+// Ties keep the earlier backend — a deterministic tie-break, not a preference.
 func buildFreshness(results []backendResult) freshness {
 	type pick struct {
 		backend string
@@ -104,9 +104,9 @@ func buildFreshness(results []backendResult) freshness {
 	return f
 }
 
-// owner names the winning backend per certname; when it holds no facts for that certname, precedence order wins.
+// owner names the winning backend per certname; a nil owner (static merge), or one holding no facts for that certname, falls back to configured order.
 func mergeFacts(results []backendResult, owner func(certname string) string) []json.RawMessage {
-	present := map[string][]string{} // certname -> backend names, in precedence order
+	present := map[string][]string{} // certname -> backend names, in configured order
 	byKey := map[string][]json.RawMessage{}
 	for _, res := range results {
 		for _, rec := range res.records {
@@ -133,7 +133,10 @@ func mergeFacts(results []backendResult, owner func(certname string) string) []j
 	out := []json.RawMessage{}
 	for _, cn := range order {
 		backends := present[cn]
-		chosen := owner(cn)
+		chosen := ""
+		if owner != nil {
+			chosen = owner(cn)
+		}
 		if !contains(backends, chosen) {
 			chosen = backends[0]
 		}

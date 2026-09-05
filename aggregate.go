@@ -159,8 +159,9 @@ type sumGroup struct {
 // A row that is not a JSON object passes through untouched, as does the sole row
 // of a key only one backend reported — those keep their upstream bytes. An
 // aggregate column that is absent or non-numeric in a later row is left at the
-// first backend's value rather than being coerced to zero. results must be
-// ordered by precedence; output keeps first-seen order.
+// earlier backend's value rather than being coerced to zero. results come in
+// configured backend order and the output keeps first-seen order, a tie-break
+// only.
 func sumRows(results []backendResult, columns func(map[string]json.RawMessage) ([]string, []string)) []json.RawMessage {
 	type slot struct {
 		raw   json.RawMessage // passthrough row, when group is nil
@@ -237,7 +238,7 @@ func (g *sumGroup) encode() json.RawMessage {
 }
 
 // groupKey builds a row's identity from the named fields' verbatim JSON values.
-// Both backends run the same PuppetDB serialiser, so byte equality is a sound
+// Every backend runs the same PuppetDB serialiser, so byte equality is a sound
 // comparison for object-valued keys such as event-counts' subject. An absent
 // field is distinct from any present value.
 func groupKey(row map[string]json.RawMessage, keys []string) string {

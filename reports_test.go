@@ -8,17 +8,17 @@ import (
 )
 
 func TestMergeUnion_KeepsBothBackendsHistory(t *testing.T) {
-	old := recs(t, "old", report("h1", "r1", "2026-07-01T00:00:00Z"))
-	nw := recs(t, "new", report("h1", "r2", "2026-07-02T00:00:00Z"))
-	merged := mergeUnion([]backendResult{nw, old}, reportKey)
+	a := recs(t, "a", report("h1", "r1", "2026-07-01T00:00:00Z"))
+	b := recs(t, "b", report("h1", "r2", "2026-07-02T00:00:00Z"))
+	merged := mergeUnion([]backendResult{b, a}, reportKey)
 	if got := hashesOf(t, merged); !slices.Equal(got, []string{"r2", "r1"}) {
-		t.Errorf("union = %v, want both reports in precedence order", got)
+		t.Errorf("union = %v, want both reports in configured order", got)
 	}
 }
 
 func TestMergeUnion_DedupesSharedHash(t *testing.T) {
 	dup := report("h1", "r1", "2026-07-01T00:00:00Z")
-	merged := mergeUnion([]backendResult{recs(t, "new", dup), recs(t, "old", dup)}, reportKey)
+	merged := mergeUnion([]backendResult{recs(t, "b", dup), recs(t, "a", dup)}, reportKey)
 	if got := hashesOf(t, merged); !slices.Equal(got, []string{"r1"}) {
 		t.Errorf("union = %v, want a single r1", got)
 	}
@@ -27,9 +27,9 @@ func TestMergeUnion_DedupesSharedHash(t *testing.T) {
 func TestMergeUnion_HashlessRowsAreAllKept(t *testing.T) {
 	// extract/group_by queries return synthetic rows with no hash; dropping the
 	// second backend's rows as "duplicates" would silently lose half the data.
-	old := recs(t, "old", `{"status":"changed","count":3}`)
-	nw := recs(t, "new", `{"status":"changed","count":5}`)
-	merged := mergeUnion([]backendResult{old, nw}, reportKey)
+	a := recs(t, "a", `{"status":"changed","count":3}`)
+	b := recs(t, "b", `{"status":"changed","count":5}`)
+	merged := mergeUnion([]backendResult{a, b}, reportKey)
 	if len(merged) != 2 {
 		t.Errorf("expected both aggregate rows, got %d: %v", len(merged), merged)
 	}
@@ -39,7 +39,7 @@ func TestMergeUnion_IdenticalHashlessRowsAreNotCollapsed(t *testing.T) {
 	// Two backends can legitimately produce the same aggregate row; collapsing
 	// them as duplicates undercounts the merged result.
 	same := `{"status":"changed","count":1}`
-	merged := mergeUnion([]backendResult{recs(t, "old", same), recs(t, "new", same)}, reportKey)
+	merged := mergeUnion([]backendResult{recs(t, "a", same), recs(t, "b", same)}, reportKey)
 	if len(merged) != 2 {
 		t.Errorf("expected both backends' aggregate rows, got %d: %v", len(merged), merged)
 	}
@@ -48,7 +48,7 @@ func TestMergeUnion_IdenticalHashlessRowsAreNotCollapsed(t *testing.T) {
 func TestMergeUnion_EventsDedupeOnRawIdentity(t *testing.T) {
 	same := event("h1", "r1", "Package[nginx]")
 	other := event("h1", "r1", "Service[nginx]")
-	merged := mergeUnion([]backendResult{recs(t, "new", same, other), recs(t, "old", same)}, rawKey)
+	merged := mergeUnion([]backendResult{recs(t, "b", same, other), recs(t, "a", same)}, rawKey)
 	if len(merged) != 2 {
 		t.Errorf("expected 2 distinct events, got %d: %v", len(merged), merged)
 	}

@@ -8,7 +8,6 @@ import (
 	"log"
 	"net/http"
 	"net/url"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -82,7 +81,7 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 			s.serveFirstHolder(w, r)
 			return
 		}
-		s.proxyPrimary(w, r)
+		s.proxyUnmerged(w, r)
 	}
 }
 
@@ -125,7 +124,7 @@ func (s *Server) serveUnion(w http.ResponseWriter, r *http.Request, path string,
 		return
 	}
 
-	merged := mergeUnion(s.byPrecedence(alive), key)
+	merged := mergeUnion(alive, key)
 	sortRecords(merged, page.order)
 	if page.wantTotal {
 		if total := sumTotals(alive); total >= 0 {
@@ -158,7 +157,7 @@ func (s *Server) serveSummed(w http.ResponseWriter, r *http.Request, path string
 		return
 	}
 
-	merged := sumRows(s.byPrecedence(alive), columns)
+	merged := sumRows(alive, columns)
 	sortRecords(merged, page.order)
 	if page.wantTotal {
 		w.Header().Set(recordsHeader, strconv.Itoa(len(merged)))
@@ -182,7 +181,7 @@ func (s *Server) serveFirstHolder(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "no backend holds this report", http.StatusNotFound)
 		return
 	}
-	for _, res := range s.byPrecedence(alive) {
+	for _, res := range alive {
 		if len(res.records) > 0 {
 			writeJSON(w, rawRecords(res.records))
 			return
@@ -226,33 +225,15 @@ func rawRecords(recs []record) []json.RawMessage {
 }
 
 func (s *Server) mergeNodesResponse(results []backendResult) []json.RawMessage {
-	return mergeNodes(s.byPrecedence(results))
+	return mergeNodes(results)
 }
 
 func (s *Server) mergeFactsResponse(results []backendResult) []json.RawMessage {
-	ordered := s.byPrecedence(results)
 	if s.cfg.Merge == mergeStatic {
-		prefer := s.cfg.Prefer
-		return mergeFacts(ordered, func(string) string { return prefer })
+		return mergeFacts(results, nil)
 	}
-	fresh := s.freshnessMap(context.Background(), ordered)
-	prefer := s.cfg.Prefer
-	return mergeFacts(ordered, func(cn string) string {
-		if b, ok := fresh[cn]; ok {
-			return b
-		}
-		return prefer
-	})
-}
-
-// Puts Prefer first so it wins ties; the rest keep config order.
-func (s *Server) byPrecedence(results []backendResult) []backendResult {
-	ordered := make([]backendResult, len(results))
-	copy(ordered, results)
-	sort.SliceStable(ordered, func(i, j int) bool {
-		return ordered[i].name == s.cfg.Prefer && ordered[j].name != s.cfg.Prefer
-	})
-	return ordered
+	fresh := s.freshnessMap(context.Background(), results)
+	return mergeFacts(results, func(cn string) string { return fresh[cn] })
 }
 
 // Queries /nodes unfiltered rather than reusing the request's results, because a /facts query's certname set can differ.
@@ -274,7 +255,7 @@ func (s *Server) freshnessMap(ctx context.Context, _ []backendResult) freshness 
 		}
 		alive = append(alive, res)
 	}
-	f := buildFreshness(s.byPrecedence(alive))
+	f := buildFreshness(alive)
 
 	s.mu.Lock()
 	s.freshData = f
@@ -329,29 +310,63 @@ func (s *Server) queryBackend(ctx context.Context, b Backend, path string, param
 	return recs, total, err
 }
 
-func (s *Server) proxyPrimary(w http.ResponseWriter, r *http.Request) {
-	b := s.cfg.PrimaryBackend()
+// The record shape is unknown, so a union would be guesswork: the first 2xx wins and the first error response is replayed when none succeeds.
+func (s *Server) proxyUnmerged(w http.ResponseWriter, r *http.Request) {
+	var fallback *bufferedResponse
+	for _, b := range s.cfg.Backends {
+		resp, err := s.passThrough(r, b)
+		if err != nil {
+			s.log.Printf("warning: backend %q pass-through failed for %s: %v", b.Name, r.URL.Path, err)
+			continue
+		}
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			setContentType(w, resp.Header.Get("Content-Type"))
+			w.WriteHeader(resp.StatusCode)
+			_, _ = io.Copy(w, resp.Body)
+			_ = resp.Body.Close()
+			return
+		}
+		body, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if fallback == nil {
+			fallback = &bufferedResponse{
+				status:      resp.StatusCode,
+				contentType: resp.Header.Get("Content-Type"),
+				body:        body,
+			}
+		}
+	}
+	if fallback == nil {
+		http.Error(w, "all backends failed", http.StatusBadGateway)
+		return
+	}
+	setContentType(w, fallback.contentType)
+	w.WriteHeader(fallback.status)
+	_, _ = w.Write(fallback.body)
+}
+
+type bufferedResponse struct {
+	status      int
+	contentType string
+	body        []byte
+}
+
+func (s *Server) passThrough(r *http.Request, b Backend) (*http.Response, error) {
 	target := strings.TrimRight(b.URL, "/") + r.URL.Path
 	if r.URL.RawQuery != "" {
 		target += "?" + r.URL.RawQuery
 	}
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, target, nil)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadGateway)
-		return
+		return nil, err
 	}
-	resp, err := s.client.Do(req)
-	if err != nil {
-		s.log.Printf("warning: primary %q pass-through failed for %s: %v", b.Name, r.URL.Path, err)
-		http.Error(w, "primary backend failed", http.StatusBadGateway)
-		return
+	return s.client.Do(req)
+}
+
+func setContentType(w http.ResponseWriter, contentType string) {
+	if contentType != "" {
+		w.Header().Set("Content-Type", contentType)
 	}
-	defer func() { _ = resp.Body.Close() }()
-	if ct := resp.Header.Get("Content-Type"); ct != "" {
-		w.Header().Set("Content-Type", ct)
-	}
-	w.WriteHeader(resp.StatusCode)
-	_, _ = io.Copy(w, resp.Body)
 }
 
 type healthReport struct {

@@ -73,8 +73,8 @@ func TestParseAggregate_NoFunctionIsNotAggregate(t *testing.T) {
 func TestSumRows_SharedKeysAreAdded(t *testing.T) {
 	spec := parseAggregate(`["extract",[["function","count"],"status"],["=","certname","h1"],["group_by","status"]]`)
 	merged := sumRows([]backendResult{
-		{name: "new", records: rows(`{"count":3,"status":"changed"}`, `{"count":1,"status":"failed"}`)},
-		{name: "old", records: rows(`{"count":4,"status":"changed"}`, `{"count":2,"status":"failed"}`)},
+		{name: "a", records: rows(`{"count":3,"status":"changed"}`, `{"count":1,"status":"failed"}`)},
+		{name: "b", records: rows(`{"count":4,"status":"changed"}`, `{"count":2,"status":"failed"}`)},
 	}, spec.columns)
 
 	want := []map[string]any{
@@ -89,8 +89,8 @@ func TestSumRows_SharedKeysAreAdded(t *testing.T) {
 func TestSumRows_DisjointKeysAreKept(t *testing.T) {
 	spec := parseAggregate(`["extract",[["function","count"],"status"],["=","certname","h1"],["group_by","status"]]`)
 	merged := sumRows([]backendResult{
-		{name: "new", records: rows(`{"count":3,"status":"changed"}`)},
-		{name: "old", records: rows(`{"count":2,"status":"skipped"}`)},
+		{name: "a", records: rows(`{"count":3,"status":"changed"}`)},
+		{name: "b", records: rows(`{"count":2,"status":"skipped"}`)},
 	}, spec.columns)
 
 	want := []map[string]any{
@@ -106,8 +106,8 @@ func TestSumRows_SingleBackendRowKeepsUpstreamBytes(t *testing.T) {
 	spec := parseAggregate(`["extract",[["function","count"],"status"],["=","certname","h1"],["group_by","status"]]`)
 	const raw = `{"count":3,"status":"changed","extra":{"kept":true}}`
 	merged := sumRows([]backendResult{
-		{name: "new", records: rows(raw)},
-		{name: "old", records: nil},
+		{name: "a", records: rows(raw)},
+		{name: "b", records: nil},
 	}, spec.columns)
 
 	if len(merged) != 1 || string(merged[0]) != raw {
@@ -118,8 +118,8 @@ func TestSumRows_SingleBackendRowKeepsUpstreamBytes(t *testing.T) {
 func TestSumRows_NonNumericAggregateColumnIsNotZeroed(t *testing.T) {
 	spec := parseAggregate(`["extract",[["function","count"],"status"],["=","certname","h1"],["group_by","status"]]`)
 	merged := sumRows([]backendResult{
-		{name: "new", records: rows(`{"count":5,"status":"changed"}`)},
-		{name: "old", records: rows(`{"count":null,"status":"changed"}`)},
+		{name: "a", records: rows(`{"count":5,"status":"changed"}`)},
+		{name: "b", records: rows(`{"count":null,"status":"changed"}`)},
 	}, spec.columns)
 
 	want := []map[string]any{{"count": float64(5), "status": "changed"}}
@@ -131,8 +131,8 @@ func TestSumRows_NonNumericAggregateColumnIsNotZeroed(t *testing.T) {
 func TestSumRows_MissingAggregateColumnStartsFromTheNumericRow(t *testing.T) {
 	spec := parseAggregate(`["extract",[["function","count"],"status"],["=","certname","h1"],["group_by","status"]]`)
 	merged := sumRows([]backendResult{
-		{name: "new", records: rows(`{"status":"changed"}`)},
-		{name: "old", records: rows(`{"count":6,"status":"changed"}`)},
+		{name: "a", records: rows(`{"status":"changed"}`)},
+		{name: "b", records: rows(`{"count":6,"status":"changed"}`)},
 	}, spec.columns)
 
 	want := []map[string]any{{"count": float64(6), "status": "changed"}}
@@ -144,8 +144,8 @@ func TestSumRows_MissingAggregateColumnStartsFromTheNumericRow(t *testing.T) {
 func TestSumRows_NonObjectRowsPassThrough(t *testing.T) {
 	spec := parseAggregate(`["extract",[["function","count"],"status"],["=","certname","h1"],["group_by","status"]]`)
 	merged := sumRows([]backendResult{
-		{name: "new", records: rows(`"surprise"`)},
-		{name: "old", records: rows(`{"count":1,"status":"changed"}`)},
+		{name: "a", records: rows(`"surprise"`)},
+		{name: "b", records: rows(`{"count":1,"status":"changed"}`)},
 	}, spec.columns)
 
 	if len(merged) != 2 || string(merged[0]) != `"surprise"` {
@@ -161,8 +161,8 @@ func TestSumRows_NoKeyColumnsCollapseToOneRow(t *testing.T) {
 		t.Fatal("expected an aggregate spec")
 	}
 	merged := sumRows([]backendResult{
-		{name: "new", records: rows(`{"count":10}`)},
-		{name: "old", records: rows(`{"count":32}`)},
+		{name: "a", records: rows(`{"count":10}`)},
+		{name: "b", records: rows(`{"count":32}`)},
 	}, spec.columns)
 
 	want := []map[string]any{{"count": float64(42)}}
@@ -188,11 +188,11 @@ func TestInferredColumns_SplitsCountsFromIdentity(t *testing.T) {
 
 func TestSumRows_EventCountsPerSubject(t *testing.T) {
 	merged := sumRows([]backendResult{
-		{name: "new", records: rows(
+		{name: "a", records: rows(
 			`{"subject_type":"certname","subject":{"title":"h1"},"failures":1,"successes":2,"noops":0,"skips":0}`,
 			`{"subject_type":"certname","subject":{"title":"h2"},"failures":0,"successes":5,"noops":0,"skips":0}`,
 		)},
-		{name: "old", records: rows(
+		{name: "b", records: rows(
 			`{"subject_type":"certname","subject":{"title":"h1"},"failures":3,"successes":4,"noops":1,"skips":0}`,
 		)},
 	}, inferredColumns)
