@@ -10,11 +10,13 @@ type record struct {
 	Raw             json.RawMessage
 	Certname        string
 	ReportTimestamp string // only populated for /nodes records
+	Hash            string // only populated for /reports records
 }
 
 type recordMeta struct {
 	Certname        string `json:"certname"`
 	ReportTimestamp string `json:"report_timestamp"`
+	Hash            string `json:"hash"`
 }
 
 func decodeRecords(body []byte) ([]record, error) {
@@ -30,6 +32,7 @@ func decodeRecords(body []byte) ([]record, error) {
 			Raw:             raw,
 			Certname:        m.Certname,
 			ReportTimestamp: m.ReportTimestamp,
+			Hash:            m.Hash,
 		})
 	}
 	return out, nil

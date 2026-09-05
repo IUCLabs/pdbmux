@@ -51,8 +51,8 @@ func main() {
 		Short: "Merging HTTP proxy over two PuppetDB backends.",
 		Long: "pdbmux presents a single merged PuppetDB v4 query surface over the old\n" +
 			"(VM) and new (k8s) PuppetDBs during the migration, so PuppetDB clients\n" +
-			"see one consistent view. Running pdbmux with no subcommand\n" +
-			"(or `pdbmux serve`) starts the proxy.",
+			"and Puppetboard see one consistent view. Running pdbmux with\n" +
+			"no subcommand (or `pdbmux serve`) starts the proxy.",
 		SilenceUsage: true,
 		RunE:         func(cmd *cobra.Command, args []string) error { return serve(cmd) },
 	}
