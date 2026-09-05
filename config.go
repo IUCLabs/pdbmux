@@ -27,6 +27,13 @@ const (
 	defaultFreshnessTTL = 30 * time.Second
 
 	defaultSourceFact = "pdbmux_source"
+
+	// maxFactsTTL is a hard cap, not a default: a larger configured value is
+	// clamped down to it rather than rejected, so a stray env var cannot make a
+	// container crash-loop.
+	maxFactsTTL      = 30 * time.Second
+	defaultFactsTTL  = 30 * time.Second
+	defaultCacheSize = int64(64 << 20)
 )
 
 var exampleBackends = []Backend{
@@ -45,11 +52,14 @@ type Config struct {
 	Merge        string        `yaml:"merge"`
 	Timeout      time.Duration `yaml:"timeout"`
 	FreshnessTTL time.Duration `yaml:"freshness_ttl"`
+	FactsTTL     time.Duration `yaml:"facts_ttl"`         // 0 disables the /facts+/nodes cache
+	CacheBytes   int64         `yaml:"facts_cache_bytes"` // byte budget for that cache
 
 	SourceFact        string `yaml:"source_fact"`
 	SourceFactEnabled bool   `yaml:"source_fact_enabled"`
 
-	sourcePath string // file this config was read from, empty if none was found
+	sourcePath      string        // file this config was read from, empty if none was found
+	factsTTLClamped time.Duration // pre-clamp facts_ttl, zero when nothing was clamped
 }
 
 // SourcePath returns the config file Load read, or "" when none was loaded.
@@ -66,6 +76,8 @@ func DefaultConfig() Config {
 		Merge:             mergeFreshness,
 		Timeout:           defaultTimeout,
 		FreshnessTTL:      defaultFreshnessTTL,
+		FactsTTL:          defaultFactsTTL,
+		CacheBytes:        defaultCacheSize,
 		SourceFact:        defaultSourceFact,
 		SourceFactEnabled: true,
 	}
@@ -146,7 +158,17 @@ func Load(flagPath string) (Config, error) {
 	}
 
 	applyEnv(&cfg, os.Getenv)
+	cfg.clampFactsTTL()
 	return cfg, nil
+}
+
+// clampFactsTTL pins facts_ttl to maxFactsTTL, remembering the configured value
+// so `config show` can say the cap was applied.
+func (c *Config) clampFactsTTL() {
+	if c.FactsTTL > maxFactsTTL {
+		c.factsTTLClamped = c.FactsTTL
+		c.FactsTTL = maxFactsTTL
+	}
 }
 
 func applyEnv(cfg *Config, getenv func(string) string) {
@@ -172,6 +194,16 @@ func applyEnv(cfg *Config, getenv func(string) string) {
 	if v := getenv(envPrefix + "SOURCE_FACT_ENABLED"); v != "" {
 		if b, err := strconv.ParseBool(v); err == nil {
 			cfg.SourceFactEnabled = b
+		}
+	}
+	if v := getenv(envPrefix + "FACTS_TTL"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			cfg.FactsTTL = d
+		}
+	}
+	if v := getenv(envPrefix + "FACTS_CACHE_BYTES"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			cfg.CacheBytes = n
 		}
 	}
 	if v := getenv(envPrefix + "BACKENDS"); v != "" {
@@ -234,8 +266,18 @@ func (c Config) Validate() error {
 	if c.SourceFactEnabled && c.SourceFact == "" {
 		return fmt.Errorf("source_fact must be non-empty, or set source_fact_enabled to false")
 	}
+	if c.FactsTTL < 0 {
+		return fmt.Errorf("facts_ttl must not be negative (0 disables the cache)")
+	}
+	if c.CacheBytes < 0 {
+		return fmt.Errorf("facts_cache_bytes must not be negative")
+	}
 	return nil
 }
+
+// cacheEnabled reports whether a facts/nodes cache should be built: both a TTL
+// and a byte budget are required.
+func (c Config) cacheEnabled() bool { return c.FactsTTL > 0 && c.CacheBytes > 0 }
 
 func writeDefaultConfig(path string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -249,8 +291,11 @@ func writeDefaultConfig(path string) error {
 		"# A merging proxy presenting one PuppetDB v4 query surface over several\n" +
 		"# PuppetDB backends. The backend URLs below are placeholders — edit them.\n" +
 		"# Env overrides: PDBMUX_LISTEN, PDBMUX_MERGE, PDBMUX_TIMEOUT,\n" +
-		"#   PDBMUX_FRESHNESS_TTL, PDBMUX_BACKENDS (name=url,name=url),\n" +
-		"#   PDBMUX_SOURCE_FACT, PDBMUX_SOURCE_FACT_ENABLED.\n\n")
+		"#   PDBMUX_FRESHNESS_TTL, PDBMUX_FACTS_TTL, PDBMUX_FACTS_CACHE_BYTES,\n" +
+		"#   PDBMUX_BACKENDS (name=url,name=url),\n" +
+		"#   PDBMUX_SOURCE_FACT, PDBMUX_SOURCE_FACT_ENABLED.\n" +
+		"# facts_ttl caches merged /facts and /nodes in memory; it is capped at 30s\n" +
+		"# (a larger value is clamped) and 0 disables the cache.\n\n")
 	if err := os.WriteFile(path, append(header, data...), 0o644); err != nil {
 		return fmt.Errorf("writing config: %w", err)
 	}

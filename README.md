@@ -38,7 +38,7 @@ not PQL) is forwarded verbatim.
 | `GET /metrics/v2/read/<mbean>` | Fan out to all and merge the Jolokia response; numeric attributes are **summed** by default (see merge semantics). |
 | `GET /metrics/v2/list` | Fan out to all and serve the **union** of the backends' MBean trees. |
 | `GET /metrics/v1/mbeans[/<mbean>]` | Same merge, applied to the legacy envelope-less body. |
-| `GET /healthz` | Per-backend reachability. `200 {"status":"ok"}` if all reachable, `200 degraded` if some fail, `503 down` if all fail. |
+| `GET /healthz` | Per-backend reachability plus cache state. `200 {"status":"ok"}` if all reachable, `200 degraded` if some fail, `503 down` if all fail. |
 
 Fan-out is concurrent. If one backend errors or times out, `pdbmux` serves the
 surviving backends' results and logs a warning; a merged endpoint only returns `502` when
@@ -208,6 +208,41 @@ Each backend applies `order_by`/`limit`/`offset` to its own slice only, so
 - A malformed `limit`, `offset` or `order_by` gets a `400` rather than being
   forwarded.
 
+## Caching
+
+`pdbmux` caches merged `/nodes` and `/facts` record sets **in memory** so a busy
+Puppetboard does not re-fan-out the same query every few seconds. Everything else
+runs uncached — including `extract`/`count` aggregates on those two paths, and
+the `/pdb/meta/v1/*` and `/metrics/*` endpoints, which are served live on every
+request. The cache is an interface, and `/reports` gets its own (S3-backed)
+backend later without further handler changes.
+
+- **Key** — `<path>?<params>`, where the params are the ones that actually
+  determine the response, URL-encoded with keys sorted ascending and a repeated
+  param's values sorted ascending. Param order in the request is therefore
+  irrelevant: one canonical key per distinct request. A request with no params
+  keys on the bare path.
+- **TTL** — `facts_ttl`, default `30s`, **hard cap `30s`**. A larger configured
+  value is **clamped** down to the cap, not rejected, so a stray env var cannot
+  crash-loop a container; `pdbmux config show` prints
+  `facts_ttl : 30s (clamped from 600s, cap 30s)` when that happens. `facts_ttl: 0`
+  disables the cache entirely and the merged endpoints behave exactly as before.
+- **Stale on failure only** — an expired entry is kept, not dropped. When the TTL
+  has passed `pdbmux` always re-queries the backends; the expired copy is served
+  **only** if every backend fails, which turns a `502` into slightly-old data. A
+  healthy backend is never shadowed by a stale entry.
+- **Bounded** — `facts_cache_bytes` (default 64 MiB) is a byte budget, evicted
+  least-recently-used; reads count as use, so a stale entry that is still being
+  asked for survives. A single response larger than the whole budget is not
+  cached at all.
+- **Single-flight** — concurrent requests for the same key collapse into one
+  upstream fan-out; the rest wait for it and share the result.
+- **Visibility** — `/healthz` carries a `cache` object: `backend`
+  (`memory`/`none`), `ttl`, `entries`, `stale_entries`, `bytes`, `serving_stale`,
+  `stale_served` and `last_stale_served`. `serving_stale` is `true` from the
+  moment a stale fallback is served until the next response comes from a live
+  fan-out or a fresh entry.
+
 ## Config
 
 Precedence (lowest → highest): **defaults < config file < env vars (`PDBMUX_*`) < flags**.
@@ -229,9 +264,11 @@ backends:                          # order is a tie-break only, not a ranking
     url: http://puppetdb1.example.com:8080
   - name: pdb-b
     url: https://puppetdb2.example.com
-merge: freshness      # freshness | static
-timeout: 10s          # per-upstream request timeout
-freshness_ttl: 30s    # freshness-map cache TTL (freshness merge only)
+merge: freshness             # freshness | static
+timeout: 10s                 # per-upstream request timeout
+freshness_ttl: 30s           # freshness-map cache TTL (freshness merge only)
+facts_ttl: 30s               # /facts + /nodes response cache TTL; 0 disables, capped at 30s
+facts_cache_bytes: 67108864  # byte budget for that cache (64 MiB), LRU-evicted
 source_fact: pdbmux_source   # name of the synthetic provenance fact
 source_fact_enabled: true    # false serves backends' records untouched
 ```
@@ -246,6 +283,8 @@ the `/pdb/query/v4/...` path per request.
 | `PDBMUX_MERGE` | `merge` |
 | `PDBMUX_TIMEOUT` | `timeout` (Go duration, e.g. `10s`) |
 | `PDBMUX_FRESHNESS_TTL` | `freshness_ttl` |
+| `PDBMUX_FACTS_TTL` | `facts_ttl` (clamped to 30s) |
+| `PDBMUX_FACTS_CACHE_BYTES` | `facts_cache_bytes` (plain integer bytes) |
 | `PDBMUX_BACKENDS` | whole backend list, as `name=url,name=url` |
 | `PDBMUX_SOURCE_FACT` | `source_fact` (default `pdbmux_source`) |
 | `PDBMUX_SOURCE_FACT_ENABLED` | `source_fact_enabled` (default `true`); `false` disables injection |
@@ -281,5 +320,6 @@ A static (`CGO_ENABLED=0`) binary on a distroless base. Configure it with
 `PDBMUX_*` env vars (at minimum `PDBMUX_BACKENDS`), or mount a config file — a
 configmap at `/etc/pdbmux/config.yaml` is picked up with no env var at all, and
 any other mount path works via `PDBMUX_CONFIG`. Env vars still override file
-values, so the two mix. Stateless, so run as many replicas as you like; use
-`/healthz` for liveness/readiness probes.
+values, so the two mix. Run as many replicas as you like — the only state is the
+in-memory cache, which is per-replica and bounded by `facts_cache_bytes`, so size
+the memory limit above it. Use `/healthz` for liveness/readiness probes.
