@@ -15,6 +15,11 @@ const (
 	appName        = "pdbmux"
 	configFileName = "config.yaml"
 	envPrefix      = "PDBMUX_"
+	envConfigPath  = envPrefix + "CONFIG"
+
+	// systemConfigDir is the last resort in the search order, and the path a
+	// container mount (configmap, secret) is expected to land on.
+	systemConfigDir = "/etc/" + appName
 
 	defaultListen = ":8080"
 
@@ -40,7 +45,12 @@ type Config struct {
 	Prefer       string        `yaml:"prefer"` // wins under static merge, and breaks ties under freshness merge
 	Timeout      time.Duration `yaml:"timeout"`
 	FreshnessTTL time.Duration `yaml:"freshness_ttl"`
+
+	sourcePath string // file this config was read from, empty if none was found
 }
+
+// SourcePath returns the config file Load read, or "" when none was loaded.
+func (c Config) SourcePath() string { return c.sourcePath }
 
 const (
 	mergeFreshness = "freshness"
@@ -68,6 +78,9 @@ func ConfigDir() string {
 	base := os.Getenv("XDG_CONFIG_HOME")
 	if base == "" {
 		home, _ := os.UserHomeDir()
+		if home == "" {
+			return systemConfigDir
+		}
 		base = filepath.Join(home, ".config")
 	}
 	return filepath.Join(base, appName)
@@ -77,19 +90,56 @@ func ConfigPath() string {
 	return filepath.Join(ConfigDir(), configFileName)
 }
 
+// configSearchPaths lists the default config locations, highest priority first.
+func configSearchPaths() []string {
+	paths := []string{ConfigPath()}
+	if system := filepath.Join(systemConfigDir, configFileName); system != paths[0] {
+		paths = append(paths, system)
+	}
+	return paths
+}
+
+// explicitConfigPath returns the config path named by --config or PDBMUX_CONFIG,
+// or "" when neither is set.
+func explicitConfigPath(flagPath string) string {
+	if flagPath != "" {
+		return flagPath
+	}
+	return os.Getenv(envConfigPath)
+}
+
+// resolveConfigPath picks the config file to read: --config, else PDBMUX_CONFIG,
+// else the first existing default search path. explicit reports whether the path
+// was named outright, in which case a missing file is an error.
+func resolveConfigPath(flagPath string) (path string, explicit bool) {
+	if p := explicitConfigPath(flagPath); p != "" {
+		return p, true
+	}
+	paths := configSearchPaths()
+	for _, p := range paths {
+		if st, err := os.Stat(p); err == nil && !st.IsDir() {
+			return p, false
+		}
+	}
+	return paths[0], false
+}
+
 // Precedence: defaults < config file < env vars < flags, and flags are applied by the caller.
-func Load() (Config, error) {
+func Load(flagPath string) (Config, error) {
 	cfg := DefaultConfig()
 
-	path := ConfigPath()
+	path, explicit := resolveConfigPath(flagPath)
 	data, err := os.ReadFile(path)
-	if err != nil && !os.IsNotExist(err) {
-		return cfg, fmt.Errorf("reading config %s: %w", path, err)
-	}
-	if err == nil {
+	switch {
+	case err == nil:
 		if err := yaml.Unmarshal(data, &cfg); err != nil {
 			return cfg, fmt.Errorf("parsing config %s: %w", path, err)
 		}
+		cfg.sourcePath = path
+	case os.IsNotExist(err) && !explicit:
+		// No config file anywhere on the search path: defaults + env only.
+	default:
+		return cfg, fmt.Errorf("reading config %s: %w", path, err)
 	}
 
 	applyEnv(&cfg, os.Getenv)
@@ -157,10 +207,19 @@ func (c *Config) normalize() {
 	}
 }
 
+// configHint names the file a user should edit: the one actually loaded, else
+// the default write target.
+func (c Config) configHint() string {
+	if c.sourcePath != "" {
+		return c.sourcePath
+	}
+	return ConfigPath()
+}
+
 func (c Config) Validate() error {
 	if len(c.Backends) == 0 {
 		return fmt.Errorf("no backends configured: set %sBACKENDS to \"name=url,name=url\" or add a backends list to %s",
-			envPrefix, ConfigPath())
+			envPrefix, c.configHint())
 	}
 	seen := map[string]bool{}
 	for _, b := range c.Backends {
@@ -198,12 +257,10 @@ func (c Config) PrimaryBackend() Backend {
 	return c.Backends[0]
 }
 
-func writeDefaultConfig() error {
-	dir := ConfigDir()
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+func writeDefaultConfig(path string) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("creating config dir: %w", err)
 	}
-	path := ConfigPath()
 	if _, err := os.Stat(path); err == nil {
 		return fmt.Errorf("config already exists at %s", path)
 	}

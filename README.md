@@ -100,8 +100,15 @@ Each backend applies `order_by`/`limit`/`offset` to its own slice only, so
 
 Precedence (lowest → highest): **defaults < config file < env vars (`PDBMUX_*`) < flags**.
 
-Config file: `$XDG_CONFIG_HOME/pdbmux/config.yaml`. In a container there is no
-config file — everything comes from `PDBMUX_*` env vars.
+The config file is optional; a file, env vars, or both work equally well,
+including in a container.
+
+Which file is read: `--config <path>`, else `PDBMUX_CONFIG`, else the first that
+exists of `$XDG_CONFIG_HOME/pdbmux/config.yaml` (or `$HOME/.config/pdbmux/config.yaml`),
+then `/etc/pdbmux/config.yaml`. A path given via `--config`/`PDBMUX_CONFIG` **must**
+exist — pdbmux fails rather than silently falling back — while a missing file on
+the default search path is fine. `pdbmux config show` prints the file it loaded,
+or the paths it searched.
 
 ```yaml
 listen: ":8080"
@@ -122,6 +129,7 @@ the `/pdb/query/v4/...` path per request.
 
 | Env var | Overrides |
 |---|---|
+| `PDBMUX_CONFIG` | config file path (not a file key) |
 | `PDBMUX_LISTEN` | `listen` |
 | `PDBMUX_PRIMARY` | `primary` |
 | `PDBMUX_MERGE` | `merge` |
@@ -130,7 +138,10 @@ the `/pdb/query/v4/...` path per request.
 | `PDBMUX_FRESHNESS_TTL` | `freshness_ttl` |
 | `PDBMUX_BACKENDS` | whole backend list, as `name=url,name=url` |
 
-Flags: `--listen`, `--primary`, `--merge`.
+Flags: `--config`, `--listen`, `--primary`, `--merge`.
+
+`config init` writes to `--config`/`PDBMUX_CONFIG` when set, else to
+`$XDG_CONFIG_HOME/pdbmux/config.yaml`.
 
 ## Running
 
@@ -154,7 +165,9 @@ Container image only — no OS package. Every `v*` tag builds and pushes the ima
 (the release pipeline); registry and repository are pipeline settings. Tag
 with `make patch` / `minor` / `major`.
 
-A static (`CGO_ENABLED=0`) binary on a distroless base, configured entirely via
-`PDBMUX_*` env vars; a container needs at minimum `PDBMUX_BACKENDS`. Stateless,
-so run as many replicas as you like; use `/healthz` for liveness/readiness
-probes.
+A static (`CGO_ENABLED=0`) binary on a distroless base. Configure it with
+`PDBMUX_*` env vars (at minimum `PDBMUX_BACKENDS`), or mount a config file — a
+configmap at `/etc/pdbmux/config.yaml` is picked up with no env var at all, and
+any other mount path works via `PDBMUX_CONFIG`. Env vars still override file
+values, so the two mix. Stateless, so run as many replicas as you like; use
+`/healthz` for liveness/readiness probes.
