@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -18,19 +19,28 @@ import (
 var version = "dev"
 
 func main() {
-	cfg, err := Load()
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "config error:", err)
-		os.Exit(1)
-	}
-
 	var (
-		listen  string
-		primary string
-		merge   string
+		cfg        Config
+		configPath string
+		listen     string
+		primary    string
+		merge      string
 	)
 
+	// Loaded lazily: --config is only known once cobra has parsed flags.
+	loadConfig := func() error {
+		c, err := Load(configPath)
+		if err != nil {
+			return err
+		}
+		cfg = c
+		return nil
+	}
+
 	serve := func(cmd *cobra.Command) error {
+		if err := loadConfig(); err != nil {
+			return err
+		}
 		if cmd.Flags().Changed("listen") {
 			cfg.Listen = listen
 		}
@@ -58,9 +68,10 @@ func main() {
 	}
 
 	pf := root.PersistentFlags()
-	pf.StringVar(&listen, "listen", cfg.Listen, "HTTP listen address (overrides config and PDBMUX_LISTEN)")
-	pf.StringVar(&primary, "primary", cfg.Primary, "Primary backend name for non-merged pass-through")
-	pf.StringVar(&merge, "merge", cfg.Merge, "Facts merge strategy: freshness or static")
+	pf.StringVar(&configPath, "config", "", "Config file path (overrides PDBMUX_CONFIG and the default search path)")
+	pf.StringVar(&listen, "listen", defaultListen, "HTTP listen address (overrides config and PDBMUX_LISTEN)")
+	pf.StringVar(&primary, "primary", "", "Primary backend name for non-merged pass-through")
+	pf.StringVar(&merge, "merge", mergeFreshness, "Facts merge strategy: freshness or static")
 
 	serveCmd := &cobra.Command{
 		Use:          "serve",
@@ -73,15 +84,24 @@ func main() {
 	configCmd.AddCommand(
 		&cobra.Command{
 			Use:          "init",
-			Short:        "Write a default config file to " + ConfigPath(),
+			Short:        "Write a default config file (--config path, else " + ConfigPath() + ")",
 			SilenceUsage: true,
-			RunE:         func(cmd *cobra.Command, args []string) error { return writeDefaultConfig() },
+			RunE: func(cmd *cobra.Command, args []string) error {
+				path := explicitConfigPath(configPath)
+				if path == "" {
+					path = ConfigPath()
+				}
+				return writeDefaultConfig(path)
+			},
 		},
 		&cobra.Command{
 			Use:          "show",
 			Short:        "Print the active configuration",
 			SilenceUsage: true,
 			RunE: func(cmd *cobra.Command, args []string) error {
+				if err := loadConfig(); err != nil {
+					return err
+				}
 				printConfig(cfg)
 				return nil
 			},
@@ -137,7 +157,11 @@ func runServer(cfg Config) error {
 }
 
 func printConfig(cfg Config) {
-	fmt.Printf("config file  : %s\n", ConfigPath())
+	if p := cfg.SourcePath(); p != "" {
+		fmt.Printf("config file  : %s (loaded)\n", p)
+	} else {
+		fmt.Printf("config file  : none loaded (searched %s)\n", strings.Join(configSearchPaths(), ", "))
+	}
 	fmt.Printf("listen       : %s\n", cfg.Listen)
 	fmt.Printf("primary      : %s\n", cfg.Primary)
 	fmt.Printf("merge        : %s\n", cfg.Merge)

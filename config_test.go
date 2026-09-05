@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"strings"
@@ -42,7 +43,7 @@ func TestLoad_NoBackendsLoadsButFailsValidation(t *testing.T) {
 	clearEnv(t)
 
 	// Load itself must succeed so `config init` / `version` work unconfigured.
-	cfg, err := Load()
+	cfg, err := Load("")
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
@@ -60,7 +61,7 @@ func TestLoad_PrimaryDefaultsToFirstBackend(t *testing.T) {
 	clearEnv(t)
 	t.Setenv(envPrefix+"BACKENDS", "a=http://localhost:18080,b=http://localhost:18081")
 
-	cfg, err := Load()
+	cfg, err := Load("")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -87,7 +88,7 @@ func TestLoad_FileAndEnvOverride(t *testing.T) {
 	// env beats file for listen.
 	t.Setenv(envPrefix+"LISTEN", "127.0.0.1:1234")
 
-	cfg, err := Load()
+	cfg, err := Load("")
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
@@ -174,9 +175,233 @@ func TestExampleConfig_IsValidAndNeutral(t *testing.T) {
 	}
 }
 
+const testConfigBody = "listen: \":9999\"\nmerge: static\nprimary: old\nprefer: old\n" +
+	"backends:\n  - name: old\n    url: http://localhost:18080\n  - name: new\n    url: http://localhost:18081\n"
+
+func writeConfigFile(t *testing.T, path string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(testConfigBody), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLoad_FileOnly(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", dir)
+	clearEnv(t)
+	path := filepath.Join(dir, appName, configFileName)
+	writeConfigFile(t, path)
+
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.Listen != ":9999" || cfg.Merge != mergeStatic || len(cfg.Backends) != 2 {
+		t.Errorf("file values not applied: %+v", cfg)
+	}
+	if cfg.SourcePath() != path {
+		t.Errorf("source path = %q, want %q", cfg.SourcePath(), path)
+	}
+}
+
+func TestLoad_EnvOnly_DefaultPathMissing(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	clearEnv(t)
+	t.Setenv(envPrefix+"BACKENDS", "a=http://localhost:18080")
+	t.Setenv(envPrefix+"LISTEN", "127.0.0.1:1234")
+
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("a missing default config file must not be an error: %v", err)
+	}
+	if cfg.SourcePath() != "" {
+		t.Errorf("no file was loaded, source path should be empty, got %q", cfg.SourcePath())
+	}
+	if cfg.Listen != "127.0.0.1:1234" || len(cfg.Backends) != 1 {
+		t.Errorf("env values not applied: %+v", cfg)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("env-only config should validate: %v", err)
+	}
+}
+
+// A mounted config file must load with neither HOME nor XDG_CONFIG_HOME set.
+func TestLoad_ExplicitPath(t *testing.T) {
+	mounted := filepath.Join(t.TempDir(), "mounted.yaml")
+	writeConfigFile(t, mounted)
+
+	for _, tc := range []struct {
+		name string
+		flag string
+		env  string
+	}{
+		{"flag", mounted, ""},
+		{"env", "", mounted},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("XDG_CONFIG_HOME", "")
+			t.Setenv("HOME", "")
+			clearEnv(t)
+			t.Setenv(envConfigPath, tc.env)
+
+			cfg, err := Load(tc.flag)
+			if err != nil {
+				t.Fatalf("load: %v", err)
+			}
+			if cfg.SourcePath() != mounted {
+				t.Errorf("source path = %q, want %q", cfg.SourcePath(), mounted)
+			}
+			if cfg.Listen != ":9999" {
+				t.Errorf("listen = %q, want :9999", cfg.Listen)
+			}
+		})
+	}
+}
+
+func TestLoad_ExplicitPathMissingIsError(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "typo.yaml")
+
+	for _, tc := range []struct {
+		name string
+		flag string
+		env  string
+	}{
+		{"flag", missing, ""},
+		{"env", "", missing},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+			clearEnv(t)
+			t.Setenv(envConfigPath, tc.env)
+
+			_, err := Load(tc.flag)
+			if err == nil {
+				t.Fatal("an explicitly named config file that does not exist must fail loudly")
+			}
+			if !strings.Contains(err.Error(), missing) {
+				t.Errorf("error should name the missing path, got: %v", err)
+			}
+		})
+	}
+}
+
+func TestLoad_ExplicitFileStillLosesToEnv(t *testing.T) {
+	mounted := filepath.Join(t.TempDir(), "mounted.yaml")
+	writeConfigFile(t, mounted)
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	clearEnv(t)
+	t.Setenv(envConfigPath, mounted)
+	t.Setenv(envPrefix+"LISTEN", "127.0.0.1:1234")
+	t.Setenv(envPrefix+"MERGE", mergeFreshness)
+
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.Listen != "127.0.0.1:1234" || cfg.Merge != mergeFreshness {
+		t.Errorf("env must beat the file: %+v", cfg)
+	}
+	if len(cfg.Backends) != 2 {
+		t.Errorf("unset env must leave file backends alone: %+v", cfg.Backends)
+	}
+}
+
+func TestResolveConfigPath_Precedence(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", dir)
+	clearEnv(t)
+	defaultPath := filepath.Join(dir, appName, configFileName)
+
+	if got, explicit := resolveConfigPath(""); got != defaultPath || explicit {
+		t.Errorf("no file anywhere: got %q explicit=%v, want %q false", got, explicit, defaultPath)
+	}
+
+	writeConfigFile(t, defaultPath)
+	if got, explicit := resolveConfigPath(""); got != defaultPath || explicit {
+		t.Errorf("default search: got %q explicit=%v, want %q false", got, explicit, defaultPath)
+	}
+
+	t.Setenv(envConfigPath, "/from/env.yaml")
+	if got, explicit := resolveConfigPath(""); got != "/from/env.yaml" || !explicit {
+		t.Errorf("env should beat the search path: got %q explicit=%v", got, explicit)
+	}
+	if got, explicit := resolveConfigPath("/from/flag.yaml"); got != "/from/flag.yaml" || !explicit {
+		t.Errorf("flag should beat env: got %q explicit=%v", got, explicit)
+	}
+}
+
+func TestConfigSearchPaths_EndsAtSystemDir(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	paths := configSearchPaths()
+	want := filepath.Join(systemConfigDir, configFileName)
+	if len(paths) != 2 || paths[1] != want {
+		t.Errorf("search paths = %v, want the system path %q last", paths, want)
+	}
+
+	t.Setenv("XDG_CONFIG_HOME", "")
+	t.Setenv("HOME", "")
+	if paths := configSearchPaths(); len(paths) != 1 || paths[0] != want {
+		t.Errorf("without HOME/XDG the search path should be just %q, got %v", want, paths)
+	}
+}
+
+func TestPrintConfig_ReportsSource(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", dir)
+	clearEnv(t)
+
+	out := captureStdout(t, func() {
+		cfg, err := Load("")
+		if err != nil {
+			t.Fatal(err)
+		}
+		printConfig(cfg)
+	})
+	if !strings.Contains(out, "none loaded") || !strings.Contains(out, filepath.Join(dir, appName, configFileName)) {
+		t.Errorf("config show should report nothing was loaded and what it searched, got:\n%s", out)
+	}
+
+	path := filepath.Join(dir, appName, configFileName)
+	writeConfigFile(t, path)
+	out = captureStdout(t, func() {
+		cfg, err := Load("")
+		if err != nil {
+			t.Fatal(err)
+		}
+		printConfig(cfg)
+	})
+	if !strings.Contains(out, path+" (loaded)") {
+		t.Errorf("config show should name the loaded file, got:\n%s", out)
+	}
+}
+
+func captureStdout(t *testing.T, f func()) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	orig := os.Stdout
+	os.Stdout = w
+	defer func() { os.Stdout = orig }()
+
+	f()
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	if _, err := buf.ReadFrom(r); err != nil {
+		t.Fatal(err)
+	}
+	return buf.String()
+}
+
 func clearEnv(t *testing.T) {
 	t.Helper()
-	for _, k := range []string{"LISTEN", "PRIMARY", "MERGE", "PREFER", "TIMEOUT", "FRESHNESS_TTL", "BACKENDS"} {
+	for _, k := range []string{"CONFIG", "LISTEN", "PRIMARY", "MERGE", "PREFER", "TIMEOUT", "FRESHNESS_TTL", "BACKENDS"} {
 		t.Setenv(envPrefix+k, "")
 	}
 }
