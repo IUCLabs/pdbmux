@@ -16,11 +16,13 @@ import (
 )
 
 const (
-	factsPath   = "/pdb/query/v4/facts"
-	nodesPath   = "/pdb/query/v4/nodes"
-	reportsPath = "/pdb/query/v4/reports"
-	eventsPath  = "/pdb/query/v4/events"
-	queryV4     = "/pdb/query/v4/"
+	factsPath                = "/pdb/query/v4/facts"
+	nodesPath                = "/pdb/query/v4/nodes"
+	reportsPath              = "/pdb/query/v4/reports"
+	eventsPath               = "/pdb/query/v4/events"
+	eventCountsPath          = "/pdb/query/v4/event-counts"
+	aggregateEventCountsPath = "/pdb/query/v4/aggregate-event-counts"
+	queryV4                  = "/pdb/query/v4/"
 
 	// PuppetDB only sends this when the request carries include_total=true.
 	recordsHeader = "X-Records"
@@ -70,9 +72,11 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	case factsPath:
 		s.serveMerged(w, r, factsPath, s.mergeFactsResponse)
 	case reportsPath:
-		s.serveUnion(w, r, reportsPath, reportKey)
+		s.serveReports(w, r)
 	case eventsPath:
 		s.serveUnion(w, r, eventsPath, rawKey)
+	case eventCountsPath, aggregateEventCountsPath:
+		s.serveSummed(w, r, r.URL.Path, inferredColumns)
 	default:
 		if isReportSubResource(r.URL.Path) {
 			s.serveFirstHolder(w, r)
@@ -127,6 +131,37 @@ func (s *Server) serveUnion(w http.ResponseWriter, r *http.Request, path string,
 		if total := sumTotals(alive); total >= 0 {
 			w.Header().Set(recordsHeader, strconv.Itoa(total))
 		}
+	}
+	writeJSON(w, page.apply(merged))
+}
+
+// An `extract` query with a `function` column returns synthetic aggregate rows that carry no identity, so they are summed rather than unioned.
+func (s *Server) serveReports(w http.ResponseWriter, r *http.Request) {
+	if spec := parseAggregate(r.URL.Query().Get("query")); spec != nil {
+		s.serveSummed(w, r, reportsPath, spec.columns)
+		return
+	}
+	s.serveUnion(w, r, reportsPath, reportKey)
+}
+
+// Merged rows are fewer than the backends' combined records, so include_total reports the merged count rather than a sum of X-Records.
+func (s *Server) serveSummed(w http.ResponseWriter, r *http.Request, path string, columns func(map[string]json.RawMessage) ([]string, []string)) {
+	in := r.URL.Query()
+	page, err := parsePaging(in)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	alive, ok := s.aliveResults(w, r, path, page.upstreamParams(in))
+	if !ok {
+		return
+	}
+
+	merged := sumRows(s.byPrecedence(alive), columns)
+	sortRecords(merged, page.order)
+	if page.wantTotal {
+		w.Header().Set(recordsHeader, strconv.Itoa(len(merged)))
 	}
 	writeJSON(w, page.apply(merged))
 }
