@@ -1069,6 +1069,81 @@ func TestServeCached_CacheStatusHeaders(t *testing.T) {
 	}
 }
 
+// recordingCache captures what Put was handed, so a test can assert the store
+// does not run on an already-cancelled context. memoryCache ignores its context
+// and so cannot show the difference.
+type recordingCache struct {
+	putCalled chan struct{}
+	putCtxErr error
+	putBody   []byte
+}
+
+func newRecordingCache() *recordingCache {
+	return &recordingCache{putCalled: make(chan struct{})}
+}
+
+func (c *recordingCache) Get(context.Context, string) (CacheEntry, CacheStatus, error) {
+	return CacheEntry{}, CacheMiss, nil
+}
+
+// The fields are read only after putCalled closes, which orders the two.
+func (c *recordingCache) Put(ctx context.Context, _ string, body []byte) error {
+	c.putCtxErr = ctx.Err()
+	c.putBody = append([]byte(nil), body...)
+	close(c.putCalled)
+	return nil
+}
+
+func (c *recordingCache) Stats() CacheStats { return CacheStats{Backend: "recording"} }
+
+// A build that succeeded must still reach the cache once the last participant
+// has left and cancelled the flight, or an out-of-process backend would drop the
+// write and lose the entry the next caller would have hit warm.
+func TestServeCached_PutRunsOnDetachedContext(t *testing.T) {
+	srv := newTestServer(cacheTestConfig("http://backend.invalid", "http://backend.invalid"))
+	cache := newRecordingCache()
+	srv.factsCache = cache
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req := httptest.NewRequest(http.MethodGet, factsPath, nil).WithContext(ctx)
+
+	served := make(chan struct{})
+	go func() {
+		defer close(served)
+		srv.serveCached(httptest.NewRecorder(), req, factsPath, nil, func(context.Context) (cachedResponse, error) {
+			close(entered)
+			<-release
+			return cachedResponse{Body: json.RawMessage(`[]`), Records: -1}, nil
+		})
+	}()
+
+	<-entered
+	cancel()
+	select {
+	case <-served:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the abandoning request stayed parked")
+	}
+
+	// The flight's own context is cancelled by now, so only a detached one can
+	// carry the store.
+	close(release)
+	select {
+	case <-cache.putCalled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("a completed build never reached the cache")
+	}
+	if cache.putCtxErr != nil {
+		t.Errorf("Put ran on a cancelled context: %v", cache.putCtxErr)
+	}
+	if len(cache.putBody) == 0 {
+		t.Error("Put stored an empty body")
+	}
+}
+
 func TestHandler_HealthzReportsCacheState(t *testing.T) {
 	a := newCountingBackend(t, map[string]string{factsPath: `[` + fact("h1", "role", "web", "") + `]`})
 	b := newCountingBackend(t, map[string]string{factsPath: `[]`})

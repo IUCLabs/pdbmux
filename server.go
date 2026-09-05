@@ -334,7 +334,13 @@ func (s *Server) serveCached(w http.ResponseWriter, r *http.Request, path string
 			s.log.Printf("warning: encoding cache entry for %s failed: %v", key, marshalErr)
 			return built, nil
 		}
-		if putErr := cache.Put(ctx, key, body); putErr != nil {
+		// The build succeeded, so the entry is worth storing even if the last
+		// participant has already left and cancelled ctx: warming the cache for
+		// the next caller is the whole point. Same bound as the flight so an
+		// out-of-process cache cannot hang the store forever.
+		putCtx, cancelPut := context.WithTimeout(context.WithoutCancel(ctx), s.flightTimeout())
+		defer cancelPut()
+		if putErr := cache.Put(putCtx, key, body); putErr != nil {
 			s.log.Printf("warning: cache store for %s failed: %v", key, putErr)
 		}
 		return built, nil

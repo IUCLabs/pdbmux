@@ -52,6 +52,10 @@ type CacheStats struct {
 // upstream fetch fails. The context and error exist for out-of-process backends
 // (the reports cache lands on S3); an in-process backend ignores both.
 //
+// Put's context is detached from the request and flight that produced the body,
+// so a store still runs when the last caller has walked away; it carries its own
+// timeout.
+//
 // A Body handed back by Get aliases the cache's copy and must not be mutated.
 type Cache interface {
 	Get(ctx context.Context, key string) (CacheEntry, CacheStatus, error)
