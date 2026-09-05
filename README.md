@@ -83,16 +83,10 @@ Each backend applies `order_by`/`limit`/`offset` to its own slice only, so
 
 Precedence (lowest → highest): **defaults < config file < env vars (`PDBMUX_*`) < flags**.
 
-Config file: `$XDG_CONFIG_HOME/pdbmux/config.yaml`. In a container, configuration
-is supplied entirely via `PDBMUX_*` env vars (no config file) — see
-[Deployment](#deployment).
-
-**`backends` has no default.** `pdbmux` refuses to start until at least one
-backend is configured, via the config file or `PDBMUX_BACKENDS`. `primary` and
-`prefer` default to the first configured backend.
+Config file: `$XDG_CONFIG_HOME/pdbmux/config.yaml`. In a container there is no
+config file — everything comes from `PDBMUX_*` env vars.
 
 ```yaml
-# ~/.config/pdbmux/config.yaml  (local dev; in a container use PDBMUX_* env instead)
 listen: ":8080"
 backends:
   - name: old
@@ -106,8 +100,8 @@ timeout: 10s          # per-upstream request timeout
 freshness_ttl: 30s    # freshness-map cache TTL (freshness merge only)
 ```
 
-`backends[*].url` is a **base** URL (`scheme://host[:port]`), without the
-`/pdb/query/v4/...` path — `pdbmux` appends the path per request.
+`backends[*].url` is a **base** URL (`scheme://host[:port]`); `pdbmux` appends
+the `/pdb/query/v4/...` path per request.
 
 | Env var | Overrides |
 |---|---|
@@ -123,69 +117,27 @@ Flags: `--listen`, `--primary`, `--merge`.
 
 ## Running
 
-```bash
-pdbmux                 # start the proxy (serve is the default action)
-pdbmux serve           # explicit
-pdbmux config init     # write an example config file to edit
-pdbmux config show     # print active config after all overrides
-pdbmux version
-```
-
-Point a consumer at it — any PuppetDB v4 client works, it just needs the
-`pdbmux` base URL in place of a PuppetDB one. For Puppetboard, that is its
-PuppetDB host/port setting; for a raw query:
+Subcommands: `serve` (default), `config init`, `config show`, `version`. Run
+`pdbmux --help` for details. Any PuppetDB v4 client works against the `pdbmux`
+base URL in place of a PuppetDB one.
 
 ```bash
+PDBMUX_BACKENDS='old=http://puppetdb1.example.com:8080,new=http://puppetdb2.example.com:8080' pdbmux
 curl -s --get http://localhost:8080/pdb/query/v4/nodes \
   --data-urlencode 'query=["=","certname","host1.example.com"]'
 ```
 
 ## Build
 
-```bash
-make build             # -> dist/pdbmux (CGO disabled, static)
-make test              # go test -race ./...
-make lint              # golangci-lint
-```
-
-Requires Go 1.25+. Dependencies: `github.com/spf13/cobra` (CLI),
-`gopkg.in/yaml.v3` (config file).
+`make build` (static binary into `dist/`), `make test`, `make lint`. Requires Go 1.25+.
 
 ## Deployment
 
-`pdbmux` is distributed as a container image only — there is no OS package. The
-image is built and pushed on every `v*` tag (the release pipeline); the
-registry and repository are pipeline settings, so point them at your own.
+Container image only — no OS package. Every `v*` tag builds and pushes the image
+(the release pipeline); registry and repository are pipeline settings. Tag
+with `make patch` / `minor` / `major`.
 
-It is a minimal static (`CGO_ENABLED=0`) binary on a distroless base
-(`Dockerfile`), configured entirely via `PDBMUX_*` env vars, with a single HTTP
-listener and `/healthz` for liveness/readiness probes. It is stateless, so run
-as many replicas as you like behind an ordinary Service/Ingress.
-
-A container needs at minimum `PDBMUX_BACKENDS`; everything else has a default:
-
-```yaml
-env:
-  - name: PDBMUX_BACKENDS
-    value: "old=http://puppetdb1.example.com:8080,new=http://puppetdb2.example.com:8080"
-  - name: PDBMUX_PRIMARY
-    value: "new"
-  - name: PDBMUX_PREFER
-    value: "new"
-```
-
-Locally you can run the binary directly for development:
-
-```bash
-PDBMUX_BACKENDS='old=http://puppetdb1.example.com:8080,new=http://puppetdb2.example.com:8080' \
-  pdbmux serve
-curl -s localhost:8080/healthz
-```
-
-## Version bumps
-
-```bash
-make patch             # tag vX.Y.(Z+1) and push (triggers the docker release)
-make minor             # tag vX.(Y+1).0
-make major             # tag v(X+1).0.0
-```
+A static (`CGO_ENABLED=0`) binary on a distroless base, configured entirely via
+`PDBMUX_*` env vars; a container needs at minimum `PDBMUX_BACKENDS`. Stateless,
+so run as many replicas as you like; use `/healthz` for liveness/readiness
+probes.

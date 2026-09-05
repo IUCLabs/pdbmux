@@ -22,14 +22,10 @@ const (
 	eventsPath  = "/pdb/query/v4/events"
 	queryV4     = "/pdb/query/v4/"
 
-	// recordsHeader is PuppetDB's total-result-count header, returned when a
-	// request carries include_total=true.
+	// PuppetDB only sends this when the request carries include_total=true.
 	recordsHeader = "X-Records"
 )
 
-// backendResult is one backend's decoded response for a query. err is non-nil
-// when the backend failed (network/timeout/non-2xx); such results carry no
-// records and are excluded from the merge but logged.
 type backendResult struct {
 	name    string
 	records []record
@@ -37,7 +33,6 @@ type backendResult struct {
 	err     error
 }
 
-// Server proxies and merges PuppetDB queries across the configured backends.
 type Server struct {
 	cfg    Config
 	client *http.Client
@@ -49,7 +44,6 @@ type Server struct {
 	freshAt   time.Time
 }
 
-// NewServer builds a Server with an HTTP client bounded by cfg.Timeout.
 func NewServer(cfg Config, logger *log.Logger) *Server {
 	return &Server{
 		cfg:    cfg,
@@ -58,7 +52,6 @@ func NewServer(cfg Config, logger *log.Logger) *Server {
 	}
 }
 
-// Handler returns the HTTP mux for the proxy.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.handleHealth)
@@ -66,10 +59,6 @@ func (s *Server) Handler() http.Handler {
 	return mux
 }
 
-// handleQuery dispatches /pdb/query/v4/* requests: /facts and /nodes are merged
-// per node, /reports and /events are unioned across backends, a report's
-// sub-resources resolve to whichever backend stores that report, and every other
-// v4 path is transparently proxied to the primary.
 func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "only GET is supported", http.StatusMethodNotAllowed)
@@ -93,9 +82,7 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// isReportSubResource reports whether path is a per-report child endpoint —
-// /pdb/query/v4/reports/<hash>/{events,logs,metrics} — whose data lives in
-// exactly one backend.
+// Matches /pdb/query/v4/reports/<hash>/{events,logs,metrics}, whose data lives in exactly one backend.
 func isReportSubResource(path string) bool {
 	rest, ok := strings.CutPrefix(path, reportsPath+"/")
 	if !ok {
@@ -112,9 +99,6 @@ func isReportSubResource(path string) bool {
 	return false
 }
 
-// serveMerged fans out the request to all backends, then hands the per-backend
-// results to merge to produce the response body. If every backend fails it
-// returns 502; if some fail it serves the survivors and logs a warning.
 func (s *Server) serveMerged(w http.ResponseWriter, r *http.Request, path string, merge func([]backendResult) []json.RawMessage) {
 	alive, ok := s.aliveResults(w, r, path, queryParams(r.URL.Query().Get("query")))
 	if !ok {
@@ -123,10 +107,7 @@ func (s *Server) serveMerged(w http.ResponseWriter, r *http.Request, path string
 	writeJSON(w, merge(alive))
 }
 
-// serveUnion fans out a request whose records are immutable history — reports
-// and events — and serves the deduped union of every backend. Because each
-// backend ordered and paged only its own slice, the union is re-ordered and
-// re-paged here from the client's order_by/limit/offset.
+// Reports and events are immutable history, so both backends' records belong in the merged view.
 func (s *Server) serveUnion(w http.ResponseWriter, r *http.Request, path string, key func(record) (string, bool)) {
 	in := r.URL.Query()
 	page, err := parsePaging(in)
@@ -150,11 +131,7 @@ func (s *Server) serveUnion(w http.ResponseWriter, r *http.Request, path string,
 	writeJSON(w, page.apply(merged))
 }
 
-// serveFirstHolder answers a per-report sub-resource request. The report lives
-// in exactly one backend, so all are asked concurrently and the first one (in
-// precedence order) that actually holds it wins. Backends that do not have the
-// report answer 404, which is indistinguishable here from any other failure, so
-// an empty result is only served once every backend has been consulted.
+// A backend without the report answers 404, indistinguishable from a failure, so every backend is consulted before serving empty.
 func (s *Server) serveFirstHolder(w http.ResponseWriter, r *http.Request) {
 	results := s.fanOut(r.Context(), r.URL.Path, r.URL.Query())
 
@@ -179,8 +156,7 @@ func (s *Server) serveFirstHolder(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, nil)
 }
 
-// aliveResults fans out to every backend and returns the successful results.
-// It writes a 502 and returns ok=false when every backend failed.
+// Writes a 502 and returns ok=false only when every backend failed.
 func (s *Server) aliveResults(w http.ResponseWriter, r *http.Request, path string, params url.Values) ([]backendResult, bool) {
 	results := s.fanOut(r.Context(), path, params)
 
@@ -199,8 +175,6 @@ func (s *Server) aliveResults(w http.ResponseWriter, r *http.Request, path strin
 	return alive, true
 }
 
-// queryParams builds the upstream param set for a merged endpoint that only
-// forwards the PuppetDB query.
 func queryParams(query string) url.Values {
 	if query == "" {
 		return nil
@@ -208,7 +182,6 @@ func queryParams(query string) url.Values {
 	return url.Values{"query": []string{query}}
 }
 
-// rawRecords strips decoded metadata back down to the verbatim JSON elements.
 func rawRecords(recs []record) []json.RawMessage {
 	out := make([]json.RawMessage, 0, len(recs))
 	for _, rec := range recs {
@@ -217,21 +190,16 @@ func rawRecords(recs []record) []json.RawMessage {
 	return out
 }
 
-// mergeNodesResponse merges /nodes results (dedupe by certname, newer wins).
 func (s *Server) mergeNodesResponse(results []backendResult) []json.RawMessage {
 	return mergeNodes(s.byPrecedence(results))
 }
 
-// mergeFactsResponse merges /facts results at node granularity, choosing each
-// certname's owner via the configured merge strategy.
 func (s *Server) mergeFactsResponse(results []backendResult) []json.RawMessage {
 	ordered := s.byPrecedence(results)
 	if s.cfg.Merge == mergeStatic {
 		prefer := s.cfg.Prefer
 		return mergeFacts(ordered, func(string) string { return prefer })
 	}
-	// freshness merge: attribute each certname to the backend with the newer
-	// report_timestamp, taken from a short-TTL /nodes freshness map.
 	fresh := s.freshnessMap(context.Background(), ordered)
 	prefer := s.cfg.Prefer
 	return mergeFacts(ordered, func(cn string) string {
@@ -242,8 +210,7 @@ func (s *Server) mergeFactsResponse(results []backendResult) []json.RawMessage {
 	})
 }
 
-// byPrecedence orders results so the Prefer backend comes first, giving it the
-// tie-break on equal timestamps. Remaining backends keep config order.
+// Puts Prefer first so it wins ties; the rest keep config order.
 func (s *Server) byPrecedence(results []backendResult) []backendResult {
 	ordered := make([]backendResult, len(results))
 	copy(ordered, results)
@@ -253,15 +220,7 @@ func (s *Server) byPrecedence(results []backendResult) []backendResult {
 	return ordered
 }
 
-// freshnessMap returns a per-certname owner map derived from each backend's
-// /nodes report_timestamp, cached for cfg.FreshnessTTL. On cache miss it queries
-// /nodes from all backends; a backend that fails is simply absent from the map,
-// so its certnames fall back to precedence/Prefer.
-//
-// When the incoming request already carries /nodes data (results has records),
-// we still query /nodes broadly here because a /facts query's certname set can
-// differ from what the request's query filter returned. The cache keeps this
-// cheap under load.
+// Queries /nodes unfiltered rather than reusing the request's results, because a /facts query's certname set can differ.
 func (s *Server) freshnessMap(ctx context.Context, _ []backendResult) freshness {
 	s.mu.Lock()
 	if s.freshData != nil && time.Since(s.freshAt) < s.cfg.FreshnessTTL {
@@ -271,7 +230,6 @@ func (s *Server) freshnessMap(ctx context.Context, _ []backendResult) freshness 
 	}
 	s.mu.Unlock()
 
-	// Empty query = all nodes; cheap enough for a short-TTL cache.
 	nodeResults := s.fanOut(ctx, nodesPath, nil)
 	var alive []backendResult
 	for _, res := range nodeResults {
@@ -290,8 +248,7 @@ func (s *Server) freshnessMap(ctx context.Context, _ []backendResult) freshness 
 	return f
 }
 
-// fanOut queries every backend concurrently for path with the given params and
-// returns one backendResult per backend, in config order.
+// Returns one result per backend, in config order.
 func (s *Server) fanOut(ctx context.Context, path string, params url.Values) []backendResult {
 	results := make([]backendResult, len(s.cfg.Backends))
 	var wg sync.WaitGroup
@@ -307,8 +264,7 @@ func (s *Server) fanOut(ctx context.Context, path string, params url.Values) []b
 	return results
 }
 
-// queryBackend performs one GET b.URL+path?params and decodes the JSON array.
-// It also returns the upstream X-Records count, or -1 when the backend sent none.
+// The returned count is the upstream X-Records value, or -1 when the backend sent none.
 func (s *Server) queryBackend(ctx context.Context, b Backend, path string, params url.Values) ([]record, int, error) {
 	target := strings.TrimRight(b.URL, "/") + path
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
@@ -338,8 +294,6 @@ func (s *Server) queryBackend(ctx context.Context, b Backend, path string, param
 	return recs, total, err
 }
 
-// proxyPrimary transparently forwards a non-merged /pdb/query/v4/* request to
-// the primary backend and streams the response back verbatim.
 func (s *Server) proxyPrimary(w http.ResponseWriter, r *http.Request) {
 	b := s.cfg.PrimaryBackend()
 	target := strings.TrimRight(b.URL, "/") + r.URL.Path
@@ -365,15 +319,11 @@ func (s *Server) proxyPrimary(w http.ResponseWriter, r *http.Request) {
 	_, _ = io.Copy(w, resp.Body)
 }
 
-// healthReport is the /healthz JSON body.
 type healthReport struct {
 	Status   string            `json:"status"`
 	Backends map[string]string `json:"backends"` // name -> "ok" | error text
 }
 
-// handleHealth probes every backend's /nodes endpoint with a trivial query and
-// reports per-backend reachability. Overall status is "ok" if any backend is
-// reachable, "degraded" if some fail, "down" if all fail (503 in that case).
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	probe := `["=","certname","pdbmux-healthz-probe"]`
 	results := s.fanOut(r.Context(), nodesPath, queryParams(probe))
@@ -406,7 +356,6 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	_ = enc.Encode(report)
 }
 
-// writeJSON writes a JSON array of raw records as a PuppetDB-style response.
 func writeJSON(w http.ResponseWriter, recs []json.RawMessage) {
 	w.Header().Set("Content-Type", "application/json")
 	if recs == nil {
