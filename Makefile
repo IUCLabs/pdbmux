@@ -9,7 +9,6 @@ ARCH    ?= $(shell go env GOARCH)
 
 all: build
 
-# Build the single static binary into dist/.
 build:
 	CGO_ENABLED=0 GOOS=$(OS) GOARCH=$(ARCH) go build $(GOFLAGS) -o $(DIST)/$(BINARY) .
 
@@ -28,8 +27,6 @@ clean:
 install:
 	go install $(GOFLAGS) .
 
-# Bump helpers — read the latest semver tag and create the next one.
-# If no tag exists yet, start from v0.0.0.
 _LATEST := $(shell git tag --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$$' | head -1)
 _BASE   := $(if $(_LATEST),$(_LATEST),v0.0.0)
 _MAJ    := $(shell echo $(_BASE) | sed 's/^v//' | cut -d. -f1)

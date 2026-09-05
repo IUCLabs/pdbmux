@@ -5,24 +5,18 @@ import (
 	"time"
 )
 
-// record is a single PuppetDB result element kept as raw JSON so unknown fields
-// survive the merge untouched. certname/report_timestamp are decoded only for
-// merge decisions.
+// Raw is kept verbatim so unknown PuppetDB fields survive the merge.
 type record struct {
 	Raw             json.RawMessage
 	Certname        string
 	ReportTimestamp string // only populated for /nodes records
 }
 
-// recordMeta is the subset we decode from any /nodes or /facts element to drive
-// merge decisions.
 type recordMeta struct {
 	Certname        string `json:"certname"`
 	ReportTimestamp string `json:"report_timestamp"`
 }
 
-// decodeRecords turns a raw PuppetDB JSON array into records, preserving each
-// element verbatim in Raw. A body that is not a JSON array yields (nil, err).
 func decodeRecords(body []byte) ([]record, error) {
 	var raws []json.RawMessage
 	if err := json.Unmarshal(body, &raws); err != nil {
@@ -41,8 +35,7 @@ func decodeRecords(body []byte) ([]record, error) {
 	return out, nil
 }
 
-// parseTimestamp parses a PuppetDB RFC3339(nano) timestamp. Zero time on
-// failure sorts oldest, so a backend with a well-formed newer timestamp wins.
+// An unparseable timestamp yields the zero time, which sorts oldest.
 func parseTimestamp(s string) time.Time {
 	if s == "" {
 		return time.Time{}
@@ -53,10 +46,7 @@ func parseTimestamp(s string) time.Time {
 	return time.Time{}
 }
 
-// mergeNodes dedupes /nodes records by certname, keeping the one with the newer
-// report_timestamp. backends is the ordered list of (name, records) results;
-// when timestamps tie (or both are zero), the earlier backend in the slice
-// wins, so callers should order by precedence.
+// results must be ordered by precedence: ties keep the earlier backend's record.
 func mergeNodes(results []backendResult) []json.RawMessage {
 	type pick struct {
 		raw json.RawMessage
@@ -73,7 +63,6 @@ func mergeNodes(results []backendResult) []json.RawMessage {
 				order = append(order, rec.Certname)
 				continue
 			}
-			// Strictly-newer wins; ties keep the existing (earlier-backend) pick.
 			if ts.After(cur.ts) {
 				best[rec.Certname] = pick{raw: rec.Raw, ts: ts}
 			}
@@ -86,12 +75,10 @@ func mergeNodes(results []backendResult) []json.RawMessage {
 	return out
 }
 
-// freshness maps certname -> backend name that holds that node's newest report.
+// certname -> name of the backend holding that node's newest report.
 type freshness map[string]string
 
-// buildFreshness computes, per certname, which backend has the newer
-// report_timestamp. results must be ordered by precedence; on a tie the
-// earlier backend wins.
+// results must be ordered by precedence: ties keep the earlier backend.
 func buildFreshness(results []backendResult) freshness {
 	type pick struct {
 		backend string
@@ -114,19 +101,9 @@ func buildFreshness(results []backendResult) freshness {
 	return f
 }
 
-// mergeFacts merges /facts records at node granularity: for each certname, all
-// facts from the winning backend are kept and the other backend's facts for
-// that certname are dropped.
-//
-// The winner is chosen per certname by `owner(certname)`. Callers supply owner
-// from either a freshness map (freshness merge) or a constant preferred backend
-// (static merge). When owner returns a backend that has no facts for a certname
-// (or a name not in results), records fall back to precedence order so a node
-// present in only one backend still appears.
+// owner names the winning backend per certname; when it holds no facts for that certname, precedence order wins.
 func mergeFacts(results []backendResult, owner func(certname string) string) []json.RawMessage {
-	// Which backends actually returned facts for each certname, in precedence
-	// order, so we can fall back if the chosen owner has none.
-	present := map[string][]string{} // certname -> ordered backend names
+	present := map[string][]string{} // certname -> backend names, in precedence order
 	byKey := map[string][]json.RawMessage{}
 	for _, res := range results {
 		for _, rec := range res.records {
@@ -154,7 +131,6 @@ func mergeFacts(results []backendResult, owner func(certname string) string) []j
 	for _, cn := range order {
 		backends := present[cn]
 		chosen := owner(cn)
-		// Fall back to precedence order if the chosen backend has no facts here.
 		if !contains(backends, chosen) {
 			chosen = backends[0]
 		}

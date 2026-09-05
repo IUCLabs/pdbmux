@@ -16,49 +16,27 @@ const (
 	configFileName = "config.yaml"
 	envPrefix      = "PDBMUX_"
 
-	// defaultListen is the default HTTP listen address.
-	defaultListen = ":8080"
-	// defaultOldURL / defaultNewURL are the two PuppetDBs merged during the
-	// VM -> k8s migration. old = legacy VM-registered puppetdbapi; new =
-	// the k8s PuppetDB behind the gateway (TLS terminated there).
-	defaultOldURL = "http://puppetdb.example.com:8080"
-	defaultNewURL = "https://puppetdb.k8s.example.net"
-	// defaultPrimary is the backend name used for pass-through (non-merged)
-	// /pdb/query/v4/* paths and as static precedence for merge fallback.
+	defaultListen  = ":8080"
+	defaultOldURL  = "http://puppetdb.example.com:8080"
+	defaultNewURL  = "https://puppetdb.k8s.example.net"
 	defaultPrimary = "new"
 
 	defaultTimeout      = 10 * time.Second
 	defaultFreshnessTTL = 30 * time.Second
 )
 
-// Backend is one upstream PuppetDB. URL is the base URL (scheme://host[:port]),
-// without the /pdb/query/v4/... path — that is appended per request.
 type Backend struct {
 	Name string `yaml:"name"`
-	URL  string `yaml:"url"`
+	URL  string `yaml:"url"` // base URL only; the query path is appended per request
 }
 
-// Config holds every configurable value. Fields map 1:1 to config-file keys and
-// env vars (PDBMUX_*). See Load for precedence.
 type Config struct {
-	// Listen is the HTTP listen address (host:port).
-	Listen string `yaml:"listen"`
-	// Backends is the ordered list of upstream PuppetDBs to fan out to.
-	Backends []Backend `yaml:"backends"`
-	// Primary is the backend Name used for transparent pass-through of
-	// non-merged /pdb/query/v4/* paths.
-	Primary string `yaml:"primary"`
-	// Merge selects how /facts records are attributed to a backend when a
-	// certname appears in both: "freshness" (query /nodes report_timestamp,
-	// newer wins) or "static" (always prefer the Prefer backend).
-	Merge string `yaml:"merge"`
-	// Prefer names the backend that wins under static merge and as the
-	// tie-breaker/fallback under freshness merge.
-	Prefer string `yaml:"prefer"`
-	// Timeout bounds each upstream request.
-	Timeout time.Duration `yaml:"timeout"`
-	// FreshnessTTL is how long a per-certname freshness map (from /nodes) is
-	// cached under the "freshness" merge strategy.
+	Listen       string        `yaml:"listen"`
+	Backends     []Backend     `yaml:"backends"`
+	Primary      string        `yaml:"primary"`
+	Merge        string        `yaml:"merge"`
+	Prefer       string        `yaml:"prefer"` // wins under static merge, and breaks ties under freshness merge
+	Timeout      time.Duration `yaml:"timeout"`
 	FreshnessTTL time.Duration `yaml:"freshness_ttl"`
 }
 
@@ -67,8 +45,6 @@ const (
 	mergeStatic    = "static"
 )
 
-// DefaultConfig returns the built-in defaults: both migration PuppetDBs,
-// freshness merge, "new" primary/preferred.
 func DefaultConfig() Config {
 	return Config{
 		Listen: defaultListen,
@@ -84,7 +60,6 @@ func DefaultConfig() Config {
 	}
 }
 
-// ConfigDir returns the XDG_CONFIG_HOME/pdbmux directory.
 func ConfigDir() string {
 	base := os.Getenv("XDG_CONFIG_HOME")
 	if base == "" {
@@ -94,15 +69,11 @@ func ConfigDir() string {
 	return filepath.Join(base, appName)
 }
 
-// ConfigPath returns the full path to the config file.
 func ConfigPath() string {
 	return filepath.Join(ConfigDir(), configFileName)
 }
 
-// Load reads the config file (if present), then applies env var overrides.
-// Precedence (lowest -> highest): defaults < config file < env vars < flags
-// (flags are applied by the caller). Backends can be overridden wholesale via
-// PDBMUX_BACKENDS ("name=url,name=url").
+// Precedence: defaults < config file < env vars < flags, and flags are applied by the caller.
 func Load() (Config, error) {
 	cfg := DefaultConfig()
 
@@ -125,7 +96,6 @@ func Load() (Config, error) {
 	return cfg, nil
 }
 
-// applyEnv overlays PDBMUX_* env vars onto cfg. getenv is injected for testing.
 func applyEnv(cfg *Config, getenv func(string) string) {
 	if v := getenv(envPrefix + "LISTEN"); v != "" {
 		cfg.Listen = v
@@ -156,8 +126,7 @@ func applyEnv(cfg *Config, getenv func(string) string) {
 	}
 }
 
-// parseBackends parses "name=url,name=url" into Backends. Entries without an
-// "=" are skipped. Used for the PDBMUX_BACKENDS env override.
+// Parses the PDBMUX_BACKENDS form "name=url,name=url"; entries without an "=" are skipped.
 func parseBackends(s string) []Backend {
 	var out []Backend
 	for _, part := range strings.Split(s, ",") {
@@ -175,7 +144,6 @@ func parseBackends(s string) []Backend {
 	return out
 }
 
-// Validate checks the config is internally consistent and usable.
 func (c Config) Validate() error {
 	if len(c.Backends) == 0 {
 		return fmt.Errorf("no backends configured")
@@ -207,8 +175,6 @@ func (c Config) Validate() error {
 	return nil
 }
 
-// PrimaryBackend returns the backend named by Primary (guaranteed present after
-// Validate).
 func (c Config) PrimaryBackend() Backend {
 	for _, b := range c.Backends {
 		if b.Name == c.Primary {
@@ -218,7 +184,6 @@ func (c Config) PrimaryBackend() Backend {
 	return c.Backends[0]
 }
 
-// writeDefaultConfig creates the config dir and writes a default config file.
 func writeDefaultConfig() error {
 	dir := ConfigDir()
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -240,8 +205,6 @@ func writeDefaultConfig() error {
 	return nil
 }
 
-// durationString renders a duration for `config show` (falls back to a plain
-// seconds count for zero to avoid "0s" ambiguity in logs).
 func durationString(d time.Duration) string {
 	if d == 0 {
 		return "0"

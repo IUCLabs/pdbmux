@@ -1,21 +1,4 @@
-// Command pdbmux is a small merging HTTP proxy over two PuppetDB backends.
-//
-// During the VM -> k8s Puppet migration there are two PuppetDBs — the legacy
-// VM-registered one and the new k8s one — and nodes move between them as
-// they migrate. pdbmux presents a single merged PuppetDB v4 query surface so
-// PuppetDB clients (and anything else) see one consistent view:
-//
-//   - GET /pdb/query/v4/nodes  — fan out to both backends, dedupe by certname,
-//     keep the record with the newer report_timestamp.
-//   - GET /pdb/query/v4/facts  — fan out to both, and for a certname present in
-//     both keep ALL facts from the backend holding that node's newer report
-//     (freshness merge) or a static preferred backend (static merge).
-//   - any other GET /pdb/query/v4/* — transparently proxied to the primary.
-//   - GET /healthz — per-backend reachability.
-//
-// The query param is forwarded verbatim (PuppetDB AST JSON). If one backend
-// errors/times out, the other's results are served; only if both fail does a
-// merged endpoint return 502.
+// Command pdbmux serves one merged PuppetDB v4 query surface over two PuppetDBs.
 package main
 
 import (
@@ -119,8 +102,6 @@ func main() {
 	}
 }
 
-// runServer starts the HTTP server and blocks until SIGINT/SIGTERM, then
-// gracefully shuts down.
 func runServer(cfg Config) error {
 	logger := log.New(os.Stderr, "pdbmux: ", log.LstdFlags)
 	srv := NewServer(cfg, logger)
@@ -155,7 +136,6 @@ func runServer(cfg Config) error {
 	}
 }
 
-// printConfig renders the active config for `config show`.
 func printConfig(cfg Config) {
 	fmt.Printf("config file  : %s\n", ConfigPath())
 	fmt.Printf("listen       : %s\n", cfg.Listen)

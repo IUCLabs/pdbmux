@@ -1,7 +1,4 @@
-# Build and push the pdbmux container image on a v* tag. pdbmux is a k8s-only
-# daemon (deployed via GitOps), so it ships as an image. Mirrors the estate
-# convention: the CA-baked plugin-docker-buildx image pushes to the
-# internal docker registry (unauthenticated in-cluster push).
+# plugin-docker-buildx is the CA-baked variant; the registry's cert is not in the default trust store.
 when:
   - event: tag
     ref: refs/tags/v*
