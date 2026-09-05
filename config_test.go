@@ -118,6 +118,46 @@ func TestApplyEnv_Backends(t *testing.T) {
 	}
 }
 
+func TestDefaultConfig_HealthProbe(t *testing.T) {
+	cfg := DefaultConfig()
+	if !cfg.HealthProbe || cfg.HealthProbePath != defaultHealthProbePath {
+		t.Errorf("health probe defaults to enabled=%v path=%q, want true %q",
+			cfg.HealthProbe, cfg.HealthProbePath, defaultHealthProbePath)
+	}
+	if cfg.HealthProbeInterval != defaultHealthProbeInterval || cfg.HealthProbeTimeout != defaultHealthProbeTimeout {
+		t.Errorf("probe interval/timeout = %v/%v", cfg.HealthProbeInterval, cfg.HealthProbeTimeout)
+	}
+	if cfg.HealthProbeFailures != defaultHealthProbeFailures || cfg.HealthProbeSuccesses != defaultHealthProbeSuccesses {
+		t.Errorf("probe thresholds = %d/%d", cfg.HealthProbeFailures, cfg.HealthProbeSuccesses)
+	}
+}
+
+func TestApplyEnv_HealthProbe(t *testing.T) {
+	cfg := testConfigValid()
+	env := map[string]string{
+		envPrefix + "HEALTH_PROBE_ENABLED":   "false",
+		envPrefix + "HEALTH_PROBE_PATH":      "/status/v1/simple",
+		envPrefix + "HEALTH_PROBE_INTERVAL":  "45s",
+		envPrefix + "HEALTH_PROBE_TIMEOUT":   "2s",
+		envPrefix + "HEALTH_PROBE_FAILURES":  "5",
+		envPrefix + "HEALTH_PROBE_SUCCESSES": "1",
+	}
+	applyEnv(&cfg, func(k string) string { return env[k] })
+
+	if cfg.HealthProbe {
+		t.Error("PDBMUX_HEALTH_PROBE_ENABLED=false did not disable probing")
+	}
+	if cfg.HealthProbePath != "/status/v1/simple" {
+		t.Errorf("path = %q", cfg.HealthProbePath)
+	}
+	if cfg.HealthProbeInterval != 45*time.Second || cfg.HealthProbeTimeout != 2*time.Second {
+		t.Errorf("interval/timeout = %v/%v", cfg.HealthProbeInterval, cfg.HealthProbeTimeout)
+	}
+	if cfg.HealthProbeFailures != 5 || cfg.HealthProbeSuccesses != 1 {
+		t.Errorf("thresholds = %d/%d", cfg.HealthProbeFailures, cfg.HealthProbeSuccesses)
+	}
+}
+
 func TestDefaultConfig_SourceFact(t *testing.T) {
 	cfg := DefaultConfig()
 	if cfg.SourceFact != defaultSourceFact || !cfg.SourceFactEnabled {
@@ -195,6 +235,16 @@ func TestValidate(t *testing.T) {
 		{"zero timeout", func(c *Config) { c.Timeout = 0 }, true},
 		{"empty source fact while enabled", func(c *Config) { c.SourceFact = "" }, true},
 		{"empty source fact while disabled", func(c *Config) { c.SourceFact = ""; c.SourceFactEnabled = false }, false},
+		{"empty health probe path", func(c *Config) { c.HealthProbePath = "" }, true},
+		{"relative health probe path", func(c *Config) { c.HealthProbePath = "status/v1/services" }, true},
+		{"zero health probe interval", func(c *Config) { c.HealthProbeInterval = 0 }, true},
+		{"zero health probe timeout", func(c *Config) { c.HealthProbeTimeout = 0 }, true},
+		{"zero health probe failures", func(c *Config) { c.HealthProbeFailures = 0 }, true},
+		{"zero health probe successes", func(c *Config) { c.HealthProbeSuccesses = 0 }, true},
+		{"bad health probe settings while disabled", func(c *Config) {
+			c.HealthProbe = false
+			c.HealthProbePath, c.HealthProbeInterval, c.HealthProbeFailures = "", 0, 0
+		}, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -456,7 +506,9 @@ func captureStdout(t *testing.T, f func()) string {
 
 func clearEnv(t *testing.T) {
 	t.Helper()
-	for _, k := range []string{"CONFIG", "LISTEN", "MERGE", "TIMEOUT", "FRESHNESS_TTL", "FACTS_TTL", "FACTS_CACHE_BYTES", "BACKENDS"} {
+	for _, k := range []string{"CONFIG", "LISTEN", "MERGE", "TIMEOUT", "FRESHNESS_TTL", "FACTS_TTL", "FACTS_CACHE_BYTES", "BACKENDS",
+		"HEALTH_PROBE_ENABLED", "HEALTH_PROBE_PATH", "HEALTH_PROBE_INTERVAL", "HEALTH_PROBE_TIMEOUT",
+		"HEALTH_PROBE_FAILURES", "HEALTH_PROBE_SUCCESSES"} {
 		t.Setenv(envPrefix+k, "")
 	}
 }

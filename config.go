@@ -34,6 +34,13 @@ const (
 	maxFactsTTL      = 30 * time.Second
 	defaultFactsTTL  = 30 * time.Second
 	defaultCacheSize = int64(64 << 20)
+
+	// PuppetDB serves its trapperkeeper status service here, unauthenticated.
+	defaultHealthProbePath      = "/status/v1/services"
+	defaultHealthProbeInterval  = 10 * time.Second
+	defaultHealthProbeTimeout   = 5 * time.Second
+	defaultHealthProbeFailures  = 3
+	defaultHealthProbeSuccesses = 2
 )
 
 var exampleBackends = []Backend{
@@ -58,6 +65,13 @@ type Config struct {
 	SourceFact        string `yaml:"source_fact"`
 	SourceFactEnabled bool   `yaml:"source_fact_enabled"`
 
+	HealthProbe          bool          `yaml:"health_probe_enabled"`
+	HealthProbePath      string        `yaml:"health_probe_path"`
+	HealthProbeInterval  time.Duration `yaml:"health_probe_interval"`
+	HealthProbeTimeout   time.Duration `yaml:"health_probe_timeout"`
+	HealthProbeFailures  int           `yaml:"health_probe_failures"`
+	HealthProbeSuccesses int           `yaml:"health_probe_successes"`
+
 	sourcePath      string        // file this config was read from, empty if none was found
 	factsTTLClamped time.Duration // pre-clamp facts_ttl, zero when nothing was clamped
 }
@@ -80,6 +94,13 @@ func DefaultConfig() Config {
 		CacheBytes:        defaultCacheSize,
 		SourceFact:        defaultSourceFact,
 		SourceFactEnabled: true,
+
+		HealthProbe:          true,
+		HealthProbePath:      defaultHealthProbePath,
+		HealthProbeInterval:  defaultHealthProbeInterval,
+		HealthProbeTimeout:   defaultHealthProbeTimeout,
+		HealthProbeFailures:  defaultHealthProbeFailures,
+		HealthProbeSuccesses: defaultHealthProbeSuccesses,
 	}
 }
 
@@ -206,6 +227,34 @@ func applyEnv(cfg *Config, getenv func(string) string) {
 			cfg.CacheBytes = n
 		}
 	}
+	if v := getenv(envPrefix + "HEALTH_PROBE_ENABLED"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			cfg.HealthProbe = b
+		}
+	}
+	if v := getenv(envPrefix + "HEALTH_PROBE_PATH"); v != "" {
+		cfg.HealthProbePath = v
+	}
+	if v := getenv(envPrefix + "HEALTH_PROBE_INTERVAL"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			cfg.HealthProbeInterval = d
+		}
+	}
+	if v := getenv(envPrefix + "HEALTH_PROBE_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			cfg.HealthProbeTimeout = d
+		}
+	}
+	if v := getenv(envPrefix + "HEALTH_PROBE_FAILURES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.HealthProbeFailures = n
+		}
+	}
+	if v := getenv(envPrefix + "HEALTH_PROBE_SUCCESSES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.HealthProbeSuccesses = n
+		}
+	}
 	if v := getenv(envPrefix + "BACKENDS"); v != "" {
 		if bs := parseBackends(v); len(bs) > 0 {
 			cfg.Backends = bs
@@ -272,6 +321,26 @@ func (c Config) Validate() error {
 	if c.CacheBytes < 0 {
 		return fmt.Errorf("facts_cache_bytes must not be negative")
 	}
+	if c.HealthProbe {
+		if c.HealthProbePath == "" {
+			return fmt.Errorf("health_probe_path must be non-empty, or set health_probe_enabled to false")
+		}
+		if !strings.HasPrefix(c.HealthProbePath, "/") {
+			return fmt.Errorf("health_probe_path must start with /, got %q", c.HealthProbePath)
+		}
+		if c.HealthProbeInterval <= 0 {
+			return fmt.Errorf("health_probe_interval must be positive")
+		}
+		if c.HealthProbeTimeout <= 0 {
+			return fmt.Errorf("health_probe_timeout must be positive")
+		}
+		if c.HealthProbeFailures < 1 {
+			return fmt.Errorf("health_probe_failures must be at least 1")
+		}
+		if c.HealthProbeSuccesses < 1 {
+			return fmt.Errorf("health_probe_successes must be at least 1")
+		}
+	}
 	return nil
 }
 
@@ -293,9 +362,14 @@ func writeDefaultConfig(path string) error {
 		"# Env overrides: PDBMUX_LISTEN, PDBMUX_MERGE, PDBMUX_TIMEOUT,\n" +
 		"#   PDBMUX_FRESHNESS_TTL, PDBMUX_FACTS_TTL, PDBMUX_FACTS_CACHE_BYTES,\n" +
 		"#   PDBMUX_BACKENDS (name=url,name=url),\n" +
-		"#   PDBMUX_SOURCE_FACT, PDBMUX_SOURCE_FACT_ENABLED.\n" +
+		"#   PDBMUX_SOURCE_FACT, PDBMUX_SOURCE_FACT_ENABLED,\n" +
+		"#   PDBMUX_HEALTH_PROBE_ENABLED, PDBMUX_HEALTH_PROBE_PATH,\n" +
+		"#   PDBMUX_HEALTH_PROBE_INTERVAL, PDBMUX_HEALTH_PROBE_TIMEOUT,\n" +
+		"#   PDBMUX_HEALTH_PROBE_FAILURES, PDBMUX_HEALTH_PROBE_SUCCESSES.\n" +
 		"# facts_ttl caches merged /facts and /nodes in memory; it is capped at 30s\n" +
-		"# (a larger value is clamped) and 0 disables the cache.\n\n")
+		"# (a larger value is clamped) and 0 disables the cache.\n" +
+		"# health_probe_* polls each backend's status endpoint so queries skip a\n" +
+		"# backend that is down; when every backend is down all are queried anyway.\n\n")
 	if err := os.WriteFile(path, append(header, data...), 0o644); err != nil {
 		return fmt.Errorf("writing config: %w", err)
 	}

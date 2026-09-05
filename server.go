@@ -32,6 +32,9 @@ const (
 	// and how old the served copy is.
 	cacheStatusHeader = "X-Cache"
 	ageHeader         = "Age"
+
+	// Set by pdbmux: "<contributed>/<configured>" backends behind a merged response.
+	backendsHeader = "X-Backends"
 )
 
 type backendResult struct {
@@ -53,6 +56,10 @@ type Server struct {
 	flights    flightGroup
 	stale      staleTracker
 
+	// health is nil when probing is disabled, which makes every backend healthy.
+	health  *prober
+	partial partialTracker
+
 	// now is shared with the cache's clock so Age matches the stored timestamp.
 	now func() time.Time
 
@@ -73,8 +80,16 @@ func NewServer(cfg Config, logger *log.Logger) *Server {
 	if cfg.cacheEnabled() {
 		s.factsCache = newMemoryCache(cfg.FactsTTL, cfg.CacheBytes)
 	}
+	s.health = newProber(cfg, logger)
 	return s
 }
+
+// StartProbes begins background health probing; it never blocks on a first
+// round, so the listener serves straight away.
+func (s *Server) StartProbes(ctx context.Context) { s.health.Start(ctx) }
+
+// StopProbes stops the probing goroutines and waits for them to exit.
+func (s *Server) StopProbes() { s.health.Stop() }
 
 // cacheFor picks the cache backing a request. Merged /facts and /nodes record
 // sets share the in-memory cache; every other path is uncached until the reports
@@ -156,8 +171,16 @@ func (s *Server) serveMerged(w http.ResponseWriter, r *http.Request, path string
 		if err != nil {
 			return cachedResponse{}, err
 		}
-		return cachedResponse{Body: encodeRecords(merge(alive)), Records: -1}, nil
+		resp := cachedResponse{Body: encodeRecords(merge(alive)), Records: -1}
+		s.countBackends(&resp, alive)
+		return resp, nil
 	})
+}
+
+// countBackends stamps a response with how many backends it was built from, of
+// how many configured.
+func (s *Server) countBackends(resp *cachedResponse, alive []backendResult) {
+	resp.Backends, resp.Configured = len(alive), len(s.cfg.Backends)
 }
 
 // Reports and events are immutable history, so both backends' records belong in the merged view.
@@ -179,6 +202,7 @@ func (s *Server) serveUnion(w http.ResponseWriter, r *http.Request, path string,
 		merged := mergeUnion(alive, key)
 		sortRecords(merged, page.order)
 		resp := cachedResponse{Body: encodeRecords(page.apply(merged)), Records: -1}
+		s.countBackends(&resp, alive)
 		if page.wantTotal {
 			if total := sumTotals(alive); total >= 0 {
 				resp.Records = total
@@ -232,6 +256,7 @@ func (s *Server) serveSummed(w http.ResponseWriter, r *http.Request, path string
 		merged := sumRows(alive, columns)
 		sortRecords(merged, page.order)
 		resp := cachedResponse{Body: encodeRecords(page.apply(merged)), Records: -1}
+		s.countBackends(&resp, alive)
 		if page.wantTotal {
 			resp.Records = len(merged)
 		}
@@ -276,17 +301,21 @@ func (s *Server) aliveResults(ctx context.Context, path string, params url.Value
 		}
 		alive = append(alive, res)
 	}
+	s.partial.record(len(alive), len(s.cfg.Backends), s.now())
 	if len(alive) == 0 {
 		return nil, errAllBackendsFailed
 	}
 	return alive, nil
 }
 
-// cachedResponse is the stored form of a merged response: the JSON body plus the
-// X-Records value it carried, so a cache hit reproduces both.
+// cachedResponse is the stored form of a merged response: the JSON body, the
+// X-Records value it carried and how many backends it was built from, so a cache
+// hit reproduces all three.
 type cachedResponse struct {
-	Body    json.RawMessage `json:"body"`
-	Records int             `json:"records"` // -1 when the response sets no X-Records
+	Body       json.RawMessage `json:"body"`
+	Records    int             `json:"records"`    // -1 when the response sets no X-Records
+	Backends   int             `json:"backends"`   // backends that contributed records
+	Configured int             `json:"configured"` // backends configured at build time
 }
 
 // serveCached answers from the cache when the entry is fresh, otherwise runs
@@ -413,6 +442,9 @@ func writeCached(w http.ResponseWriter, resp cachedResponse) {
 	if resp.Records >= 0 {
 		w.Header().Set(recordsHeader, strconv.Itoa(resp.Records))
 	}
+	if resp.Configured > 0 {
+		w.Header().Set(backendsHeader, strconv.Itoa(resp.Backends)+"/"+strconv.Itoa(resp.Configured))
+	}
 	// resp.Body is shared with the cache and with every caller of a single
 	// flight, so it is written, never appended to.
 	body := []byte(resp.Body)
@@ -499,11 +531,40 @@ func (s *Server) freshnessMap(ctx context.Context, _ []backendResult) freshness 
 	return f
 }
 
-// Returns one result per backend, in config order.
+// Returns one result per queried backend, in config order. Backends the prober
+// currently has down are skipped so a known-dead backend costs no timeout.
 func (s *Server) fanOut(ctx context.Context, path string, params url.Values) []backendResult {
-	results := make([]backendResult, len(s.cfg.Backends))
+	return s.fanOutTo(ctx, s.liveBackends(), path, params)
+}
+
+// fanOutAll ignores health state and asks every configured backend.
+func (s *Server) fanOutAll(ctx context.Context, path string, params url.Values) []backendResult {
+	return s.fanOutTo(ctx, s.cfg.Backends, path, params)
+}
+
+// liveBackends drops the backends currently marked unhealthy, but falls open to
+// the full list when that would leave none: a broken prober, a wrong health
+// path or a partition seen only by the prober must never black-hole traffic.
+func (s *Server) liveBackends() []Backend {
+	if s.health == nil {
+		return s.cfg.Backends
+	}
+	live := make([]Backend, 0, len(s.cfg.Backends))
+	for _, b := range s.cfg.Backends {
+		if s.health.healthy(b.Name) {
+			live = append(live, b)
+		}
+	}
+	if len(live) == 0 {
+		return s.cfg.Backends
+	}
+	return live
+}
+
+func (s *Server) fanOutTo(ctx context.Context, backends []Backend, path string, params url.Values) []backendResult {
+	results := make([]backendResult, len(backends))
 	var wg sync.WaitGroup
-	for i, b := range s.cfg.Backends {
+	for i, b := range backends {
 		wg.Add(1)
 		go func(i int, b Backend) {
 			defer wg.Done()
@@ -605,9 +666,43 @@ func setContentType(w http.ResponseWriter, contentType string) {
 }
 
 type healthReport struct {
-	Status   string            `json:"status"`
-	Backends map[string]string `json:"backends"` // name -> "ok" | error text
-	Cache    cacheHealth       `json:"cache"`
+	Status   string                   `json:"status"`
+	Backends map[string]backendReport `json:"backends"`
+	Query    queryReport              `json:"query"`
+	Cache    cacheHealth              `json:"cache"`
+}
+
+// backendReport pairs this request's own reachability check with the background
+// prober's running state for the same backend.
+type backendReport struct {
+	Reachable string `json:"reachable"` // "ok" | error text
+	State     string `json:"state"`     // healthy | unhealthy | unprobed | unmonitored
+	Failures  int    `json:"consecutive_failures"`
+	Successes int    `json:"consecutive_successes"`
+	LastProbe string `json:"last_probe,omitempty"`
+	LastError string `json:"last_error,omitempty"`
+}
+
+// queryReport describes the most recent merged fan-out.
+type queryReport struct {
+	Partial       bool   `json:"partial"`
+	Contributed   int    `json:"contributed"`
+	Configured    int    `json:"configured"`
+	PartialRounds uint64 `json:"partial_rounds"`
+	LastPartial   string `json:"last_partial,omitempty"`
+}
+
+func (s *Server) queryHealth() queryReport {
+	seen, contributed, configured, rounds, last := s.partial.snapshot()
+	q := queryReport{Configured: len(s.cfg.Backends), PartialRounds: rounds}
+	if seen {
+		q.Contributed, q.Configured = contributed, configured
+		q.Partial = contributed < configured
+	}
+	if !last.IsZero() {
+		q.LastPartial = last.UTC().Format(time.RFC3339)
+	}
+	return q
 }
 
 type cacheHealth struct {
@@ -646,17 +741,33 @@ func (s *Server) cacheHealth() cacheHealth {
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	probe := `["=","certname","pdbmux-healthz-probe"]`
-	results := s.fanOut(r.Context(), nodesPath, queryParams(probe))
+	// Every backend is checked, including ones the prober has down, so the
+	// report never hides a backend queries are currently skipping.
+	results := s.fanOutAll(r.Context(), nodesPath, queryParams(probe))
+	states := s.health.snapshot()
 
-	report := healthReport{Backends: map[string]string{}, Cache: s.cacheHealth()}
+	report := healthReport{
+		Backends: map[string]backendReport{},
+		Query:    s.queryHealth(),
+		Cache:    s.cacheHealth(),
+	}
 	healthy := 0
 	for _, res := range results {
+		b := backendReport{Reachable: "ok", State: stateUnmonitored}
 		if res.err != nil {
-			report.Backends[res.name] = res.err.Error()
-			continue
+			b.Reachable = res.err.Error()
+		} else {
+			healthy++
 		}
-		report.Backends[res.name] = "ok"
-		healthy++
+		if st, ok := states[res.name]; ok {
+			b.State = st.stateName()
+			b.Failures, b.Successes = st.Failures, st.Successes
+			b.LastError = st.LastErr
+			if !st.LastProbe.IsZero() {
+				b.LastProbe = st.LastProbe.UTC().Format(time.RFC3339)
+			}
+		}
+		report.Backends[res.name] = b
 	}
 	switch {
 	case healthy == len(results):

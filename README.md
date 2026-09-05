@@ -38,15 +38,17 @@ not PQL) is forwarded verbatim.
 | `GET /metrics/v2/read/<mbean>` | Fan out to all and merge the Jolokia response; numeric attributes are **summed** by default (see merge semantics). |
 | `GET /metrics/v2/list` | Fan out to all and serve the **union** of the backends' MBean trees. |
 | `GET /metrics/v1/mbeans[/<mbean>]` | Same merge, applied to the legacy envelope-less body. |
-| `GET /healthz` | Per-backend reachability plus cache state. `200 {"status":"ok"}` if all reachable, `200 degraded` if some fail, `503 down` if all fail. |
+| `GET /healthz` | Per-backend reachability, probe state and cache state. `200 {"status":"ok"}` if all reachable, `200 degraded` if some fail, `503 down` if all fail. |
 
-Fan-out is concurrent. If one backend errors or times out, `pdbmux` serves the
-surviving backends' results and logs a warning; a merged endpoint only returns `502` when
-**every** backend fails. Response records are passed through as raw JSON so
-unknown fields survive untouched.
+Fan-out is concurrent, and goes only to the backends the health prober currently
+believes are up — see [Backend health](#backend-health). If one backend errors or
+times out, `pdbmux` serves the surviving backends' results and logs a warning; a
+merged endpoint only returns `502` when **every** backend fails. Response records
+are passed through as raw JSON so unknown fields survive untouched.
 
 Responses carry PuppetDB's `X-Records` when the query asked for a total, and on
-the cached paths two headers `pdbmux` adds itself, `X-Cache` and `Age` — see
+the merged paths `X-Backends` (see [Backend health](#backend-health)). Cached
+paths add two more headers `pdbmux` sets itself, `X-Cache` and `Age` — see
 [Caching](#caching).
 
 ## Merge semantics
@@ -212,6 +214,50 @@ Each backend applies `order_by`/`limit`/`offset` to its own slice only, so
 - A malformed `limit`, `offset` or `order_by` gets a `400` rather than being
   forwarded.
 
+## Backend health
+
+A backend that is down otherwise costs a full `timeout` stall on **every**
+request, since fan-out has no way to know before it asks. `pdbmux` polls each
+backend's status endpoint in the background instead, and skips the ones that are
+not answering.
+
+- **Endpoint** — `health_probe_path`, default `/status/v1/services`, PuppetDB's
+  trapperkeeper status service (unauthenticated by default). A backend is healthy
+  when it answers `200` **and** every service in the body reports
+  `"state": "running"` — a `200` whose body says `starting`, `stopping`, `error`
+  or `unknown` counts as a failure. A body that is not in that shape is judged on
+  its status code alone, so pointing `health_probe_path` at some other endpoint
+  still works.
+- **Thresholds** — a healthy backend goes down after `health_probe_failures`
+  (default 3) **consecutive** failures; a down one comes back after
+  `health_probe_successes` (default 2) consecutive successes. One blip cannot
+  flap a backend out, and one lucky reply cannot flap it back in. A down backend
+  keeps being probed, so recovery is automatic.
+- **Fails open** — if the prober has marked **every** backend down, `pdbmux`
+  queries them all anyway. A wrong `health_probe_path`, a broken prober or a
+  partition that only the prober sees can therefore never black-hole traffic;
+  the worst case is today's behaviour.
+- **Serves immediately** — the listener never waits for a first probe round, and
+  a backend nobody has probed yet counts as healthy, so a restart drops nothing.
+- **Quiet** — only *transitions* (up→down, down→up) are logged, never individual
+  probes.
+- **Partial responses stay partial.** Health state changes which backends are
+  asked, never what a merged answer means: a response built from a subset is
+  still served, as before. Every merged response carries `X-Backends:
+  <contributed>/<configured>` naming how many backends' records went into it, so
+  a client can tell a full answer from a partial one. On a cache hit the header
+  describes the stored body, not the current backend count.
+- **`/healthz`** gives each backend a `state` (`healthy`, `unhealthy`,
+  `unprobed`, or `unmonitored` when probing is off), `consecutive_failures`,
+  `consecutive_successes`, `last_probe` and `last_error`, alongside the
+  `reachable` check `/healthz` runs itself — which always asks **every**
+  backend, so a backend queries are skipping is still reported. A `query` object
+  reports the last merged fan-out: `partial`, `contributed`, `configured`,
+  `partial_rounds` and `last_partial`.
+- **`health_probe_enabled: false`** turns the whole thing off: no probing
+  goroutines, no backend ever skipped, every backend queried on every request.
+  `X-Backends` still reports how many answered.
+
 ## Caching
 
 `pdbmux` caches merged `/nodes` and `/facts` record sets **in memory** so a busy
@@ -298,6 +344,12 @@ facts_ttl: 30s               # /facts + /nodes response cache TTL; 0 disables, c
 facts_cache_bytes: 67108864  # byte budget for that cache (64 MiB), LRU-evicted
 source_fact: pdbmux_source   # name of the synthetic provenance fact
 source_fact_enabled: true    # false serves backends' records untouched
+health_probe_enabled: true          # false queries every backend on every request
+health_probe_path: /status/v1/services  # backend health endpoint
+health_probe_interval: 10s          # how often each backend is probed
+health_probe_timeout: 5s            # per-probe timeout
+health_probe_failures: 3            # consecutive failures before a backend is skipped
+health_probe_successes: 2           # consecutive successes before it is used again
 ```
 
 `backends[*].url` is a **base** URL (`scheme://host[:port]`); `pdbmux` appends
@@ -315,8 +367,14 @@ the `/pdb/query/v4/...` path per request.
 | `PDBMUX_BACKENDS` | whole backend list, as `name=url,name=url` |
 | `PDBMUX_SOURCE_FACT` | `source_fact` (default `pdbmux_source`) |
 | `PDBMUX_SOURCE_FACT_ENABLED` | `source_fact_enabled` (default `true`); `false` disables injection |
+| `PDBMUX_HEALTH_PROBE_ENABLED` | `health_probe_enabled` (default `true`) |
+| `PDBMUX_HEALTH_PROBE_PATH` | `health_probe_path` (default `/status/v1/services`) |
+| `PDBMUX_HEALTH_PROBE_INTERVAL` | `health_probe_interval` (Go duration) |
+| `PDBMUX_HEALTH_PROBE_TIMEOUT` | `health_probe_timeout` (Go duration) |
+| `PDBMUX_HEALTH_PROBE_FAILURES` | `health_probe_failures` (plain integer, minimum 1) |
+| `PDBMUX_HEALTH_PROBE_SUCCESSES` | `health_probe_successes` (plain integer, minimum 1) |
 
-Flags: `--config`, `--listen`, `--merge`.
+Flags: `--config`, `--listen`, `--merge`, `--health-probe`.
 
 `config init` writes to `--config`/`PDBMUX_CONFIG` when set, else to
 `$XDG_CONFIG_HOME/pdbmux/config.yaml`.
