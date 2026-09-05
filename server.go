@@ -27,6 +27,11 @@ const (
 
 	// PuppetDB only sends this when the request carries include_total=true.
 	recordsHeader = "X-Records"
+
+	// Set by pdbmux, not by PuppetDB: how a cache-backed response was answered
+	// and how old the served copy is.
+	cacheStatusHeader = "X-Cache"
+	ageHeader         = "Age"
 )
 
 type backendResult struct {
@@ -305,7 +310,7 @@ func (s *Server) serveCached(w http.ResponseWriter, r *http.Request, path string
 		s.log.Printf("warning: cache lookup for %s failed: %v", key, err)
 	case status == CacheFresh:
 		s.stale.markFresh()
-		s.writeStored(w, ent.Body)
+		s.writeStored(w, ent, CacheFresh)
 		return
 	case status == CacheStale:
 		stale = &ent
@@ -343,13 +348,14 @@ func (s *Server) serveCached(w http.ResponseWriter, r *http.Request, path string
 			s.stale.markStale(time.Now())
 			s.log.Printf("warning: serving stale %s from cache (stored %s): %v",
 				path, stale.StoredAt.UTC().Format(time.RFC3339), err)
-			s.writeStored(w, stale.Body)
+			s.writeStored(w, *stale, CacheStale)
 			return
 		}
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
 	s.stale.markFresh()
+	setCacheHeaders(w, CacheMiss, time.Time{})
 	writeCached(w, resp)
 }
 
@@ -362,14 +368,36 @@ func (s *Server) flightTimeout() time.Duration {
 	return defaultTimeout
 }
 
-func (s *Server) writeStored(w http.ResponseWriter, body []byte) {
+func (s *Server) writeStored(w http.ResponseWriter, ent CacheEntry, status CacheStatus) {
 	var resp cachedResponse
-	if err := json.Unmarshal(body, &resp); err != nil {
+	if err := json.Unmarshal(ent.Body, &resp); err != nil {
 		s.log.Printf("warning: unreadable cache entry: %v", err)
 		http.Error(w, "unreadable cache entry", http.StatusBadGateway)
 		return
 	}
+	setCacheHeaders(w, status, ent.StoredAt)
 	writeCached(w, resp)
+}
+
+// setCacheHeaders labels a response from a cache-backed path: X-Cache is
+// hit/stale/miss and Age is whole seconds since the served copy was stored (0
+// for a response built by this request).
+func setCacheHeaders(w http.ResponseWriter, status CacheStatus, storedAt time.Time) {
+	label := "miss"
+	switch status {
+	case CacheFresh:
+		label = "hit"
+	case CacheStale:
+		label = "stale"
+	}
+	age := 0
+	if !storedAt.IsZero() {
+		if secs := int(time.Since(storedAt).Seconds()); secs > 0 {
+			age = secs
+		}
+	}
+	w.Header().Set(cacheStatusHeader, label)
+	w.Header().Set(ageHeader, strconv.Itoa(age))
 }
 
 func writeCached(w http.ResponseWriter, resp cachedResponse) {

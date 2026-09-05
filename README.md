@@ -45,6 +45,10 @@ surviving backends' results and logs a warning; a merged endpoint only returns `
 **every** backend fails. Response records are passed through as raw JSON so
 unknown fields survive untouched.
 
+Responses carry PuppetDB's `X-Records` when the query asked for a total, and on
+the cached paths two headers `pdbmux` adds itself, `X-Cache` and `Age` — see
+[Caching](#caching).
+
 ## Merge semantics
 
 - **`/nodes`** — dedupe by `certname`; the record with the strictly-newer
@@ -238,7 +242,14 @@ backend later without further handler changes.
   the list/map bookkeeping are not accounted for, so it is a target for body
   bytes rather than a hard cap on process memory.
 - **Single-flight** — concurrent requests for the same key collapse into one
-  upstream fan-out; the rest wait for it and share the result.
+  upstream fan-out; the rest wait for it and share the result. That fan-out runs
+  on its own context, bounded by `timeout`, so a client that disconnects can
+  neither cancel nor fail the requests sharing its flight; a waiter whose own
+  client goes away leaves the flight running for the others.
+- **Response headers** — every response on a cached path carries `X-Cache`
+  (`hit` served from a fresh entry, `miss` built by this request, `stale` the
+  expired-entry fallback) and `Age` in whole seconds since the served copy was
+  stored (`0` on a `miss`). Uncached paths carry neither.
 - **Visibility** — `/healthz` carries a `cache` object: `backend`
   (`memory`/`none`), `ttl`, `entries`, `stale_entries`, `bytes`, `serving_stale`,
   `stale_served` and `last_stale_served`. `serving_stale` is `true` from the

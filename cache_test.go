@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -773,6 +774,48 @@ func TestFlightGroup_AllCallersAbandon(t *testing.T) {
 	g.mu.Unlock()
 	if remaining != 0 {
 		t.Errorf("%d flights left registered, want 0", remaining)
+	}
+}
+
+func TestServeCached_CacheStatusHeaders(t *testing.T) {
+	stored := `[` + fact("h1", "role", "web", "") + `]`
+	a := newCountingBackend(t, map[string]string{factsPath: stored})
+	b := newCountingBackend(t, map[string]string{factsPath: `[]`})
+	srv, clk := newCachedServer(t, cacheTestConfig(a.srv.URL, b.srv.URL))
+	h := srv.Handler()
+
+	rec := doGet(t, h, factsPath, "")
+	if got := rec.Header().Get(cacheStatusHeader); got != "miss" {
+		t.Errorf("first request %s = %q, want miss", cacheStatusHeader, got)
+	}
+	if got := rec.Header().Get(ageHeader); got != "0" {
+		t.Errorf("first request %s = %q, want 0", ageHeader, got)
+	}
+
+	rec = doGet(t, h, factsPath, "")
+	if got := rec.Header().Get(cacheStatusHeader); got != "hit" {
+		t.Errorf("cached request %s = %q, want hit", cacheStatusHeader, got)
+	}
+	if _, err := strconv.Atoi(rec.Header().Get(ageHeader)); err != nil {
+		t.Errorf("cached request %s = %q, want whole seconds", ageHeader, rec.Header().Get(ageHeader))
+	}
+
+	// Past the TTL with every backend down, the stale fallback must say so.
+	clk.advance(31 * time.Second)
+	a.setFail(true)
+	b.setFail(true)
+	rec = doGet(t, h, factsPath, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("stale fallback status %d (%s)", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get(cacheStatusHeader); got != "stale" {
+		t.Errorf("stale fallback %s = %q, want stale", cacheStatusHeader, got)
+	}
+	if got := rec.Header().Get(ageHeader); got == "" {
+		t.Errorf("stale fallback must carry an %s header", ageHeader)
+	}
+	if got := strings.TrimSpace(rec.Body.String()); got != stored {
+		t.Errorf("stale body = %s, want %s", got, stored)
 	}
 }
 
