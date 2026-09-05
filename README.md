@@ -24,14 +24,20 @@ not PQL) is forwarded verbatim.
 
 | Path | Behaviour |
 |---|---|
-| `GET /pdb/query/v4/nodes` | Fan out to all backends, dedupe by `certname`, keep the record with the newer `report_timestamp`. Stamped with the winning backend's name (see provenance). |
+| `GET /pdb/query/v4/nodes` | Fan out to all backends, dedupe by `certname`, keep the record with the newer `report_timestamp`, stamped with the winning backend's name (see provenance). An `extract`/`count` query is **summed** instead. |
 | `GET /pdb/query/v4/facts` | Fan out to all, and per `certname` keep **all** facts from the backend that owns that node (see merge semantics), plus a synthetic `pdbmux_source` fact naming it. |
+| `GET /pdb/query/v4/resources` | An `extract`/`count` query is fanned out and **summed**; any other query is an unmerged pass-through. |
 | `GET /pdb/query/v4/reports` | Fan out to all and serve the **union**, deduped by report `hash`, re-ordered and re-paged across backends. |
 | `GET /pdb/query/v4/events` | Fan out to all and serve the **union**, deduped by record identity, re-ordered and re-paged. |
 | `GET /pdb/query/v4/event-counts` | Fan out to all and **sum** each subject's counts into one row per subject. |
 | `GET /pdb/query/v4/aggregate-event-counts` | Fan out to all and **sum** the summary object's counts. |
 | `GET /pdb/query/v4/reports/<hash>/{events,logs,metrics}` | Ask every backend; serve the answer from whichever backend actually holds that report. `404` when none does. |
 | `GET /pdb/query/v4/*` (any other) | No merge rule, so backends are tried in configured order and the first success is streamed back verbatim; if all reject it, the first upstream error response is replayed. |
+| `GET /pdb/meta/v1/version` | Fan out to all and report the **lowest** version any backend runs. |
+| `GET /pdb/meta/v1/server-time` | Fan out to all and serve the first reachable backend's clock. |
+| `GET /metrics/v2/read/<mbean>` | Fan out to all and merge the Jolokia response; numeric attributes are **summed** by default (see merge semantics). |
+| `GET /metrics/v2/list` | Fan out to all and serve the **union** of the backends' MBean trees. |
+| `GET /metrics/v1/mbeans[/<mbean>]` | Same merge, applied to the legacy envelope-less body. |
 | `GET /healthz` | Per-backend reachability. `200 {"status":"ok"}` if all reachable, `200 degraded` if some fail, `503 down` if all fail. |
 
 Fan-out is concurrent. If one backend errors or times out, `pdbmux` serves the
@@ -62,12 +68,20 @@ unknown fields survive untouched.
   reporting to more than one backend stores identical records in each).
 - **Aggregates** — `extract`/`group_by` rows are counts, not records, so each
   backend returns a partial answer that has to be **added**, not deduped. This
-  covers `/event-counts`, `/aggregate-event-counts`, and a `/reports` query whose
-  `extract` carries a `["function", ...]` column.
-  - The grouping key is the row's non-aggregate fields: for `/reports` they come
-    from the query — the plain `extract` fields plus any `group_by` clause — and
-    for the event-count endpoints from the row itself (`subject_type`/`subject`,
-    or `summarize_by`), whose remaining fields are all counts.
+  covers `/event-counts`, `/aggregate-event-counts`, and any `/reports`,
+  `/nodes` or `/resources` query whose `extract` carries a `["function", ...]`
+  column.
+  - The grouping key is the row's non-aggregate fields: for `/reports`,
+    `/nodes` and `/resources` they come from the query — the plain `extract`
+    fields plus any `group_by` clause — and for the event-count endpoints from
+    the row itself (`subject_type`/`subject`, or `summarize_by`), whose
+    remaining fields are all counts.
+  - On `/nodes` this takes precedence over the `certname` merge: a count row has
+    no `certname`, so deduping would collapse every backend's count into one
+    backend's number. A `/nodes` query with no `function` column — including a
+    plain `extract` projection — still merges by `certname`.
+  - `/resources` has no cross-backend record identity to dedupe on, so only its
+    aggregate queries merge; everything else stays an unmerged pass-through.
   - Rows sharing a key collapse into one with their numeric columns summed. A key
     only one backend reported is passed through byte-for-byte. An aggregate column
     that is absent or non-numeric in a row is skipped, never zeroed, so the
@@ -132,6 +146,39 @@ does not merge either today — they take the unmerged pass-through path, where
 the answer comes from whichever backend replied first rather than from a merge
 winner, so there is no owner to attribute. Injecting there would state a
 provenance that isn't true.
+
+### Metadata and metrics
+
+- **`/pdb/meta/v1/version`** — when the backends agree, that version is served.
+  When they differ, `pdbmux` reports the **lowest**: a client reads this as the
+  feature level it may rely on, and the estate can only be relied on for what its
+  oldest PuppetDB implements. Versions compare segment by segment, numerically
+  where both segments are numbers (`7.9.0` < `7.12.0`), lexically otherwise.
+  A backend whose body is unparseable is skipped rather than treated as lowest.
+- **`/pdb/meta/v1/server-time`** — the clock of whichever PuppetDB answered is
+  not estate state and has no meaningful merge, so the first **reachable**
+  backend in configured order supplies it, the same tie-break used elsewhere.
+- **`/metrics/...`** — the Jolokia envelope's `value` is merged and the rest of
+  the envelope comes from the first backend (with the newest `timestamp`).
+  Values merge recursively:
+  - Objects merge over the **union** of their keys, so an MBean attribute only
+    one backend exposes still survives.
+  - Numbers combine by the attribute's own name. The default is a **sum** —
+    almost everything here is a population count (`num-nodes`, `num-resources`,
+    queue depth, command totals) whose estate-wide value is the total, and rates
+    are additive throughput. The exceptions describe a distribution or a bound,
+    where adding two servers' numbers yields a figure that was never true of
+    either: `Min` takes the minimum; `Max`, `Uptime` and `StartTime` take the
+    maximum; `Mean`, `Median`, `StdDev` and `*Percentile` take the unweighted
+    arithmetic mean (`pdbmux` has no per-backend sample counts to weight by).
+    Matching is case-insensitive.
+  - Strings, booleans, arrays, nulls and mixed kinds keep the first backend's
+    value — there is no sound way to add them.
+  - Jolokia signals a bad MBean as a non-2xx `status` **inside** an HTTP 200.
+    Such a backend is skipped; if every backend does so, the first one's error
+    envelope is replayed verbatim so the client sees the real reason.
+  - MBean names arrive percent-encoded over Jolokia's own `!`-escaping; the raw
+    path is forwarded so neither layer is lost.
 
 ### Paging and ordering on the merged endpoints
 

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"slices"
+	"strings"
 	"testing"
 )
 
@@ -243,6 +244,38 @@ func TestHandler_SourceNotInjectedOnAggregate(t *testing.T) {
 		if !slices.Contains(upstream, string(raw)) {
 			t.Errorf("aggregate row %s is not an upstream row", raw)
 		}
+	}
+}
+
+// /nodes aggregates are summed rather than merged, so nothing may stamp them.
+func TestHandler_NodesAggregateNotStamped(t *testing.T) {
+	a := newFakeBackend(t, `[]`, `[]`)
+	b := newFakeBackend(t, `[]`, `[]`)
+	a.bodies[nodesPath] = `[{"count":3}]`
+	b.bodies[nodesPath] = `[{"count":2}]`
+	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic))
+
+	rec := doGet(t, srv.Handler(), nodesPath, `["extract",[["function","count"]]]`)
+	if strings.Contains(rec.Body.String(), defaultSourceFact) {
+		t.Errorf("aggregate rows were stamped: %s", rec.Body.String())
+	}
+	if got := rec.Body.String(); !strings.Contains(got, `"count":5`) {
+		t.Errorf("count = %s, want the summed 5", got)
+	}
+}
+
+// A plain extract projects columns and skips the aggregate path, so the stamp
+// must not add a key the client did not ask for.
+func TestHandler_NodesProjectionNotStamped(t *testing.T) {
+	a := newFakeBackend(t, `[]`, `[]`)
+	b := newFakeBackend(t, `[]`, `[]`)
+	a.bodies[nodesPath] = `[{"certname":"h1"}]`
+	b.bodies[nodesPath] = `[]`
+	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic))
+
+	rec := doGet(t, srv.Handler(), nodesPath, `["extract",["certname"]]`)
+	if strings.Contains(rec.Body.String(), defaultSourceFact) {
+		t.Errorf("projection gained a stamp: %s", rec.Body.String())
 	}
 }
 
