@@ -17,6 +17,7 @@ import (
 const (
 	factsPath                = "/pdb/query/v4/facts"
 	nodesPath                = "/pdb/query/v4/nodes"
+	resourcesPath            = "/pdb/query/v4/resources"
 	reportsPath              = "/pdb/query/v4/reports"
 	eventsPath               = "/pdb/query/v4/events"
 	eventCountsPath          = "/pdb/query/v4/event-counts"
@@ -57,6 +58,9 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.handleHealth)
 	mux.HandleFunc("/pdb/query/v4/", s.handleQuery)
+	mux.HandleFunc(metaVersionPath, s.handleMetaVersion)
+	mux.HandleFunc(metaServerTimePath, s.handleMetaServerTime)
+	mux.HandleFunc(metricsPrefix, s.handleMetrics)
 	return mux
 }
 
@@ -67,7 +71,9 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	}
 	switch r.URL.Path {
 	case nodesPath:
-		s.serveMerged(w, r, nodesPath, s.mergeNodesResponse)
+		s.serveNodes(w, r)
+	case resourcesPath:
+		s.serveResources(w, r)
 	case factsPath:
 		s.serveMerged(w, r, factsPath, s.mergeFactsResponse)
 	case reportsPath:
@@ -132,6 +138,24 @@ func (s *Server) serveUnion(w http.ResponseWriter, r *http.Request, path string,
 		}
 	}
 	writeJSON(w, page.apply(merged))
+}
+
+// A count row carries no certname, so the certname-keyed merge would collapse every backend's count into one backend's; aggregates take the summing path instead.
+func (s *Server) serveNodes(w http.ResponseWriter, r *http.Request) {
+	if spec := parseAggregate(r.URL.Query().Get("query")); spec != nil {
+		s.serveSummed(w, r, nodesPath, spec.columns)
+		return
+	}
+	s.serveMerged(w, r, nodesPath, s.mergeNodesResponse)
+}
+
+// Only aggregates merge: a resource record has no cross-backend identity to dedupe on, so a plain query stays on the pass-through path.
+func (s *Server) serveResources(w http.ResponseWriter, r *http.Request) {
+	if spec := parseAggregate(r.URL.Query().Get("query")); spec != nil {
+		s.serveSummed(w, r, resourcesPath, spec.columns)
+		return
+	}
+	s.proxyUnmerged(w, r)
 }
 
 // An `extract` query with a `function` column returns synthetic aggregate rows that carry no identity, so they are summed rather than unioned.

@@ -34,6 +34,9 @@ type fakeBackend struct {
 
 	mu        sync.Mutex
 	gotParams map[string]url.Values
+	// rawPaths records the still-escaped request paths, so tests can assert an
+	// MBean name's percent-encoding survived the proxy.
+	rawPaths []string
 }
 
 func newFakeBackend(t *testing.T, nodesBody, factsBody string) *fakeBackend {
@@ -51,6 +54,7 @@ func newFakeBackend(t *testing.T, nodesBody, factsBody string) *fakeBackend {
 		}
 		fb.mu.Lock()
 		fb.gotParams[r.URL.Path] = r.URL.Query()
+		fb.rawPaths = append(fb.rawPaths, r.URL.EscapedPath())
 		fb.mu.Unlock()
 		if fb.fail {
 			http.Error(w, "boom", http.StatusInternalServerError)
@@ -89,6 +93,14 @@ func (fb *fakeBackend) params(path string) (url.Values, bool) {
 	defer fb.mu.Unlock()
 	v, ok := fb.gotParams[path]
 	return v, ok
+}
+
+// sawRawPath reports whether the backend was asked for a path with exactly that
+// escaping.
+func (fb *fakeBackend) sawRawPath(p string) bool {
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+	return slices.Contains(fb.rawPaths, p)
 }
 
 // gotQuery returns the PuppetDB query param the backend saw for a path.
@@ -856,5 +868,122 @@ func TestHandler_EventCountsBadPagingParam(t *testing.T) {
 	rec := doGetParams(t, srv.Handler(), eventCountsPath, url.Values{"limit": {"lots"}})
 	if rec.Code != http.StatusBadRequest {
 		t.Errorf("expected 400 for a malformed limit, got %d", rec.Code)
+	}
+}
+
+// What Puppetboard's landing page sends when DEFAULT_ENVIRONMENT names a real
+// environment: an extract/count with no group_by, so every backend returns one
+// anonymous row.
+const nodeCountQuery = `["extract",[["function","count"]],["and",["=","catalog_environment","production"]]]`
+
+func TestHandler_NodesAggregateSummed(t *testing.T) {
+	// A count row has no certname, so the certname-keyed merge would have
+	// collapsed both backends' counts into one backend's number.
+	a := newFakeBackend(t, `[{"count":90}]`, `[]`)
+	b := newFakeBackend(t, `[{"count":53}]`, `[]`)
+	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic))
+
+	rec := doGet(t, srv.Handler(), nodesPath, nodeCountQuery)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+	}
+	if got := counts(t, rec.Body.Bytes(), "count"); !slices.Equal(got, []float64{143}) {
+		t.Errorf("count = %v, want [143]", got)
+	}
+}
+
+func TestHandler_NodesAggregateGroupedSummed(t *testing.T) {
+	a := newFakeBackend(t, `[{"count":4,"catalog_environment":"production"},{"count":1,"catalog_environment":"dev"}]`, `[]`)
+	b := newFakeBackend(t, `[{"count":3,"catalog_environment":"production"}]`, `[]`)
+	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic))
+
+	rec := doGet(t, srv.Handler(), nodesPath,
+		`["extract",[["function","count"],"catalog_environment"],["~","certname",".*"],["group_by","catalog_environment"]]`)
+	var got []map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	byEnv := map[string]float64{}
+	for _, row := range got {
+		e, _ := row["catalog_environment"].(string)
+		n, _ := row["count"].(float64)
+		byEnv[e] = n
+	}
+	want := map[string]float64{"production": 7, "dev": 1}
+	if !reflect.DeepEqual(byEnv, want) {
+		t.Errorf("counts = %v, want %v", byEnv, want)
+	}
+}
+
+func TestHandler_NodesNonAggregateStillMergedByCertname(t *testing.T) {
+	// Regression: routing aggregates to the summing path must not divert plain
+	// queries, including an extract projection that carries no function column.
+	a := newFakeBackend(t,
+		`[`+node("h1", "2026-07-01T00:00:00Z")+`,`+node("h2", "2026-07-10T00:00:00Z")+`]`, `[]`)
+	b := newFakeBackend(t, `[`+node("h1", "2026-07-20T00:00:00Z")+`]`, `[]`)
+	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic))
+
+	for _, q := range []string{
+		`["=","certname","h1"]`,
+		`["extract",["certname","report_timestamp"],["~","certname",".*"]]`,
+	} {
+		rec := doGet(t, srv.Handler(), nodesPath, q)
+		var got []recordMeta
+		if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+			t.Fatalf("query %s: %v", q, err)
+		}
+		if len(got) != 2 {
+			t.Fatalf("query %s: expected 2 deduped nodes, got %d: %s", q, len(got), rec.Body.String())
+		}
+		for _, m := range got {
+			if m.Certname == "h1" && m.ReportTimestamp != "2026-07-20T00:00:00Z" {
+				t.Errorf("query %s: h1 should be the newer record, got %s", q, m.ReportTimestamp)
+			}
+		}
+	}
+}
+
+func TestHandler_ResourcesAggregateSummed(t *testing.T) {
+	// /resources is otherwise an unmerged pass-through, so before this the
+	// landing page's resource total was whichever backend answered first.
+	a := newFakeBackend(t, `[]`, `[]`)
+	a.bodies[resourcesPath] = `[{"count":1000}]`
+	b := newFakeBackend(t, `[]`, `[]`)
+	b.bodies[resourcesPath] = `[{"count":234}]`
+	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic))
+
+	rec := doGet(t, srv.Handler(), resourcesPath,
+		`["extract",[["function","count"]],["=","environment","production"]]`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+	}
+	if got := counts(t, rec.Body.Bytes(), "count"); !slices.Equal(got, []float64{1234}) {
+		t.Errorf("count = %v, want [1234]", got)
+	}
+}
+
+func TestHandler_ResourcesNonAggregateStillPassesThrough(t *testing.T) {
+	a := newFakeBackend(t, `[]`, `[]`)
+	a.bodies[resourcesPath] = `[{"certname":"h1","type":"File"}]`
+	b := newFakeBackend(t, `[]`, `[]`)
+	b.bodies[resourcesPath] = `[{"certname":"h2","type":"File"}]`
+	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic))
+
+	rec := doGet(t, srv.Handler(), resourcesPath, `["=","type","File"]`)
+	if got := rec.Body.String(); !strings.Contains(got, `"h1"`) || strings.Contains(got, `"h2"`) {
+		t.Errorf("body = %s, want the first backend's response verbatim", got)
+	}
+}
+
+func TestHandler_ResourcesAggregateAsksEveryBackend(t *testing.T) {
+	a := newFakeBackend(t, `[]`, `[]`)
+	a.bodies[resourcesPath] = `[{"count":1}]`
+	b := newFakeBackend(t, `[]`, `[]`)
+	b.bodies[resourcesPath] = `[{"count":1}]`
+	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic))
+
+	doGet(t, srv.Handler(), resourcesPath, `["extract",[["function","count"]],["=","environment","production"]]`)
+	if _, ok := b.params(resourcesPath); !ok {
+		t.Error("second backend was never asked for the resource count")
 	}
 }
