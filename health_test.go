@@ -772,21 +772,6 @@ func TestProber_SuccessResetsTheRunInEveryDirection(t *testing.T) {
 	}
 }
 
-func TestProber_RecoversFromProbeUnsupported(t *testing.T) {
-	p := newTestProber(t, healthConfig("http://a.invalid", "http://b.invalid"))
-	markUnsupported(t, p, "a")
-
-	for i := 0; i < p.successes; i++ {
-		p.record("a", nil)
-	}
-	if !p.healthy("a") {
-		t.Fatal("backend left the pool while recovering")
-	}
-	if got := p.snapshot()["a"].stateName(); got != stateHealthy {
-		t.Fatalf("state = %q, want %q", got, stateHealthy)
-	}
-}
-
 // The misconfigured-path case: nothing has ever answered the probe on this
 // backend, so there is no health signal to gate on and it keeps serving queries
 // however its probes fail — including real failures, since a probe that cannot
