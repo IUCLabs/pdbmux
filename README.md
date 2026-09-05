@@ -56,11 +56,10 @@ unknown fields survive untouched.
   - A node present in only one backend always appears (falls back to whichever
     backend actually returned facts for it).
 - **`/reports`, `/events`** — **union**, not a per-node winner. Reports are
-  immutable history, so a node that moved between PuppetDBs legitimately has
-  reports in both and both belong in the merged view. Reports dedupe
-  on `hash`; events, which carry no id of their own, dedupe on the verbatim
-  record (a node briefly reporting to both PuppetDBs stores identical records in
-  each).
+  immutable history, so a node's reports can legitimately exist in more than one
+  backend and all of them belong in the merged view. Reports dedupe on `hash`;
+  events, which carry no id of their own, dedupe on the verbatim record (a node
+  reporting to more than one backend stores identical records in each).
 - **Aggregates** — `extract`/`group_by` rows are counts, not records, so each
   backend returns a partial answer that has to be **added**, not deduped. This
   covers `/event-counts`, `/aggregate-event-counts`, and a `/reports` query whose
