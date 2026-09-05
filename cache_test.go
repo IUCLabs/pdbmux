@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"math/rand/v2"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -17,6 +19,16 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+)
+
+const (
+	// testFlightTimeout is long enough that a flight ending early can only be the
+	// refcount, never the deadline.
+	testFlightTimeout = 30 * time.Second
+
+	// disconnectAfter is long enough for the fan-out to reach the backends and
+	// short enough to leave the whole abort well inside cfg.Timeout.
+	disconnectAfter = 25 * time.Millisecond
 )
 
 // fakeClock drives the cache's TTL without sleeping.
@@ -111,6 +123,7 @@ func newCachedServer(t *testing.T, cfg Config) (*Server, *fakeClock) {
 	}
 	clk := newFakeClock()
 	mc.now = clk.now
+	srv.now = clk.now
 	return srv, clk
 }
 
@@ -389,7 +402,7 @@ func TestFlightGroup_LeaderRunsOnce(t *testing.T) {
 	entered := make(chan struct{})
 	release := make(chan struct{})
 
-	run := func() (cachedResponse, error) {
+	run := func(context.Context) (cachedResponse, error) {
 		if calls.Add(1) == 1 {
 			close(entered)
 		}
@@ -402,7 +415,7 @@ func TestFlightGroup_LeaderRunsOnce(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if _, _, s := g.Do(context.Background(), "k", run); s {
+			if _, _, s := g.Do(context.Background(), "k", testFlightTimeout, run); s {
 				shared.Add(1)
 			}
 		}()
@@ -419,7 +432,9 @@ func TestFlightGroup_LeaderRunsOnce(t *testing.T) {
 		t.Errorf("%d callers shared the flight, want 15", shared.Load())
 	}
 	// The key is released once the flight finishes.
-	if _, _, s := g.Do(context.Background(), "k", func() (cachedResponse, error) { return cachedResponse{Records: -1}, nil }); s {
+	if _, _, s := g.Do(context.Background(), "k", testFlightTimeout, func(context.Context) (cachedResponse, error) {
+		return cachedResponse{Records: -1}, nil
+	}); s {
 		t.Error("a later call must start its own flight")
 	}
 }
@@ -441,7 +456,7 @@ func TestFlightGroup_LeaderPanicFailsLeaderAndWaiters(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		leader.resp, leader.err, leader.shared = g.Do(context.Background(), "k", func() (cachedResponse, error) {
+		leader.resp, leader.err, leader.shared = g.Do(context.Background(), "k", testFlightTimeout, func(context.Context) (cachedResponse, error) {
 			close(entered)
 			<-release
 			panic("build exploded")
@@ -453,7 +468,7 @@ func TestFlightGroup_LeaderPanicFailsLeaderAndWaiters(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			waiters[i].resp, waiters[i].err, waiters[i].shared = g.Do(context.Background(), "k", func() (cachedResponse, error) {
+			waiters[i].resp, waiters[i].err, waiters[i].shared = g.Do(context.Background(), "k", testFlightTimeout, func(context.Context) (cachedResponse, error) {
 				t.Error("a waiter must not run its own fn")
 				return cachedResponse{}, nil
 			})
@@ -480,7 +495,7 @@ func TestFlightGroup_LeaderPanicFailsLeaderAndWaiters(t *testing.T) {
 	}
 
 	// The key is released on the panic path, so a later call leads its own flight.
-	resp, err, shared := g.Do(context.Background(), "k", func() (cachedResponse, error) {
+	resp, err, shared := g.Do(context.Background(), "k", testFlightTimeout, func(context.Context) (cachedResponse, error) {
 		return cachedResponse{Body: json.RawMessage(`[]`), Records: 0}, nil
 	})
 	if shared {
@@ -639,6 +654,117 @@ func TestHandler_LeaderDisconnectDoesNotFailFollowers(t *testing.T) {
 	if got := a.hitCount(nodesPath); got != 1 {
 		t.Errorf("backend a saw %d requests, want 1", got)
 	}
+
+	// The flight the leader started still populated the cache.
+	warmed := doGet(t, h, nodesPath, "")
+	if got := warmed.Header().Get(cacheStatusHeader); got != "hit" {
+		t.Errorf("%s = %q, want hit: the abandoned leader's flight must still warm the cache", cacheStatusHeader, got)
+	}
+	if got := a.hitCount(nodesPath); got != 1 {
+		t.Errorf("backend a saw %d requests after the cached read, want 1", got)
+	}
+	assertNoFlights(t, &srv.flights)
+}
+
+// blockingBackend parks every request until its own context ends, reporting when
+// that happened, so an abandoned fan-out is observable from upstream.
+func blockingBackend(t *testing.T, aborted chan<- time.Time) string {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+			aborted <- time.Now()
+		case <-time.After(10 * time.Second):
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv.URL
+}
+
+// A requester with nobody else on its flight must take the fan-out down with it
+// rather than leave a socket per backend held open until cfg.Timeout.
+func TestHandler_SoloDisconnectAbortsFanOutPromptly(t *testing.T) {
+	aborted := make(chan time.Time, 4)
+	cfg := cacheTestConfig(blockingBackend(t, aborted), blockingBackend(t, aborted))
+	cfg.Timeout = 400 * time.Millisecond
+	srv, _ := newCachedServer(t, cfg)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		time.Sleep(disconnectAfter)
+		cancel()
+	}()
+
+	start := time.Now()
+	req := httptest.NewRequest(http.MethodGet, factsPath, nil).WithContext(ctx)
+	srv.Handler().ServeHTTP(httptest.NewRecorder(), req)
+	if elapsed := time.Since(start); elapsed >= cfg.Timeout/2 {
+		t.Errorf("handler returned after %s, want well under cfg.Timeout %s", elapsed, cfg.Timeout)
+	}
+
+	waitForReleases(t, aborted, len(cfg.Backends), start.Add(cfg.Timeout/2))
+	assertNoFlights(t, &srv.flights)
+}
+
+// Distinct cache keys do not collapse into one flight, so disconnecting clients
+// must not each hold len(backends) sockets for the whole timeout.
+func TestHandler_DisconnectedRequestsDoNotPinBackends(t *testing.T) {
+	aborted := make(chan time.Time, 128)
+	cfg := cacheTestConfig(blockingBackend(t, aborted), blockingBackend(t, aborted))
+	cfg.Timeout = 400 * time.Millisecond
+	srv, _ := newCachedServer(t, cfg)
+	h := srv.Handler()
+
+	// Keep-alive plumbing outlives the requests, so the transport is ours to shut
+	// down before counting goroutines.
+	transport := &http.Transport{}
+	srv.client.Transport = transport
+
+	baseline := runtime.NumGoroutine()
+	const callers = 25
+	var wg sync.WaitGroup
+	start := time.Now()
+	for i := range callers {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			go func() {
+				time.Sleep(disconnectAfter)
+				cancel()
+			}()
+			target := factsPath + "?query=" + url.QueryEscape(strconv.Itoa(i))
+			req := httptest.NewRequest(http.MethodGet, target, nil).WithContext(ctx)
+			h.ServeHTTP(httptest.NewRecorder(), req)
+		}(i)
+	}
+	wg.Wait()
+	if elapsed := time.Since(start); elapsed >= cfg.Timeout/2 {
+		t.Errorf("%d disconnecting callers took %s, want well under cfg.Timeout %s", callers, elapsed, cfg.Timeout)
+	}
+
+	// A caller cancelled before its fan-out was dispatched leaves the backend
+	// nothing to release, so one release per caller is the floor.
+	waitForReleases(t, aborted, callers, start.Add(cfg.Timeout/2))
+	assertNoFlights(t, &srv.flights)
+	transport.CloseIdleConnections()
+	assertGoroutinesSettle(t, baseline, 2)
+}
+
+// waitForReleases fails unless at least want backend requests were released by
+// cutoff, which is set well inside cfg.Timeout so only the flight going away can
+// have freed them.
+func waitForReleases(t *testing.T, aborted <-chan time.Time, want int, cutoff time.Time) {
+	t.Helper()
+	for got := 0; got < want; got++ {
+		select {
+		case <-aborted:
+		case <-time.After(time.Until(cutoff)):
+			t.Fatalf("%d of %d backend requests released before the cutoff, want all of them", got, want)
+		}
+	}
 }
 
 // A follower whose own client goes away must unpark rather than wait out the
@@ -654,7 +780,7 @@ func TestFlightGroup_WaiterAbandonsOnContextCancel(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		leaderResp, leaderErr, _ = g.Do(context.Background(), "k", func() (cachedResponse, error) {
+		leaderResp, leaderErr, _ = g.Do(context.Background(), "k", testFlightTimeout, func(context.Context) (cachedResponse, error) {
 			close(entered)
 			<-release
 			return cachedResponse{Body: json.RawMessage(`[1]`), Records: 1}, nil
@@ -668,10 +794,7 @@ func TestFlightGroup_WaiterAbandonsOnContextCancel(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		patientResp, patientErr, _ = g.Do(context.Background(), "k", func() (cachedResponse, error) {
-			t.Error("a waiter must not run its own fn")
-			return cachedResponse{}, nil
-		})
+		patientResp, patientErr, _ = g.Do(context.Background(), "k", testFlightTimeout, waiterMustNotBuild(t))
 	}()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -680,10 +803,7 @@ func TestFlightGroup_WaiterAbandonsOnContextCancel(t *testing.T) {
 	var abandonedShared bool
 	go func() {
 		defer close(done)
-		_, abandoned, abandonedShared = g.Do(ctx, "k", func() (cachedResponse, error) {
-			t.Error("a waiter must not run its own fn")
-			return cachedResponse{}, nil
-		})
+		_, abandoned, abandonedShared = g.Do(ctx, "k", testFlightTimeout, waiterMustNotBuild(t))
 	}()
 
 	time.Sleep(100 * time.Millisecond)
@@ -693,8 +813,11 @@ func TestFlightGroup_WaiterAbandonsOnContextCancel(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("a waiter whose context was cancelled stayed parked on the leader")
 	}
+	if !errors.Is(abandoned, errFlightAbandoned) {
+		t.Errorf("abandoning waiter err = %v, want errFlightAbandoned", abandoned)
+	}
 	if !errors.Is(abandoned, context.Canceled) {
-		t.Errorf("abandoning waiter err = %v, want context.Canceled", abandoned)
+		t.Errorf("abandoning waiter err = %v, want it to carry context.Canceled", abandoned)
 	}
 	if !abandonedShared {
 		t.Error("the abandoning waiter did share the flight")
@@ -718,21 +841,22 @@ func TestFlightGroup_WaiterAbandonsOnContextCancel(t *testing.T) {
 	}
 }
 
-// Every participant walking away must still leave the flight bounded and the
-// group empty: nothing parked, nothing registered.
-func TestFlightGroup_AllCallersAbandon(t *testing.T) {
+// The last participant leaving must cancel the flight's context rather than let
+// it burn the whole timeout, and must leave the group empty.
+func TestFlightGroup_LastParticipantLeavingCancelsFlight(t *testing.T) {
 	var g flightGroup
 	entered := make(chan struct{})
-	release := make(chan struct{})
+	flightCancelled := make(chan struct{})
 
 	leaderCtx, cancelLeader := context.WithCancel(context.Background())
 	leaderDone := make(chan struct{})
 	go func() {
 		defer close(leaderDone)
-		_, _, _ = g.Do(leaderCtx, "k", func() (cachedResponse, error) {
+		_, _, _ = g.Do(leaderCtx, "k", testFlightTimeout, func(ctx context.Context) (cachedResponse, error) {
 			close(entered)
-			<-release
-			return cachedResponse{Records: -1}, nil
+			<-ctx.Done()
+			close(flightCancelled)
+			return cachedResponse{}, ctx.Err()
 		})
 	}()
 	<-entered
@@ -744,10 +868,7 @@ func TestFlightGroup_AllCallersAbandon(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, _, _ = g.Do(ctx, "k", func() (cachedResponse, error) {
-				t.Error("a waiter must not run its own fn")
-				return cachedResponse{}, nil
-			})
+			_, _, _ = g.Do(ctx, "k", testFlightTimeout, waiterMustNotBuild(t))
 		}()
 	}
 
@@ -762,18 +883,146 @@ func TestFlightGroup_AllCallersAbandon(t *testing.T) {
 		t.Fatal("waiters stayed parked after their contexts were cancelled")
 	}
 
-	close(release)
+	// testFlightTimeout is far longer, so only the refcount can have cancelled it.
+	select {
+	case <-flightCancelled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the flight ran on after its last participant left")
+	}
 	select {
 	case <-leaderDone:
 	case <-time.After(2 * time.Second):
 		t.Fatal("the leader goroutine leaked")
 	}
 
+	assertNoFlights(t, &g)
+}
+
+// A leader walking away while a waiter is still parked must leave the flight's
+// context untouched, so the waiter gets a real result.
+func TestFlightGroup_LeaderLeavingKeepsFlightAliveForWaiter(t *testing.T) {
+	var g flightGroup
+	entered := make(chan struct{})
+	release := make(chan struct{})
+
+	leaderCtx, cancelLeader := context.WithCancel(context.Background())
+	leaderDone := make(chan struct{})
+	var leaderErr error
+	go func() {
+		defer close(leaderDone)
+		_, leaderErr, _ = g.Do(leaderCtx, "k", testFlightTimeout, func(ctx context.Context) (cachedResponse, error) {
+			close(entered)
+			<-release
+			if err := ctx.Err(); err != nil {
+				return cachedResponse{}, err
+			}
+			return cachedResponse{Body: json.RawMessage(`[1]`), Records: 1}, nil
+		})
+	}()
+	<-entered
+
+	waiterDone := make(chan struct{})
+	var waiterResp cachedResponse
+	var waiterErr error
+	go func() {
+		defer close(waiterDone)
+		waiterResp, waiterErr, _ = g.Do(context.Background(), "k", testFlightTimeout, waiterMustNotBuild(t))
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+	cancelLeader()
+	select {
+	case <-leaderDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the leader stayed parked after its context was cancelled")
+	}
+	if !errors.Is(leaderErr, errFlightAbandoned) {
+		t.Errorf("leader err = %v, want errFlightAbandoned", leaderErr)
+	}
+
+	close(release)
+	select {
+	case <-waiterDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the waiter never got a result")
+	}
+	if waiterErr != nil || waiterResp.Records != 1 {
+		t.Errorf("waiter = (%+v, %v), want the flight's result", waiterResp, waiterErr)
+	}
+
+	assertNoFlights(t, &g)
+}
+
+// Random cancellations across many keys must leave nothing registered and no
+// goroutines behind.
+func TestFlightGroup_HammerRandomCancellations(t *testing.T) {
+	var g flightGroup
+	baseline := runtime.NumGoroutine()
+
+	const callers = 400
+	var wg sync.WaitGroup
+	for i := range callers {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			if i%3 == 0 {
+				go func() {
+					time.Sleep(time.Duration(rand.IntN(3000)) * time.Microsecond)
+					cancel()
+				}()
+			}
+			key := strconv.Itoa(i % 17)
+			_, _, _ = g.Do(ctx, key, testFlightTimeout, func(ctx context.Context) (cachedResponse, error) {
+				select {
+				case <-ctx.Done():
+					return cachedResponse{}, ctx.Err()
+				case <-time.After(time.Duration(rand.IntN(3000)) * time.Microsecond):
+					return cachedResponse{Records: -1}, nil
+				}
+			})
+		}(i)
+	}
+	wg.Wait()
+
+	assertNoFlights(t, &g)
+	assertGoroutinesSettle(t, baseline, 2)
+}
+
+func waiterMustNotBuild(t *testing.T) func(context.Context) (cachedResponse, error) {
+	t.Helper()
+	return func(context.Context) (cachedResponse, error) {
+		t.Error("a waiter must not run its own fn")
+		return cachedResponse{}, nil
+	}
+}
+
+func assertNoFlights(t *testing.T, g *flightGroup) {
+	t.Helper()
 	g.mu.Lock()
 	remaining := len(g.calls)
 	g.mu.Unlock()
 	if remaining != 0 {
 		t.Errorf("%d flights left registered, want 0", remaining)
+	}
+}
+
+// Goroutines unwind after their caller returns, so settling is polled rather
+// than sampled once.
+func assertGoroutinesSettle(t *testing.T, baseline, slack int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		got := runtime.NumGoroutine()
+		if got <= baseline+slack {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Errorf("goroutines = %d, want back near the baseline of %d", got, baseline)
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -792,16 +1041,17 @@ func TestServeCached_CacheStatusHeaders(t *testing.T) {
 		t.Errorf("first request %s = %q, want 0", ageHeader, got)
 	}
 
+	clk.advance(7 * time.Second)
 	rec = doGet(t, h, factsPath, "")
 	if got := rec.Header().Get(cacheStatusHeader); got != "hit" {
 		t.Errorf("cached request %s = %q, want hit", cacheStatusHeader, got)
 	}
-	if _, err := strconv.Atoi(rec.Header().Get(ageHeader)); err != nil {
-		t.Errorf("cached request %s = %q, want whole seconds", ageHeader, rec.Header().Get(ageHeader))
+	if got := rec.Header().Get(ageHeader); got != "7" {
+		t.Errorf("cached request %s = %q, want 7", ageHeader, got)
 	}
 
 	// Past the TTL with every backend down, the stale fallback must say so.
-	clk.advance(31 * time.Second)
+	clk.advance(24 * time.Second)
 	a.setFail(true)
 	b.setFail(true)
 	rec = doGet(t, h, factsPath, "")
@@ -811,8 +1061,8 @@ func TestServeCached_CacheStatusHeaders(t *testing.T) {
 	if got := rec.Header().Get(cacheStatusHeader); got != "stale" {
 		t.Errorf("stale fallback %s = %q, want stale", cacheStatusHeader, got)
 	}
-	if got := rec.Header().Get(ageHeader); got == "" {
-		t.Errorf("stale fallback must carry an %s header", ageHeader)
+	if got := rec.Header().Get(ageHeader); got != "31" {
+		t.Errorf("stale fallback %s = %q, want 31 seconds since the entry was stored", ageHeader, got)
 	}
 	if got := strings.TrimSpace(rec.Body.String()); got != stored {
 		t.Errorf("stale body = %s, want %s", got, stored)

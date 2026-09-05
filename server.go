@@ -53,6 +53,9 @@ type Server struct {
 	flights    flightGroup
 	stale      staleTracker
 
+	// now is shared with the cache's clock so Age matches the stored timestamp.
+	now func() time.Time
+
 	// freshness cache (freshness merge only).
 	mu        sync.Mutex
 	freshData freshness
@@ -65,6 +68,7 @@ func NewServer(cfg Config, logger *log.Logger) *Server {
 		cfg:    cfg,
 		client: &http.Client{Timeout: cfg.Timeout},
 		log:    logger,
+		now:    time.Now,
 	}
 	if cfg.cacheEnabled() {
 		s.factsCache = newMemoryCache(cfg.FactsTTL, cfg.CacheBytes)
@@ -316,13 +320,11 @@ func (s *Server) serveCached(w http.ResponseWriter, r *http.Request, path string
 		stale = &ent
 	}
 
-	// The flight is shared, so it runs on a context detached from whichever
-	// request happened to lead it: one client disconnecting must not cancel the
-	// fan-out its followers are waiting on. cfg.Timeout keeps it bounded.
-	resp, err, _ := s.flights.Do(r.Context(), key, func() (cachedResponse, error) {
-		ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), s.flightTimeout())
-		defer cancel()
-
+	// The flight is shared, so it runs on its own context rather than the leading
+	// request's: one client disconnecting must not cancel the fan-out its
+	// followers are waiting on, and the flight ends as soon as the last of them
+	// goes. cfg.Timeout keeps it bounded.
+	resp, err, _ := s.flights.Do(r.Context(), key, s.flightTimeout(), func(ctx context.Context) (cachedResponse, error) {
 		built, buildErr := build(ctx)
 		if buildErr != nil {
 			return cachedResponse{}, buildErr
@@ -338,14 +340,13 @@ func (s *Server) serveCached(w http.ResponseWriter, r *http.Request, path string
 		return built, nil
 	})
 	if err != nil {
-		// This caller abandoned the flight because its own client went away; the
-		// flight itself is still running for everyone else and there is nobody
-		// left to write to.
-		if rerr := r.Context().Err(); rerr != nil && errors.Is(err, rerr) {
+		// This caller left the flight because its own client went away, so there
+		// is nobody to write to.
+		if errors.Is(err, errFlightAbandoned) {
 			return
 		}
 		if stale != nil {
-			s.stale.markStale(time.Now())
+			s.stale.markStale(s.now())
 			s.log.Printf("warning: serving stale %s from cache (stored %s): %v",
 				path, stale.StoredAt.UTC().Format(time.RFC3339), err)
 			s.writeStored(w, *stale, CacheStale)
@@ -355,7 +356,7 @@ func (s *Server) serveCached(w http.ResponseWriter, r *http.Request, path string
 		return
 	}
 	s.stale.markFresh()
-	setCacheHeaders(w, CacheMiss, time.Time{})
+	s.setCacheHeaders(w, CacheMiss, time.Time{})
 	writeCached(w, resp)
 }
 
@@ -375,14 +376,15 @@ func (s *Server) writeStored(w http.ResponseWriter, ent CacheEntry, status Cache
 		http.Error(w, "unreadable cache entry", http.StatusBadGateway)
 		return
 	}
-	setCacheHeaders(w, status, ent.StoredAt)
+	s.setCacheHeaders(w, status, ent.StoredAt)
 	writeCached(w, resp)
 }
 
 // setCacheHeaders labels a response from a cache-backed path: X-Cache is
 // hit/stale/miss and Age is whole seconds since the served copy was stored (0
-// for a response built by this request).
-func setCacheHeaders(w http.ResponseWriter, status CacheStatus, storedAt time.Time) {
+// for a response built by this request). It reads the same clock the cache
+// stamps entries with, so the two never disagree.
+func (s *Server) setCacheHeaders(w http.ResponseWriter, status CacheStatus, storedAt time.Time) {
 	label := "miss"
 	switch status {
 	case CacheFresh:
@@ -392,7 +394,7 @@ func setCacheHeaders(w http.ResponseWriter, status CacheStatus, storedAt time.Ti
 	}
 	age := 0
 	if !storedAt.IsZero() {
-		if secs := int(time.Since(storedAt).Seconds()); secs > 0 {
+		if secs := int(s.now().Sub(storedAt).Seconds()); secs > 0 {
 			age = secs
 		}
 	}

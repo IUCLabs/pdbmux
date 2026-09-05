@@ -3,6 +3,7 @@ package main
 import (
 	"container/list"
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
 	"runtime/debug"
@@ -191,7 +192,17 @@ type flightCall struct {
 	done chan struct{}
 	resp cachedResponse
 	err  error
+
+	cancel context.CancelFunc
+	// participants is the number of callers still waiting on this flight,
+	// guarded by flightGroup.mu.
+	participants int
 }
+
+// errFlightAbandoned reports that this caller stopped waiting because its own
+// context ended. It says nothing about the flight, which may still be running
+// for other participants.
+var errFlightAbandoned = errors.New("abandoned the shared flight")
 
 // flightPanic is a panic from a flight's fn, reported to the leader and to every
 // waiter as an error so callers keep their error handling (stale fallback, 502)
@@ -207,43 +218,80 @@ func (p *flightPanic) Error() string {
 
 // Do returns fn's result and whether this caller shared another's in-flight run.
 //
-// ctx belongs to the caller alone. A waiter that gives up returns ctx.Err() and
-// leaves the flight running for everyone else; the leader ignores ctx entirely
-// and always runs fn to completion, so one participant walking away can neither
-// cancel nor fail the others. fn is therefore responsible for its own deadline.
-func (g *flightGroup) Do(ctx context.Context, key string, fn func() (cachedResponse, error)) (resp cachedResponse, err error, shared bool) {
+// fn runs on a context of the flight's own: detached from every caller's,
+// bounded by timeout, and cancelled once the last participant leaves. A caller
+// that gives up returns errFlightAbandoned and leaves the flight running for
+// whoever is still waiting, so one participant walking away can neither cancel
+// nor fail the others, while a flight nobody waits on any more is dropped at
+// once rather than holding upstream sockets until the timeout.
+func (g *flightGroup) Do(ctx context.Context, key string, timeout time.Duration, fn func(context.Context) (cachedResponse, error)) (resp cachedResponse, err error, shared bool) {
 	g.mu.Lock()
 	if g.calls == nil {
 		g.calls = make(map[string]*flightCall)
 	}
-	if c, ok := g.calls[key]; ok {
+	c, shared := g.calls[key]
+	if shared {
+		c.participants++
 		g.mu.Unlock()
-		select {
-		case <-c.done:
-			return c.resp, c.err, true
-		case <-ctx.Done():
-			return cachedResponse{}, ctx.Err(), true
-		}
+	} else {
+		flightCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
+		c = &flightCall{done: make(chan struct{}), cancel: cancel, participants: 1}
+		g.calls[key] = c
+		g.mu.Unlock()
+		go g.run(flightCtx, key, c, fn)
 	}
-	c := &flightCall{done: make(chan struct{})}
-	g.calls[key] = c
-	g.mu.Unlock()
+	defer g.leave(key, c)
 
+	select {
+	case <-c.done:
+		return c.resp, c.err, shared
+	case <-ctx.Done():
+		return cachedResponse{}, fmt.Errorf("%w: %w", errFlightAbandoned, ctx.Err()), shared
+	}
+}
+
+func (g *flightGroup) run(ctx context.Context, key string, c *flightCall, fn func(context.Context) (cachedResponse, error)) {
 	defer func() {
 		if r := recover(); r != nil {
 			c.resp, c.err = cachedResponse{}, &flightPanic{value: r, stack: debug.Stack()}
-			resp, err = c.resp, c.err
 		}
 		// The key is released before the results are published, so a caller that
 		// arrives late leads a new flight instead of joining a finished one.
-		g.mu.Lock()
-		delete(g.calls, key)
-		g.mu.Unlock()
+		g.forget(key, c)
 		close(c.done)
 	}()
 
-	c.resp, c.err = fn()
-	return c.resp, c.err, false
+	c.resp, c.err = fn(ctx)
+}
+
+// leave drops one participant and, when it was the last, unregisters the key and
+// cancels the flight so a lone requester disconnecting aborts the fan-out
+// instead of pinning a socket per backend for the whole timeout. Unregistering
+// under the same lock that admits joiners keeps anyone from joining a flight
+// that is about to be cancelled.
+func (g *flightGroup) leave(key string, c *flightCall) {
+	g.mu.Lock()
+	c.participants--
+	last := c.participants == 0
+	if last {
+		g.unregister(key, c)
+	}
+	g.mu.Unlock()
+	if last {
+		c.cancel()
+	}
+}
+
+func (g *flightGroup) forget(key string, c *flightCall) {
+	g.mu.Lock()
+	g.unregister(key, c)
+	g.mu.Unlock()
+}
+
+func (g *flightGroup) unregister(key string, c *flightCall) {
+	if cur, ok := g.calls[key]; ok && cur == c {
+		delete(g.calls, key)
+	}
 }
 
 // staleTracker records stale fallbacks for /healthz. serving flips back to false

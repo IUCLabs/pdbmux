@@ -245,7 +245,9 @@ backend later without further handler changes.
   upstream fan-out; the rest wait for it and share the result. That fan-out runs
   on its own context, bounded by `timeout`, so a client that disconnects can
   neither cancel nor fail the requests sharing its flight; a waiter whose own
-  client goes away leaves the flight running for the others.
+  client goes away leaves the flight running for the others. The flight is
+  cancelled once its last participant leaves, so a lone client disconnecting
+  releases the upstream connections straight away.
 - **Response headers** — every response on a cached path carries `X-Cache`
   (`hit` served from a fresh entry, `miss` built by this request, `stale` the
   expired-entry fallback) and `Age` in whole seconds since the served copy was
