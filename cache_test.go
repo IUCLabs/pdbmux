@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -400,7 +401,7 @@ func TestFlightGroup_LeaderRunsOnce(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if _, _, s := g.Do("k", run); s {
+			if _, _, s := g.Do(context.Background(), "k", run); s {
 				shared.Add(1)
 			}
 		}()
@@ -417,7 +418,7 @@ func TestFlightGroup_LeaderRunsOnce(t *testing.T) {
 		t.Errorf("%d callers shared the flight, want 15", shared.Load())
 	}
 	// The key is released once the flight finishes.
-	if _, _, s := g.Do("k", func() (cachedResponse, error) { return cachedResponse{Records: -1}, nil }); s {
+	if _, _, s := g.Do(context.Background(), "k", func() (cachedResponse, error) { return cachedResponse{Records: -1}, nil }); s {
 		t.Error("a later call must start its own flight")
 	}
 }
@@ -439,7 +440,7 @@ func TestFlightGroup_LeaderPanicFailsLeaderAndWaiters(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		leader.resp, leader.err, leader.shared = g.Do("k", func() (cachedResponse, error) {
+		leader.resp, leader.err, leader.shared = g.Do(context.Background(), "k", func() (cachedResponse, error) {
 			close(entered)
 			<-release
 			panic("build exploded")
@@ -451,7 +452,7 @@ func TestFlightGroup_LeaderPanicFailsLeaderAndWaiters(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			waiters[i].resp, waiters[i].err, waiters[i].shared = g.Do("k", func() (cachedResponse, error) {
+			waiters[i].resp, waiters[i].err, waiters[i].shared = g.Do(context.Background(), "k", func() (cachedResponse, error) {
 				t.Error("a waiter must not run its own fn")
 				return cachedResponse{}, nil
 			})
@@ -478,7 +479,7 @@ func TestFlightGroup_LeaderPanicFailsLeaderAndWaiters(t *testing.T) {
 	}
 
 	// The key is released on the panic path, so a later call leads its own flight.
-	resp, err, shared := g.Do("k", func() (cachedResponse, error) {
+	resp, err, shared := g.Do(context.Background(), "k", func() (cachedResponse, error) {
 		return cachedResponse{Body: json.RawMessage(`[]`), Records: 0}, nil
 	})
 	if shared {
@@ -494,8 +495,8 @@ func TestServeCached_BuildPanicIs502ThenStale(t *testing.T) {
 	b := newCountingBackend(t, map[string]string{factsPath: `[]`})
 	srv, clk := newCachedServer(t, cacheTestConfig(a.srv.URL, b.srv.URL))
 
-	panicBuild := func() (cachedResponse, error) { panic("build exploded") }
-	serve := func(build func() (cachedResponse, error)) *httptest.ResponseRecorder {
+	panicBuild := func(context.Context) (cachedResponse, error) { panic("build exploded") }
+	serve := func(build func(context.Context) (cachedResponse, error)) *httptest.ResponseRecorder {
 		rec := httptest.NewRecorder()
 		req := httptest.NewRequest(http.MethodGet, factsPath, nil)
 		srv.serveCached(rec, req, factsPath, nil, build)
@@ -509,7 +510,7 @@ func TestServeCached_BuildPanicIs502ThenStale(t *testing.T) {
 	}
 
 	stored := `[` + fact("h1", "role", "web", "") + `]`
-	rec = serve(func() (cachedResponse, error) {
+	rec = serve(func(context.Context) (cachedResponse, error) {
 		return cachedResponse{Body: json.RawMessage(stored), Records: 1}, nil
 	})
 	if rec.Code != http.StatusOK {
@@ -539,7 +540,7 @@ func TestServeCached_BuildPanicFailsConcurrentWaiters(t *testing.T) {
 
 	entered := make(chan struct{})
 	release := make(chan struct{})
-	serve := func(build func() (cachedResponse, error)) *httptest.ResponseRecorder {
+	serve := func(build func(context.Context) (cachedResponse, error)) *httptest.ResponseRecorder {
 		rec := httptest.NewRecorder()
 		req := httptest.NewRequest(http.MethodGet, factsPath, nil)
 		srv.serveCached(rec, req, factsPath, nil, build)
@@ -551,7 +552,7 @@ func TestServeCached_BuildPanicFailsConcurrentWaiters(t *testing.T) {
 	var leaderRec *httptest.ResponseRecorder
 	go func() {
 		defer wg.Done()
-		leaderRec = serve(func() (cachedResponse, error) {
+		leaderRec = serve(func(context.Context) (cachedResponse, error) {
 			close(entered)
 			<-release
 			panic("build exploded")
@@ -565,7 +566,7 @@ func TestServeCached_BuildPanicFailsConcurrentWaiters(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			recs[i] = serve(func() (cachedResponse, error) {
+			recs[i] = serve(func(context.Context) (cachedResponse, error) {
 				t.Error("a waiter must not run its own build")
 				return cachedResponse{}, nil
 			})
@@ -583,6 +584,195 @@ func TestServeCached_BuildPanicFailsConcurrentWaiters(t *testing.T) {
 			t.Fatalf("waiter %d got %d (%s), want 502 rather than an empty success",
 				i, rec.Code, rec.Body.String())
 		}
+	}
+}
+
+// The leader's client disconnecting mid-fetch must not fail the followers whose
+// own connections are healthy.
+func TestHandler_LeaderDisconnectDoesNotFailFollowers(t *testing.T) {
+	body := `[` + node("h1", "2026-01-01T00:00:00.000Z") + `]`
+	a := newCountingBackend(t, map[string]string{nodesPath: body})
+	b := newCountingBackend(t, map[string]string{nodesPath: `[]`})
+	srv, _ := newCachedServer(t, cacheTestConfig(a.srv.URL, b.srv.URL))
+	h := srv.Handler()
+
+	release := make(chan struct{})
+	a.setBlock(release)
+	b.setBlock(release)
+
+	leaderCtx, cancelLeader := context.WithCancel(context.Background())
+	defer cancelLeader()
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		req := httptest.NewRequest(http.MethodGet, nodesPath, nil).WithContext(leaderCtx)
+		h.ServeHTTP(httptest.NewRecorder(), req)
+	}()
+
+	// Only once the leader is inside the fan-out does a second caller join its
+	// flight rather than starting one of its own.
+	waitFor(t, func() bool { return a.hitCount(nodesPath) >= 1 })
+
+	follower := httptest.NewRecorder()
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		h.ServeHTTP(follower, httptest.NewRequest(http.MethodGet, nodesPath, nil))
+	}()
+
+	time.Sleep(250 * time.Millisecond)
+	cancelLeader()
+	time.Sleep(100 * time.Millisecond)
+	close(release)
+	wg.Wait()
+
+	if follower.Code != http.StatusOK {
+		t.Fatalf("follower status %d (%s), want 200: a healthy client must not inherit the leader's cancellation",
+			follower.Code, follower.Body.String())
+	}
+	if got := strings.TrimSpace(follower.Body.String()); got != body {
+		t.Errorf("follower body = %s, want %s", got, body)
+	}
+	if got := a.hitCount(nodesPath); got != 1 {
+		t.Errorf("backend a saw %d requests, want 1", got)
+	}
+}
+
+// A follower whose own client goes away must unpark rather than wait out the
+// leader, and must not disturb the flight the others are sharing.
+func TestFlightGroup_WaiterAbandonsOnContextCancel(t *testing.T) {
+	var g flightGroup
+	entered := make(chan struct{})
+	release := make(chan struct{})
+
+	var leaderResp cachedResponse
+	var leaderErr error
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		leaderResp, leaderErr, _ = g.Do(context.Background(), "k", func() (cachedResponse, error) {
+			close(entered)
+			<-release
+			return cachedResponse{Body: json.RawMessage(`[1]`), Records: 1}, nil
+		})
+	}()
+	<-entered
+
+	// A patient waiter proves the flight survives the abandoning one.
+	var patientResp cachedResponse
+	var patientErr error
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		patientResp, patientErr, _ = g.Do(context.Background(), "k", func() (cachedResponse, error) {
+			t.Error("a waiter must not run its own fn")
+			return cachedResponse{}, nil
+		})
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	var abandoned error
+	var abandonedShared bool
+	go func() {
+		defer close(done)
+		_, abandoned, abandonedShared = g.Do(ctx, "k", func() (cachedResponse, error) {
+			t.Error("a waiter must not run its own fn")
+			return cachedResponse{}, nil
+		})
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("a waiter whose context was cancelled stayed parked on the leader")
+	}
+	if !errors.Is(abandoned, context.Canceled) {
+		t.Errorf("abandoning waiter err = %v, want context.Canceled", abandoned)
+	}
+	if !abandonedShared {
+		t.Error("the abandoning waiter did share the flight")
+	}
+
+	close(release)
+	wg.Wait()
+
+	if leaderErr != nil || leaderResp.Records != 1 {
+		t.Errorf("leader = (%+v, %v), want a clean success", leaderResp, leaderErr)
+	}
+	if patientErr != nil || patientResp.Records != 1 {
+		t.Errorf("patient waiter = (%+v, %v), want the leader's result", patientResp, patientErr)
+	}
+
+	g.mu.Lock()
+	remaining := len(g.calls)
+	g.mu.Unlock()
+	if remaining != 0 {
+		t.Errorf("%d flights left registered, want 0", remaining)
+	}
+}
+
+// Every participant walking away must still leave the flight bounded and the
+// group empty: nothing parked, nothing registered.
+func TestFlightGroup_AllCallersAbandon(t *testing.T) {
+	var g flightGroup
+	entered := make(chan struct{})
+	release := make(chan struct{})
+
+	leaderCtx, cancelLeader := context.WithCancel(context.Background())
+	leaderDone := make(chan struct{})
+	go func() {
+		defer close(leaderDone)
+		_, _, _ = g.Do(leaderCtx, "k", func() (cachedResponse, error) {
+			close(entered)
+			<-release
+			return cachedResponse{Records: -1}, nil
+		})
+	}()
+	<-entered
+
+	const waiters = 8
+	ctx, cancel := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+	for range waiters {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, _, _ = g.Do(ctx, "k", func() (cachedResponse, error) {
+				t.Error("a waiter must not run its own fn")
+				return cachedResponse{}, nil
+			})
+		}()
+	}
+
+	time.Sleep(100 * time.Millisecond)
+	cancel()
+	cancelLeader()
+	waitDone := make(chan struct{})
+	go func() { wg.Wait(); close(waitDone) }()
+	select {
+	case <-waitDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("waiters stayed parked after their contexts were cancelled")
+	}
+
+	close(release)
+	select {
+	case <-leaderDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the leader goroutine leaked")
+	}
+
+	g.mu.Lock()
+	remaining := len(g.calls)
+	g.mu.Unlock()
+	if remaining != 0 {
+		t.Errorf("%d flights left registered, want 0", remaining)
 	}
 }
 

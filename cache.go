@@ -188,7 +188,7 @@ type flightGroup struct {
 }
 
 type flightCall struct {
-	wg   sync.WaitGroup
+	done chan struct{}
 	resp cachedResponse
 	err  error
 }
@@ -206,18 +206,26 @@ func (p *flightPanic) Error() string {
 }
 
 // Do returns fn's result and whether this caller shared another's in-flight run.
-func (g *flightGroup) Do(key string, fn func() (cachedResponse, error)) (resp cachedResponse, err error, shared bool) {
+//
+// ctx belongs to the caller alone. A waiter that gives up returns ctx.Err() and
+// leaves the flight running for everyone else; the leader ignores ctx entirely
+// and always runs fn to completion, so one participant walking away can neither
+// cancel nor fail the others. fn is therefore responsible for its own deadline.
+func (g *flightGroup) Do(ctx context.Context, key string, fn func() (cachedResponse, error)) (resp cachedResponse, err error, shared bool) {
 	g.mu.Lock()
 	if g.calls == nil {
 		g.calls = make(map[string]*flightCall)
 	}
 	if c, ok := g.calls[key]; ok {
 		g.mu.Unlock()
-		c.wg.Wait()
-		return c.resp, c.err, true
+		select {
+		case <-c.done:
+			return c.resp, c.err, true
+		case <-ctx.Done():
+			return cachedResponse{}, ctx.Err(), true
+		}
 	}
-	c := &flightCall{}
-	c.wg.Add(1)
+	c := &flightCall{done: make(chan struct{})}
 	g.calls[key] = c
 	g.mu.Unlock()
 
@@ -226,11 +234,12 @@ func (g *flightGroup) Do(key string, fn func() (cachedResponse, error)) (resp ca
 			c.resp, c.err = cachedResponse{}, &flightPanic{value: r, stack: debug.Stack()}
 			resp, err = c.resp, c.err
 		}
-		// Done only after the results are stored, so waiters read them.
-		c.wg.Done()
+		// The key is released before the results are published, so a caller that
+		// arrives late leads a new flight instead of joining a finished one.
 		g.mu.Lock()
 		delete(g.calls, key)
 		g.mu.Unlock()
+		close(c.done)
 	}()
 
 	c.resp, c.err = fn()

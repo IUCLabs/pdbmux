@@ -142,8 +142,8 @@ func isReportSubResource(path string) bool {
 
 func (s *Server) serveMerged(w http.ResponseWriter, r *http.Request, path string, merge func([]backendResult) []json.RawMessage) {
 	params := queryParams(r.URL.Query().Get("query"))
-	s.serveCached(w, r, path, params, func() (cachedResponse, error) {
-		alive, err := s.aliveResults(r.Context(), path, params)
+	s.serveCached(w, r, path, params, func(ctx context.Context) (cachedResponse, error) {
+		alive, err := s.aliveResults(ctx, path, params)
 		if err != nil {
 			return cachedResponse{}, err
 		}
@@ -162,8 +162,8 @@ func (s *Server) serveUnion(w http.ResponseWriter, r *http.Request, path string,
 
 	// Keyed on the request's own params, not the upstream ones: upstreamParams
 	// folds offset into limit, so different windows would collide.
-	s.serveCached(w, r, path, in, func() (cachedResponse, error) {
-		alive, err := s.aliveResults(r.Context(), path, page.upstreamParams(in))
+	s.serveCached(w, r, path, in, func(ctx context.Context) (cachedResponse, error) {
+		alive, err := s.aliveResults(ctx, path, page.upstreamParams(in))
 		if err != nil {
 			return cachedResponse{}, err
 		}
@@ -215,8 +215,8 @@ func (s *Server) serveSummed(w http.ResponseWriter, r *http.Request, path string
 		return
 	}
 
-	s.serveCached(w, r, path, in, func() (cachedResponse, error) {
-		alive, err := s.aliveResults(r.Context(), path, page.upstreamParams(in))
+	s.serveCached(w, r, path, in, func(ctx context.Context) (cachedResponse, error) {
+		alive, err := s.aliveResults(ctx, path, page.upstreamParams(in))
 		if err != nil {
 			return cachedResponse{}, err
 		}
@@ -285,10 +285,10 @@ type cachedResponse struct {
 // fan-out — and stores the result. A build failure falls back to a stale entry
 // when one exists; that is the only path on which stale data is served. Paths
 // with no cache configured run build directly, unchanged.
-func (s *Server) serveCached(w http.ResponseWriter, r *http.Request, path string, params url.Values, build func() (cachedResponse, error)) {
+func (s *Server) serveCached(w http.ResponseWriter, r *http.Request, path string, params url.Values, build func(context.Context) (cachedResponse, error)) {
 	cache, enabled := s.cacheFor(path, params)
 	if !enabled {
-		resp, err := build()
+		resp, err := build(r.Context())
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
@@ -311,8 +311,14 @@ func (s *Server) serveCached(w http.ResponseWriter, r *http.Request, path string
 		stale = &ent
 	}
 
-	resp, err, _ := s.flights.Do(key, func() (cachedResponse, error) {
-		built, buildErr := build()
+	// The flight is shared, so it runs on a context detached from whichever
+	// request happened to lead it: one client disconnecting must not cancel the
+	// fan-out its followers are waiting on. cfg.Timeout keeps it bounded.
+	resp, err, _ := s.flights.Do(r.Context(), key, func() (cachedResponse, error) {
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), s.flightTimeout())
+		defer cancel()
+
+		built, buildErr := build(ctx)
 		if buildErr != nil {
 			return cachedResponse{}, buildErr
 		}
@@ -321,13 +327,18 @@ func (s *Server) serveCached(w http.ResponseWriter, r *http.Request, path string
 			s.log.Printf("warning: encoding cache entry for %s failed: %v", key, marshalErr)
 			return built, nil
 		}
-		// The leader's request may be cancelled while followers still wait.
-		if putErr := cache.Put(context.WithoutCancel(r.Context()), key, body); putErr != nil {
+		if putErr := cache.Put(ctx, key, body); putErr != nil {
 			s.log.Printf("warning: cache store for %s failed: %v", key, putErr)
 		}
 		return built, nil
 	})
 	if err != nil {
+		// This caller abandoned the flight because its own client went away; the
+		// flight itself is still running for everyone else and there is nobody
+		// left to write to.
+		if rerr := r.Context().Err(); rerr != nil && errors.Is(err, rerr) {
+			return
+		}
 		if stale != nil {
 			s.stale.markStale(time.Now())
 			s.log.Printf("warning: serving stale %s from cache (stored %s): %v",
@@ -340,6 +351,15 @@ func (s *Server) serveCached(w http.ResponseWriter, r *http.Request, path string
 	}
 	s.stale.markFresh()
 	writeCached(w, resp)
+}
+
+// http.Client reads a zero Timeout as "no deadline", but it would expire a
+// context immediately, so an unset value falls back to the default.
+func (s *Server) flightTimeout() time.Duration {
+	if s.cfg.Timeout > 0 {
+		return s.cfg.Timeout
+	}
+	return defaultTimeout
 }
 
 func (s *Server) writeStored(w http.ResponseWriter, body []byte) {
