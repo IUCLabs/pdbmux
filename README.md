@@ -257,6 +257,18 @@ backend later without further handler changes.
   `stale_served` and `last_stale_served`. `serving_stale` is `true` from the
   moment a stale fallback is served until the next response comes from a live
   fan-out or a fresh entry.
+- **Provenance is stored, not re-applied** — what a cache entry holds is the
+  fully merged body, `pdbmux_source` already injected and upstream records of
+  that name already dropped. Attribution names the backend that supplied the
+  data, which is a property of that fetch, so it stays correct for as long as the
+  body does and ages out with it — `X-Cache` and `Age` say how old both are. Two
+  requests can only share an entry when they share a key, and the key is path
+  plus query, which is exactly what decides whether injection applies; a
+  name-filtered `/facts` query and a plain one therefore cache separately and
+  neither is ever served the other's shape. `source_fact` and
+  `source_fact_enabled` are read once at startup, and the cache lives for the
+  same process, so changing either cannot leave differently-shaped entries
+  behind.
 
 ## Config
 

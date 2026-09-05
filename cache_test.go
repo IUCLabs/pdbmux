@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"slices"
 	"strconv"
@@ -648,8 +649,11 @@ func TestHandler_LeaderDisconnectDoesNotFailFollowers(t *testing.T) {
 		t.Fatalf("follower status %d (%s), want 200: a healthy client must not inherit the leader's cancellation",
 			follower.Code, follower.Body.String())
 	}
-	if got := strings.TrimSpace(follower.Body.String()); got != body {
-		t.Errorf("follower body = %s, want %s", got, body)
+	// The leader built this body, so its provenance names the backend that
+	// answered the leader's fan-out.
+	want := `[` + stamped(t, node("h1", "2026-01-01T00:00:00.000Z"), defaultSourceFact, "a") + `]`
+	if got := strings.TrimSpace(follower.Body.String()); !sameJSON(t, got, want) {
+		t.Errorf("follower body = %s, want %s", got, want)
 	}
 	if got := a.hitCount(nodesPath); got != 1 {
 		t.Errorf("backend a saw %d requests, want 1", got)
@@ -1064,8 +1068,9 @@ func TestServeCached_CacheStatusHeaders(t *testing.T) {
 	if got := rec.Header().Get(ageHeader); got != "31" {
 		t.Errorf("stale fallback %s = %q, want 31 seconds since the entry was stored", ageHeader, got)
 	}
-	if got := strings.TrimSpace(rec.Body.String()); got != stored {
-		t.Errorf("stale body = %s, want %s", got, stored)
+	want := `[` + fact("h1", "role", "web", "") + `,` + factEnv("h1", defaultSourceFact, "a", "") + `]`
+	if got := strings.TrimSpace(rec.Body.String()); !sameJSON(t, got, want) {
+		t.Errorf("stale body = %s, want %s", got, want)
 	}
 }
 
@@ -1375,5 +1380,169 @@ func waitFor(t *testing.T, cond func() bool) {
 			t.Fatal("condition not met within 5s")
 		}
 		time.Sleep(time.Millisecond)
+	}
+}
+
+// sameJSON compares two JSON documents by value, so a test need not track the
+// key order json.Marshal produces for a stamped record.
+func sameJSON(t *testing.T, got, want string) bool {
+	t.Helper()
+	var g, w any
+	if err := json.Unmarshal([]byte(got), &g); err != nil {
+		t.Fatalf("unmarshal got %s: %v", got, err)
+	}
+	if err := json.Unmarshal([]byte(want), &w); err != nil {
+		t.Fatalf("unmarshal want %s: %v", want, err)
+	}
+	return reflect.DeepEqual(g, w)
+}
+
+// stamped is a /nodes record with one extra string key, as the merge serves it.
+func stamped(t *testing.T, raw, field, value string) string {
+	t.Helper()
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(raw), &obj); err != nil {
+		t.Fatalf("unmarshal %s: %v", raw, err)
+	}
+	obj[field] = json.RawMessage(strconv.Quote(value))
+	out, err := json.Marshal(obj)
+	if err != nil {
+		t.Fatalf("marshal stamped record: %v", err)
+	}
+	return string(out)
+}
+
+// The injector is per-request but a cache entry is shared, so a second caller is
+// served a body built for the first. Provenance names the backend that supplied
+// the data, which is a property of that fetch, so the shared body stays correct.
+func TestHandler_CachedFactsKeepSourceAttribution(t *testing.T) {
+	a := newCountingBackend(t, map[string]string{factsPath: `[` + fact("h1", "role", "web", "") + `]`})
+	b := newCountingBackend(t, map[string]string{factsPath: `[]`})
+	srv, _ := newCachedServer(t, cacheTestConfig(a.srv.URL, b.srv.URL))
+	h := srv.Handler()
+
+	first := doGet(t, h, factsPath, "")
+	if got := first.Header().Get(cacheStatusHeader); got != "miss" {
+		t.Fatalf("first %s = %q, want miss", cacheStatusHeader, got)
+	}
+	srcs, n := sourceValues(t, first.Body.Bytes(), defaultSourceFact)
+	if n != 1 || srcs["h1"] != "a" {
+		t.Fatalf("first request sources = %v (%d records), want h1 -> a", srcs, n)
+	}
+
+	second := doGet(t, h, factsPath, "")
+	if got := second.Header().Get(cacheStatusHeader); got != "hit" {
+		t.Fatalf("second %s = %q, want hit", cacheStatusHeader, got)
+	}
+	srcs, n = sourceValues(t, second.Body.Bytes(), defaultSourceFact)
+	if n != 1 || srcs["h1"] != "a" {
+		t.Errorf("cached request sources = %v (%d records), want exactly one h1 -> a", srcs, n)
+	}
+	if got := a.hitCount(factsPath); got != 1 {
+		t.Errorf("backend a saw %d requests, want 1: the second read must come from the cache", got)
+	}
+}
+
+// The same, for the /nodes stamp rather than the synthetic /facts record.
+func TestHandler_CachedNodesKeepSourceStamp(t *testing.T) {
+	a := newCountingBackend(t, map[string]string{nodesPath: `[` + node("h1", "2026-01-02T00:00:00.000Z") + `]`})
+	b := newCountingBackend(t, map[string]string{nodesPath: `[` + node("h1", "2026-01-01T00:00:00.000Z") + `]`})
+	srv, _ := newCachedServer(t, cacheTestConfig(a.srv.URL, b.srv.URL))
+	h := srv.Handler()
+
+	first := doGet(t, h, nodesPath, "")
+	if got := nodeSources(t, first.Body.Bytes(), defaultSourceFact); got["h1"] != "a" {
+		t.Fatalf("first request stamp = %v, want h1 -> a", got)
+	}
+
+	second := doGet(t, h, nodesPath, "")
+	if got := second.Header().Get(cacheStatusHeader); got != "hit" {
+		t.Fatalf("second %s = %q, want hit", cacheStatusHeader, got)
+	}
+	want := `[` + stamped(t, node("h1", "2026-01-02T00:00:00.000Z"), defaultSourceFact, "a") + `]`
+	if got := strings.TrimSpace(second.Body.String()); !sameJSON(t, got, want) {
+		t.Errorf("cached body = %s, want %s", got, want)
+	}
+	if got := a.hitCount(nodesPath); got != 1 {
+		t.Errorf("backend a saw %d requests, want 1", got)
+	}
+}
+
+// Provenance is baked into the cached body, so it ages with the data it labels:
+// while the entry is served the attribution is the one that fetch had, and the
+// rebuild after the TTL picks up the move.
+func TestHandler_CachedSourceAgesWithItsData(t *testing.T) {
+	a := newCountingBackend(t, map[string]string{factsPath: `[` + fact("h1", "role", "web", "") + `]`})
+	b := newCountingBackend(t, map[string]string{factsPath: `[]`})
+	srv, clk := newCachedServer(t, cacheTestConfig(a.srv.URL, b.srv.URL))
+	h := srv.Handler()
+
+	doGet(t, h, factsPath, "")
+
+	// The node moves to b while the entry is still fresh.
+	a.setBody(factsPath, `[]`)
+	b.setBody(factsPath, `[`+fact("h1", "role", "web", "")+`]`)
+
+	cached := doGet(t, h, factsPath, "")
+	if got := cached.Header().Get(cacheStatusHeader); got != "hit" {
+		t.Fatalf("%s = %q, want hit", cacheStatusHeader, got)
+	}
+	if srcs, _ := sourceValues(t, cached.Body.Bytes(), defaultSourceFact); srcs["h1"] != "a" {
+		t.Errorf("cached sources = %v, want h1 -> a: the body and its attribution come from the same fetch", srcs)
+	}
+
+	clk.advance(31 * time.Second)
+	rebuilt := doGet(t, h, factsPath, "")
+	if srcs, _ := sourceValues(t, rebuilt.Body.Bytes(), defaultSourceFact); srcs["h1"] != "b" {
+		t.Errorf("rebuilt sources = %v, want h1 -> b once the entry expired", srcs)
+	}
+}
+
+// The injection gate is a pure function of path and query, both of which are in
+// the cache key, so a gated request can never be served an injected body cached
+// for an ungated one.
+func TestHandler_SourceGateIsPerCacheKey(t *testing.T) {
+	body := `[` + fact("h1", "role", "web", "") + `]`
+	a := newCountingBackend(t, map[string]string{factsPath: body})
+	b := newCountingBackend(t, map[string]string{factsPath: `[]`})
+	srv, _ := newCachedServer(t, cacheTestConfig(a.srv.URL, b.srv.URL))
+	h := srv.Handler()
+
+	const nameFiltered = `["=","name","role"]`
+	for _, pass := range []string{"first", "cached"} {
+		open := doGet(t, h, factsPath, "")
+		if srcs, n := sourceValues(t, open.Body.Bytes(), defaultSourceFact); n != 1 || srcs["h1"] != "a" {
+			t.Errorf("%s unfiltered request sources = %v (%d records), want h1 -> a", pass, srcs, n)
+		}
+		gated := doGet(t, h, factsPath, nameFiltered)
+		if _, n := sourceValues(t, gated.Body.Bytes(), defaultSourceFact); n != 0 {
+			t.Errorf("%s name-filtered request carried %d synthetic record(s), want none", pass, n)
+		}
+		if got := strings.TrimSpace(gated.Body.String()); !sameJSON(t, got, body) {
+			t.Errorf("%s name-filtered body = %s, want %s", pass, got, body)
+		}
+	}
+	if got := a.hitCount(factsPath); got != 2 {
+		t.Errorf("backend a saw %d requests, want 2: one per distinct cache key", got)
+	}
+}
+
+// Suppression of an upstream fact of the configured name is part of the merged
+// body, so it survives into the cache rather than being re-applied per request.
+func TestHandler_SuppressionSurvivesCacheHit(t *testing.T) {
+	upstream := `[` + fact("h1", defaultSourceFact, "somewhere-else", "") + `,` + fact("h1", "role", "web", "") + `]`
+	a := newCountingBackend(t, map[string]string{factsPath: upstream})
+	b := newCountingBackend(t, map[string]string{factsPath: `[]`})
+	srv, _ := newCachedServer(t, cacheTestConfig(a.srv.URL, b.srv.URL))
+	h := srv.Handler()
+
+	doGet(t, h, factsPath, "")
+	cached := doGet(t, h, factsPath, "")
+	if got := cached.Header().Get(cacheStatusHeader); got != "hit" {
+		t.Fatalf("%s = %q, want hit", cacheStatusHeader, got)
+	}
+	srcs, n := sourceValues(t, cached.Body.Bytes(), defaultSourceFact)
+	if n != 1 || srcs["h1"] != "a" {
+		t.Errorf("cached sources = %v (%d records), want exactly one h1 -> a, the upstream value dropped", srcs, n)
 	}
 }
