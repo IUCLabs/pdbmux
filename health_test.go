@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -712,26 +713,154 @@ func TestProber_RecoversFromProbeUnsupported(t *testing.T) {
 	}
 }
 
-// Rejections cannot talk a down backend back into the pool while its failure run
-// is unbroken — the failures are still the run's best evidence. A successful
-// probe ends the run, and rejections after that mean the probe stopped working
-// rather than the backend.
-func TestProber_RejectedProbeReadmitsADownBackendOnlyAfterASuccess(t *testing.T) {
+// Rejections cannot talk a down backend back into the pool while a real failure
+// is still inside the window — the failure is still the best evidence there is.
+// Once it has aged out and nothing but refusals is left, the probe rather than
+// the backend is what is broken.
+func TestProber_RejectionsReadmitADownBackendOnlyAfterTheFailureAgesOut(t *testing.T) {
 	p := newTestProber(t, healthConfig("http://a.invalid", "http://b.invalid"))
 	markDown(t, p, "a")
 
-	for i := 0; i < p.failures*5; i++ {
+	for i := 1; i < p.window; i++ {
 		p.record("a", rejectedProbe(p))
 		if p.healthy("a") {
-			t.Fatal("rejections re-admitted a backend whose failure run never ended")
+			t.Fatalf("rejection %d of a %d-probe window re-admitted a backend whose failure is still in view", i, p.window)
+		}
+		if got := p.snapshot()["a"].stateName(); got != stateUnhealthy {
+			t.Fatalf("state = %q after rejection %d, want %q", got, i, stateUnhealthy)
 		}
 	}
-	if got := p.snapshot()["a"].stateName(); got != stateUnhealthy {
-		t.Fatalf("state = %q, want %q", got, stateUnhealthy)
+
+	p.record("a", rejectedProbe(p))
+	if !p.healthy("a") {
+		t.Fatalf("backend stayed excluded after its last failure left the %d-probe window", p.window)
+	}
+	if got := p.snapshot()["a"].stateName(); got != stateProbeUnsupported {
+		t.Fatalf("state = %q, want %q", got, stateProbeUnsupported)
 	}
 
 	p.record("a", nil)
 	markUnsupported(t, p, "a")
+}
+
+// A success clears the failure window as well as the run, so what follows it is
+// judged on its own evidence.
+func TestProber_SuccessClearsTheFailureWindow(t *testing.T) {
+	p := newTestProber(t, healthConfig("http://a.invalid", "http://b.invalid"))
+	markDown(t, p, "a")
+
+	for i := 0; i < p.successes; i++ {
+		p.record("a", nil)
+	}
+	if !p.healthy("a") {
+		t.Fatal("backend did not recover after its success threshold")
+	}
+	markUnsupported(t, p, "a")
+}
+
+// The stranding regression: a backend whose probe path is permanently wrong can
+// never answer a probe successfully, so one transient failure in the middle of
+// its 404s must not exclude it for the life of the process.
+func TestProber_AgedOutFailureSettlesOnProbeUnsupported(t *testing.T) {
+	p := newTestProber(t, healthConfig("http://a.invalid", "http://b.invalid"))
+	for i := 0; i < p.failures*3; i++ {
+		p.record("a", rejectedProbe(p))
+	}
+	if got := p.snapshot()["a"].stateName(); got != stateProbeUnsupported {
+		t.Fatalf("state = %q before the failure, want %q", got, stateProbeUnsupported)
+	}
+
+	p.record("a", errors.New("read: connection reset by peer"))
+	if p.healthy("a") {
+		t.Fatal("a real failure did not take the backend out of the pool")
+	}
+
+	for i := 1; i < p.window; i++ {
+		p.record("a", rejectedProbe(p))
+		if p.healthy("a") {
+			t.Fatalf("the failure aged out after %d of %d probes", i, p.window)
+		}
+	}
+	p.record("a", rejectedProbe(p))
+
+	for i := 0; i < 500; i++ {
+		p.record("a", rejectedProbe(p))
+		if !p.healthy("a") {
+			t.Fatalf("backend was still excluded %d probes after its failure aged out", i+p.window)
+		}
+		if got := p.snapshot()["a"].stateName(); got != stateProbeUnsupported {
+			t.Fatalf("state = %q, want %q", got, stateProbeUnsupported)
+		}
+	}
+}
+
+// The window is the failure threshold, floored so it always spans a
+// reject-heavy cycle.
+func TestProber_FailureWindowFollowsTheThreshold(t *testing.T) {
+	for _, tc := range []struct{ failures, window int }{
+		{1, minFailureWindow}, {2, minFailureWindow}, {3, 3}, {5, 5}, {9, 9},
+	} {
+		cfg := healthConfig("http://a.invalid", "http://b.invalid")
+		cfg.HealthProbeFailures = tc.failures
+		p := newTestProber(t, cfg)
+		if p.window != tc.window {
+			t.Fatalf("health_probe_failures = %d gave a window of %d, want %d", tc.failures, p.window, tc.window)
+		}
+
+		markDown(t, p, "a")
+		for i := 1; i < tc.window; i++ {
+			p.record("a", rejectedProbe(p))
+			if p.healthy("a") {
+				t.Fatalf("threshold %d: failure aged out after %d of %d probes", tc.failures, i, tc.window)
+			}
+		}
+		p.record("a", rejectedProbe(p))
+		if !p.healthy("a") {
+			t.Fatalf("threshold %d: failure never aged out of the %d-probe window", tc.failures, tc.window)
+		}
+	}
+}
+
+// Every cycle that keeps failing, whatever it mixes in, must settle down and stay
+// down: once a backend has left the pool nothing but a success may bring it back.
+func TestProber_MixedFailureCyclesNeverFlapBackIntoService(t *testing.T) {
+	rejected := func(p *prober) error { return rejectedProbe(p) }
+	failed := func(*prober) error { return errors.New("boom") }
+
+	cycles := map[string][]func(*prober) error{
+		"rejected/failure":      {rejected, failed},
+		"failure/rejected":      {failed, rejected},
+		"reject-heavy 3-cycle":  {rejected, rejected, failed},
+		"failure-heavy 3-cycle": {rejected, failed, failed},
+		"failure-led 3-cycle":   {failed, rejected, rejected},
+		"paired 4-cycle":        {rejected, rejected, failed, failed},
+	}
+	for name, cycle := range cycles {
+		for _, failures := range []int{1, 2, 3, 5} {
+			t.Run(fmt.Sprintf("%s/threshold %d", name, failures), func(t *testing.T) {
+				cfg := healthConfig("http://a.invalid", "http://b.invalid")
+				cfg.HealthProbeFailures = failures
+				p := newTestProber(t, cfg)
+
+				down := false
+				for i := 0; i < 600; i++ {
+					p.record("a", cycle[i%len(cycle)](p))
+					switch {
+					case !p.healthy("a"):
+						down = true
+					case down:
+						t.Fatalf("backend flapped back into service at probe %d", i+1)
+					}
+				}
+				if !down {
+					t.Fatal("a backend that failed 600 probes never left the pool")
+				}
+				if got := p.snapshot()["a"].stateName(); got != stateUnhealthy {
+					t.Errorf("state = %q, want %q", got, stateUnhealthy)
+				}
+			})
+		}
+	}
 }
 
 func TestProber_LogsProbeRejectionOncePerTransition(t *testing.T) {

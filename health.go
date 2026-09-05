@@ -19,6 +19,11 @@ const probeBodyLimit = 1 << 20
 // runningState is the healthy state reported by PuppetDB's status service.
 const runningState = "running"
 
+// minFailureWindow floors the failure window at the shortest reject-heavy cycle
+// that must not flap — reject, reject, failure — since a shorter window would
+// let its failure age out between two rejections.
+const minFailureWindow = 3
+
 const (
 	stateHealthy          = "healthy"
 	stateUnhealthy        = "unhealthy"
@@ -42,13 +47,13 @@ type probeState struct {
 	healthy     bool
 	unsupported bool
 	probed      bool
-	// runFailed records whether the current run of not-OK probes contains at
-	// least one real failure, which decides which non-healthy state it enters.
-	runFailed bool
-	failures  int
-	successes int
-	lastProbe time.Time
-	lastErr   string
+	// failWindow counts the probes over which the last real failure still counts
+	// as evidence; while it is positive a not-OK run is a failure run.
+	failWindow int
+	failures   int
+	successes  int
+	lastProbe  time.Time
+	lastErr    string
 }
 
 // backendHealth is a copy of one backend's probe state, safe to read outside the
@@ -121,6 +126,7 @@ type prober struct {
 	interval  time.Duration
 	failures  int
 	successes int
+	window    int
 	client    *http.Client
 	log       *log.Logger
 	now       func() time.Time
@@ -143,6 +149,7 @@ func newProber(cfg Config, logger *log.Logger) *prober {
 		interval:  cfg.HealthProbeInterval,
 		failures:  cfg.HealthProbeFailures,
 		successes: cfg.HealthProbeSuccesses,
+		window:    max(cfg.HealthProbeFailures, minFailureWindow),
 		client:    &http.Client{Timeout: cfg.HealthProbeTimeout},
 		log:       logger,
 		now:       time.Now,
@@ -244,7 +251,10 @@ func (p *prober) probeOne(ctx context.Context, b Backend) {
 // threshold is reached so a single blip cannot flap a backend in either
 // direction. One run of consecutive not-OK probes makes the down decision, no
 // matter how the kinds are mixed; the kinds only pick which non-healthy state
-// the run enters, and a real failure anywhere in the run outranks a rejection.
+// the run enters. A real failure outranks a rejection for the length of the
+// failure window, not for the whole run: a backend whose probe path is
+// permanently wrong would otherwise be stranded out of the pool for good by one
+// old transient failure, since only a success it can never give clears it.
 func (p *prober) record(name string, err error) {
 	p.mu.Lock()
 	st, ok := p.states[name]
@@ -259,7 +269,7 @@ func (p *prober) record(name string, err error) {
 	var transition string
 	if outcome == outcomeOK {
 		st.lastErr = ""
-		st.failures, st.runFailed = 0, false
+		st.failures, st.failWindow = 0, 0
 		st.successes++
 		if st.successes >= p.successes {
 			switch {
@@ -275,11 +285,15 @@ func (p *prober) record(name string, err error) {
 		st.lastErr = err.Error()
 		st.successes = 0
 		st.failures++
-		st.runFailed = st.runFailed || outcome == outcomeFailure
+		if outcome == outcomeFailure {
+			st.failWindow = p.window
+		} else if st.failWindow > 0 {
+			st.failWindow--
+		}
 		if st.failures >= p.failures {
 			switch {
-			case st.runFailed:
-				// Some probe in this run was evidence about the backend itself, so the
+			case st.failWindow > 0:
+				// A probe inside the window was evidence about the backend itself, so the
 				// run is a failure run whatever else it also contains.
 				st.unsupported = false
 				if st.healthy {

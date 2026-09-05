@@ -251,11 +251,20 @@ not answering.
   blip cannot flap a backend out, and one lucky reply cannot flap it back in.
   The run counts every unsuccessful probe whatever its kind, so a backend that
   fails every probe in mixed ways — a `503`, then a `404`, then a timeout —
-  still trips the threshold; only a success resets the run. The kinds decide
-  *which* state the run enters: a real failure anywhere in the run outranks a
-  refusal, so the backend goes `unhealthy` and is skipped, and only a run of
-  nothing but refusals enters `probe_unsupported` and stays in service. A down
-  backend keeps being probed, so recovery is automatic.
+  still trips the threshold; only a success resets the run. A down backend keeps
+  being probed, so recovery is automatic.
+- **A window decides which state the run enters.** The run is a *failure* run —
+  `unhealthy`, backend skipped — whenever a real failure landed within the last
+  `health_probe_failures` probes, floored at 3 so the window always spans a
+  reject-heavy cycle. A run whose whole window holds nothing but refusals is
+  `probe_unsupported` and keeps serving queries. A backend flipping between kinds
+  — `404`, `503`, `404`, timeout — therefore keeps a failure inside every window
+  and stays out of the pool, while a backend whose probe path is merely wrong
+  returns to service one window after the single transient failure it suffered.
+  Bounding the evidence to a window is what makes that possible: a wrong probe
+  path can never answer a probe successfully, so a failure held against the whole
+  run would be held forever and would strand a backend that is answering queries
+  perfectly. A success clears the window along with the run.
 - **Fails open** — if the prober has marked **every** backend down, `pdbmux`
   queries them all anyway. A wrong `health_probe_path`, a broken prober or a
   partition that only the prober sees can therefore never black-hole traffic;
