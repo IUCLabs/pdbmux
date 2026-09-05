@@ -230,26 +230,32 @@ not answering.
   still works.
 - **A refused probe is not a sick backend.** Only evidence about the *backend*
   takes it out of the pool: a transport failure (connection refused, DNS, TLS,
-  timeout) or a `5xx` — `503` included, since trapperkeeper answers `503` exactly
-  when its services are not nominal, so it stays a real failure. A reply that
-  refuses the *probe request* is evidence about the probe instead: every `4xx` is
-  the backend answering that our request is the problem (`404`/`410` the path is
-  not there, `405` it does not take a `GET`, `401`/`403` we are not allowed to
-  ask, `429` we asked too often), and `501` says it does not implement the
+  timeout), a `5xx` — `503` included, since trapperkeeper answers `503` exactly
+  when its services are not nominal — or a `429`, which is the backend reporting
+  its own capacity rather than judging the request, so an overloaded backend gets
+  backed off instead of kept at full traffic. A reply that refuses the *probe
+  request* is evidence about the probe instead: the other `4xx` are the backend
+  answering that our request is the problem (`404`/`410` the path is not there,
+  `405` it does not take a `GET`, `401`/`403` we are not allowed to ask), and
+  `501` says it does not implement the
   endpoint. A backend answering that way is **left in service** — still queried,
   still contributing records — and reported as `probe_unsupported` rather than
   `healthy`, so an operator can tell "verified healthy" from "not actually being
   checked". A probe path that is wrong for one backend alone can therefore never
   strand a working backend. The misconfiguration is logged once per transition,
   naming the backend, the probe path and the status.
-- **Thresholds** — a healthy backend goes down after `health_probe_failures`
-  (default 3) **consecutive** failures; a down one comes back after
-  `health_probe_successes` (default 2) consecutive successes, and the same
-  thresholds gate `probe_unsupported` in and out. One blip cannot flap a backend
-  out, and one lucky reply cannot flap it back in. A run only counts while the
-  replies keep their kind, so a stretch of `404`s and a stretch of `503`s never
-  add up to one threshold. A down backend keeps being probed, so recovery is
-  automatic.
+- **Thresholds** — a healthy backend leaves the pool after
+  `health_probe_failures` (default 3) **consecutive** unsuccessful probes; a down
+  one comes back after `health_probe_successes` (default 2) consecutive
+  successes, and the same thresholds gate `probe_unsupported` in and out. One
+  blip cannot flap a backend out, and one lucky reply cannot flap it back in.
+  The run counts every unsuccessful probe whatever its kind, so a backend that
+  fails every probe in mixed ways — a `503`, then a `404`, then a timeout —
+  still trips the threshold; only a success resets the run. The kinds decide
+  *which* state the run enters: a real failure anywhere in the run outranks a
+  refusal, so the backend goes `unhealthy` and is skipped, and only a run of
+  nothing but refusals enters `probe_unsupported` and stays in service. A down
+  backend keeps being probed, so recovery is automatic.
 - **Fails open** — if the prober has marked **every** backend down, `pdbmux`
   queries them all anyway. A wrong `health_probe_path`, a broken prober or a
   partition that only the prober sees can therefore never black-hole traffic;
@@ -269,9 +275,14 @@ not answering.
   `consecutive_failures`,
   `consecutive_successes`, `last_probe` and `last_error`, alongside the
   `reachable` check `/healthz` runs itself — which always asks **every**
-  backend, so a backend queries are skipping is still reported. A `query` object
-  reports the last merged fan-out: `partial`, `contributed`, `configured`,
-  `partial_rounds` and `last_partial`.
+  backend, so a backend queries are skipping is still reported. Read the two
+  together: `state` is the prober's verdict and `probe_unsupported` means "not
+  being verified", *not* "well", so `reachable` is the field that says whether
+  the backend is answering right now. A proxy that `404`s everything because the
+  backend behind it is dead shows `state: probe_unsupported` with `reachable`
+  carrying the query error, and the overall `status` drops to `degraded` or
+  `down` accordingly. A `query` object reports the last merged fan-out:
+  `partial`, `contributed`, `configured`, `partial_rounds` and `last_partial`.
 - **`health_probe_enabled: false`** turns the whole thing off: no probing
   goroutines, no backend ever skipped, every backend queried on every request.
   `X-Backends` still reports how many answered.

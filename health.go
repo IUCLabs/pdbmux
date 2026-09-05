@@ -42,11 +42,13 @@ type probeState struct {
 	healthy     bool
 	unsupported bool
 	probed      bool
-	outcome     probeOutcome
-	failures    int
-	successes   int
-	lastProbe   time.Time
-	lastErr     string
+	// runFailed records whether the current run of not-OK probes contains at
+	// least one real failure, which decides which non-healthy state it enters.
+	runFailed bool
+	failures  int
+	successes int
+	lastProbe time.Time
+	lastErr   string
 }
 
 // backendHealth is a copy of one backend's probe state, safe to read outside the
@@ -86,11 +88,16 @@ func (e *probeRejectedError) Error() string {
 }
 
 // probeRejects reports whether a status code refuses the probe request rather
-// than reporting the service unhealthy. Every 4xx is the backend answering that
-// our request is the problem, and 501 says it does not implement the endpoint.
-// Other 5xx stay real evidence: trapperkeeper answers 503 exactly when its
-// services are not nominal.
+// than reporting the service unhealthy. A 4xx is the backend answering that our
+// request is the problem, and 501 says it does not implement the endpoint.
+// 429 is excluded: it is the backend reporting its own capacity, not a verdict
+// on the request, so an overloaded backend must get backed off rather than kept
+// at full traffic. Other 5xx stay real evidence too: trapperkeeper answers 503
+// exactly when its services are not nominal.
 func probeRejects(code int) bool {
+	if code == http.StatusTooManyRequests {
+		return false
+	}
 	return (code >= 400 && code < 500) || code == http.StatusNotImplemented
 }
 
@@ -235,7 +242,9 @@ func (p *prober) probeOne(ctx context.Context, b Backend) {
 
 // record applies one probe outcome, flipping state only once the matching
 // threshold is reached so a single blip cannot flap a backend in either
-// direction.
+// direction. One run of consecutive not-OK probes makes the down decision, no
+// matter how the kinds are mixed; the kinds only pick which non-healthy state
+// the run enters, and a real failure anywhere in the run outranks a rejection.
 func (p *prober) record(name string, err error) {
 	p.mu.Lock()
 	st, ok := p.states[name]
@@ -244,19 +253,13 @@ func (p *prober) record(name string, err error) {
 		return
 	}
 	outcome := classifyProbe(err)
-	// A run only counts while the outcome keeps its kind, so a rejected-probe run
-	// and a real-failure run never add up to one threshold.
-	if outcome != st.outcome {
-		st.failures, st.successes = 0, 0
-	}
-	st.outcome = outcome
 	st.probed = true
 	st.lastProbe = p.now()
 
 	var transition string
-	switch outcome {
-	case outcomeOK:
+	if outcome == outcomeOK {
 		st.lastErr = ""
+		st.failures, st.runFailed = 0, false
 		st.successes++
 		if st.successes >= p.successes {
 			switch {
@@ -268,23 +271,26 @@ func (p *prober) record(name string, err error) {
 				transition = fmt.Sprintf("info: backend %q is up after %d consecutive probe successes", name, st.successes)
 			}
 		}
-	case outcomeRejected:
+	} else {
 		st.lastErr = err.Error()
+		st.successes = 0
 		st.failures++
-		if !st.unsupported && st.failures >= p.failures {
-			// The backend answered and refused the probe request itself, so this says
-			// nothing about its health: it keeps serving queries, unverified.
-			st.unsupported, st.healthy = true, true
-			transition = fmt.Sprintf("warning: backend %q rejected the health probe %d times: %v; leaving it in service but unverified, fix health_probe_path or its authorization", name, st.failures, err)
-		}
-	default:
-		st.lastErr = err.Error()
-		st.failures++
+		st.runFailed = st.runFailed || outcome == outcomeFailure
 		if st.failures >= p.failures {
-			st.unsupported = false
-			if st.healthy {
-				st.healthy = false
-				transition = fmt.Sprintf("warning: backend %q is down after %d consecutive probe failures: %v", name, st.failures, err)
+			switch {
+			case st.runFailed:
+				// Some probe in this run was evidence about the backend itself, so the
+				// run is a failure run whatever else it also contains.
+				st.unsupported = false
+				if st.healthy {
+					st.healthy = false
+					transition = fmt.Sprintf("warning: backend %q is down after %d consecutive failed probes: %v", name, st.failures, err)
+				}
+			case !st.unsupported:
+				// Nothing but refusals of the probe request, which says nothing about the
+				// backend's health: it keeps serving queries, unverified.
+				st.unsupported, st.healthy = true, true
+				transition = fmt.Sprintf("warning: backend %q rejected the health probe %d times: %v; leaving it in service but unverified, fix health_probe_path or its authorization", name, st.failures, err)
 			}
 		}
 	}

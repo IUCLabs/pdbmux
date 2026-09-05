@@ -673,10 +673,18 @@ type healthReport struct {
 }
 
 // backendReport pairs this request's own reachability check with the background
-// prober's running state for the same backend.
+// prober's running state for the same backend. The two answer different
+// questions and must be read together: probe_unsupported means "not being
+// verified", not "well", so reachable is the field that says whether the backend
+// is actually answering queries right now.
 type backendReport struct {
-	Reachable string `json:"reachable"` // "ok" | error text
-	State     string `json:"state"`     // healthy | unhealthy | probe_unsupported | unprobed | unmonitored
+	// Reachable is this request's own live query to the backend, run against
+	// every configured backend regardless of probe state: "ok" or the error text.
+	Reachable string `json:"reachable"`
+	// State is the background prober's verdict. probe_unsupported means the probe
+	// path is unusable on this backend, so its health is unknown — read Reachable
+	// to find out whether it is up.
+	State     string `json:"state"` // healthy | unhealthy | probe_unsupported | unprobed | unmonitored
 	Failures  int    `json:"consecutive_failures"`
 	Successes int    `json:"consecutive_successes"`
 	LastProbe string `json:"last_probe,omitempty"`
