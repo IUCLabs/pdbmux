@@ -151,6 +151,18 @@ func runServer(cfg Config) error {
 	}
 }
 
+func factsTTLString(cfg Config) string {
+	s := durationString(cfg.FactsTTL)
+	switch {
+	case cfg.factsTTLClamped > 0:
+		return fmt.Sprintf("%s (clamped from %s, cap %s)",
+			s, durationString(cfg.factsTTLClamped), durationString(maxFactsTTL))
+	case !cfg.cacheEnabled():
+		return s + " (cache disabled)"
+	}
+	return s
+}
+
 func printConfig(cfg Config) {
 	if p := cfg.SourcePath(); p != "" {
 		fmt.Printf("config file  : %s (loaded)\n", p)
@@ -166,6 +178,8 @@ func printConfig(cfg Config) {
 	} else {
 		fmt.Printf("source_fact  : disabled\n")
 	}
+	fmt.Printf("facts_ttl    : %s\n", factsTTLString(cfg))
+	fmt.Printf("facts_cache  : %d bytes\n", cfg.CacheBytes)
 	fmt.Println("backends:")
 	for _, b := range cfg.Backends {
 		fmt.Printf("  - %-8s %s\n", b.Name, b.URL)

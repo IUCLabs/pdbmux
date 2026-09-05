@@ -456,7 +456,7 @@ func captureStdout(t *testing.T, f func()) string {
 
 func clearEnv(t *testing.T) {
 	t.Helper()
-	for _, k := range []string{"CONFIG", "LISTEN", "MERGE", "TIMEOUT", "FRESHNESS_TTL", "BACKENDS"} {
+	for _, k := range []string{"CONFIG", "LISTEN", "MERGE", "TIMEOUT", "FRESHNESS_TTL", "FACTS_TTL", "FACTS_CACHE_BYTES", "BACKENDS"} {
 		t.Setenv(envPrefix+k, "")
 	}
 }

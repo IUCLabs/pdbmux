@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -26,6 +27,11 @@ const (
 
 	// PuppetDB only sends this when the request carries include_total=true.
 	recordsHeader = "X-Records"
+
+	// Set by pdbmux, not by PuppetDB: how a cache-backed response was answered
+	// and how old the served copy is.
+	cacheStatusHeader = "X-Cache"
+	ageHeader         = "Age"
 )
 
 type backendResult struct {
@@ -35,10 +41,20 @@ type backendResult struct {
 	err     error
 }
 
+var errAllBackendsFailed = errors.New("all backends failed")
+
 type Server struct {
 	cfg    Config
 	client *http.Client
 	log    *log.Logger
+
+	// factsCache is nil when caching is disabled; cacheFor hands out a noop then.
+	factsCache Cache
+	flights    flightGroup
+	stale      staleTracker
+
+	// now is shared with the cache's clock so Age matches the stored timestamp.
+	now func() time.Time
 
 	// freshness cache (freshness merge only).
 	mu        sync.Mutex
@@ -47,11 +63,36 @@ type Server struct {
 }
 
 func NewServer(cfg Config, logger *log.Logger) *Server {
-	return &Server{
+	cfg.clampFactsTTL()
+	s := &Server{
 		cfg:    cfg,
 		client: &http.Client{Timeout: cfg.Timeout},
 		log:    logger,
+		now:    time.Now,
 	}
+	if cfg.cacheEnabled() {
+		s.factsCache = newMemoryCache(cfg.FactsTTL, cfg.CacheBytes)
+	}
+	return s
+}
+
+// cacheFor picks the cache backing a request. Merged /facts and /nodes record
+// sets share the in-memory cache; every other path is uncached until the reports
+// cache lands, and a new backend is a case here rather than a change to any
+// handler.
+func (s *Server) cacheFor(path string, params url.Values) (Cache, bool) {
+	switch path {
+	case factsPath, nodesPath:
+		// An aggregate row is a summed count, not the merged record set the
+		// cache was built for, so it stays on the live path.
+		if parseAggregate(params.Get("query")) != nil {
+			return noopCache{}, false
+		}
+		if s.factsCache != nil {
+			return s.factsCache, true
+		}
+	}
+	return noopCache{}, false
 }
 
 func (s *Server) Handler() http.Handler {
@@ -109,11 +150,14 @@ func isReportSubResource(path string) bool {
 }
 
 func (s *Server) serveMerged(w http.ResponseWriter, r *http.Request, path string, merge func([]backendResult) []json.RawMessage) {
-	alive, ok := s.aliveResults(w, r, path, queryParams(r.URL.Query().Get("query")))
-	if !ok {
-		return
-	}
-	writeJSON(w, merge(alive))
+	params := queryParams(r.URL.Query().Get("query"))
+	s.serveCached(w, r, path, params, func(ctx context.Context) (cachedResponse, error) {
+		alive, err := s.aliveResults(ctx, path, params)
+		if err != nil {
+			return cachedResponse{}, err
+		}
+		return cachedResponse{Body: encodeRecords(merge(alive)), Records: -1}, nil
+	})
 }
 
 // Reports and events are immutable history, so both backends' records belong in the merged view.
@@ -125,19 +169,23 @@ func (s *Server) serveUnion(w http.ResponseWriter, r *http.Request, path string,
 		return
 	}
 
-	alive, ok := s.aliveResults(w, r, path, page.upstreamParams(in))
-	if !ok {
-		return
-	}
-
-	merged := mergeUnion(alive, key)
-	sortRecords(merged, page.order)
-	if page.wantTotal {
-		if total := sumTotals(alive); total >= 0 {
-			w.Header().Set(recordsHeader, strconv.Itoa(total))
+	// Keyed on the request's own params, not the upstream ones: upstreamParams
+	// folds offset into limit, so different windows would collide.
+	s.serveCached(w, r, path, in, func(ctx context.Context) (cachedResponse, error) {
+		alive, err := s.aliveResults(ctx, path, page.upstreamParams(in))
+		if err != nil {
+			return cachedResponse{}, err
 		}
-	}
-	writeJSON(w, page.apply(merged))
+		merged := mergeUnion(alive, key)
+		sortRecords(merged, page.order)
+		resp := cachedResponse{Body: encodeRecords(page.apply(merged)), Records: -1}
+		if page.wantTotal {
+			if total := sumTotals(alive); total >= 0 {
+				resp.Records = total
+			}
+		}
+		return resp, nil
+	})
 }
 
 // A count row carries no certname, so the certname-keyed merge would collapse every backend's count into one backend's; aggregates take the summing path instead.
@@ -176,17 +224,19 @@ func (s *Server) serveSummed(w http.ResponseWriter, r *http.Request, path string
 		return
 	}
 
-	alive, ok := s.aliveResults(w, r, path, page.upstreamParams(in))
-	if !ok {
-		return
-	}
-
-	merged := sumRows(alive, columns)
-	sortRecords(merged, page.order)
-	if page.wantTotal {
-		w.Header().Set(recordsHeader, strconv.Itoa(len(merged)))
-	}
-	writeJSON(w, page.apply(merged))
+	s.serveCached(w, r, path, in, func(ctx context.Context) (cachedResponse, error) {
+		alive, err := s.aliveResults(ctx, path, page.upstreamParams(in))
+		if err != nil {
+			return cachedResponse{}, err
+		}
+		merged := sumRows(alive, columns)
+		sortRecords(merged, page.order)
+		resp := cachedResponse{Body: encodeRecords(page.apply(merged)), Records: -1}
+		if page.wantTotal {
+			resp.Records = len(merged)
+		}
+		return resp, nil
+	})
 }
 
 // A backend without the report answers 404, indistinguishable from a failure, so every backend is consulted before serving empty.
@@ -214,9 +264,9 @@ func (s *Server) serveFirstHolder(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, nil)
 }
 
-// Writes a 502 and returns ok=false only when every backend failed.
-func (s *Server) aliveResults(w http.ResponseWriter, r *http.Request, path string, params url.Values) ([]backendResult, bool) {
-	results := s.fanOut(r.Context(), path, params)
+// Returns errAllBackendsFailed only when every backend failed.
+func (s *Server) aliveResults(ctx context.Context, path string, params url.Values) ([]backendResult, error) {
+	results := s.fanOut(ctx, path, params)
 
 	var alive []backendResult
 	for _, res := range results {
@@ -227,10 +277,161 @@ func (s *Server) aliveResults(w http.ResponseWriter, r *http.Request, path strin
 		alive = append(alive, res)
 	}
 	if len(alive) == 0 {
-		http.Error(w, "all backends failed", http.StatusBadGateway)
-		return nil, false
+		return nil, errAllBackendsFailed
 	}
-	return alive, true
+	return alive, nil
+}
+
+// cachedResponse is the stored form of a merged response: the JSON body plus the
+// X-Records value it carried, so a cache hit reproduces both.
+type cachedResponse struct {
+	Body    json.RawMessage `json:"body"`
+	Records int             `json:"records"` // -1 when the response sets no X-Records
+}
+
+// serveCached answers from the cache when the entry is fresh, otherwise runs
+// build — single-flighted, so N concurrent identical requests cause one upstream
+// fan-out — and stores the result. A build failure falls back to a stale entry
+// when one exists; that is the only path on which stale data is served. Paths
+// with no cache configured run build directly, unchanged.
+func (s *Server) serveCached(w http.ResponseWriter, r *http.Request, path string, params url.Values, build func(context.Context) (cachedResponse, error)) {
+	cache, enabled := s.cacheFor(path, params)
+	if !enabled {
+		resp, err := build(r.Context())
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		writeCached(w, resp)
+		return
+	}
+
+	key := cacheKey(path, params)
+	var stale *CacheEntry
+	ent, status, err := cache.Get(r.Context(), key)
+	switch {
+	case err != nil:
+		s.log.Printf("warning: cache lookup for %s failed: %v", key, err)
+	case status == CacheFresh:
+		s.stale.markFresh()
+		s.writeStored(w, ent, CacheFresh)
+		return
+	case status == CacheStale:
+		stale = &ent
+	}
+
+	// The flight is shared, so it runs on its own context rather than the leading
+	// request's: one client disconnecting must not cancel the fan-out its
+	// followers are waiting on, and the flight ends as soon as the last of them
+	// goes. cfg.Timeout keeps it bounded.
+	resp, err, _ := s.flights.Do(r.Context(), key, s.flightTimeout(), func(ctx context.Context) (cachedResponse, error) {
+		built, buildErr := build(ctx)
+		if buildErr != nil {
+			return cachedResponse{}, buildErr
+		}
+		body, marshalErr := json.Marshal(built)
+		if marshalErr != nil {
+			s.log.Printf("warning: encoding cache entry for %s failed: %v", key, marshalErr)
+			return built, nil
+		}
+		// The build succeeded, so the entry is worth storing even if the last
+		// participant has already left and cancelled ctx: warming the cache for
+		// the next caller is the whole point. Same bound as the flight so an
+		// out-of-process cache cannot hang the store forever.
+		putCtx, cancelPut := context.WithTimeout(context.WithoutCancel(ctx), s.flightTimeout())
+		defer cancelPut()
+		if putErr := cache.Put(putCtx, key, body); putErr != nil {
+			s.log.Printf("warning: cache store for %s failed: %v", key, putErr)
+		}
+		return built, nil
+	})
+	if err != nil {
+		// This caller left the flight because its own client went away, so there
+		// is nobody to write to.
+		if errors.Is(err, errFlightAbandoned) {
+			return
+		}
+		if stale != nil {
+			s.stale.markStale(s.now())
+			s.log.Printf("warning: serving stale %s from cache (stored %s): %v",
+				path, stale.StoredAt.UTC().Format(time.RFC3339), err)
+			s.writeStored(w, *stale, CacheStale)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	s.stale.markFresh()
+	s.setCacheHeaders(w, CacheMiss, time.Time{})
+	writeCached(w, resp)
+}
+
+// http.Client reads a zero Timeout as "no deadline", but it would expire a
+// context immediately, so an unset value falls back to the default.
+func (s *Server) flightTimeout() time.Duration {
+	if s.cfg.Timeout > 0 {
+		return s.cfg.Timeout
+	}
+	return defaultTimeout
+}
+
+func (s *Server) writeStored(w http.ResponseWriter, ent CacheEntry, status CacheStatus) {
+	var resp cachedResponse
+	if err := json.Unmarshal(ent.Body, &resp); err != nil {
+		s.log.Printf("warning: unreadable cache entry: %v", err)
+		http.Error(w, "unreadable cache entry", http.StatusBadGateway)
+		return
+	}
+	s.setCacheHeaders(w, status, ent.StoredAt)
+	writeCached(w, resp)
+}
+
+// setCacheHeaders labels a response from a cache-backed path: X-Cache is
+// hit/stale/miss and Age is whole seconds since the served copy was stored (0
+// for a response built by this request). It reads the same clock the cache
+// stamps entries with, so the two never disagree.
+func (s *Server) setCacheHeaders(w http.ResponseWriter, status CacheStatus, storedAt time.Time) {
+	label := "miss"
+	switch status {
+	case CacheFresh:
+		label = "hit"
+	case CacheStale:
+		label = "stale"
+	}
+	age := 0
+	if !storedAt.IsZero() {
+		if secs := int(s.now().Sub(storedAt).Seconds()); secs > 0 {
+			age = secs
+		}
+	}
+	w.Header().Set(cacheStatusHeader, label)
+	w.Header().Set(ageHeader, strconv.Itoa(age))
+}
+
+func writeCached(w http.ResponseWriter, resp cachedResponse) {
+	w.Header().Set("Content-Type", "application/json")
+	if resp.Records >= 0 {
+		w.Header().Set(recordsHeader, strconv.Itoa(resp.Records))
+	}
+	// resp.Body is shared with the cache and with every caller of a single
+	// flight, so it is written, never appended to.
+	body := []byte(resp.Body)
+	if len(body) == 0 {
+		body = []byte("[]")
+	}
+	_, _ = w.Write(body)
+	_, _ = w.Write([]byte("\n"))
+}
+
+func encodeRecords(recs []json.RawMessage) json.RawMessage {
+	if recs == nil {
+		recs = []json.RawMessage{}
+	}
+	b, err := json.Marshal(recs)
+	if err != nil {
+		return json.RawMessage("[]")
+	}
+	return b
 }
 
 func queryParams(query string) url.Values {
@@ -406,13 +607,48 @@ func setContentType(w http.ResponseWriter, contentType string) {
 type healthReport struct {
 	Status   string            `json:"status"`
 	Backends map[string]string `json:"backends"` // name -> "ok" | error text
+	Cache    cacheHealth       `json:"cache"`
+}
+
+type cacheHealth struct {
+	Backend      string `json:"backend"` // "memory" | "none"
+	TTL          string `json:"ttl"`
+	Entries      int    `json:"entries"`
+	StaleEntries int    `json:"stale_entries"` // cached entries past their TTL
+	Bytes        int64  `json:"bytes"`
+	ServingStale bool   `json:"serving_stale"` // last cached response came from a stale entry
+	StaleServed  uint64 `json:"stale_served"`
+	LastStale    string `json:"last_stale_served,omitempty"`
+}
+
+func (s *Server) cacheHealth() cacheHealth {
+	stats := CacheStats{Backend: "none"}
+	ttl := time.Duration(0)
+	if s.factsCache != nil {
+		stats = s.factsCache.Stats()
+		ttl = s.cfg.FactsTTL
+	}
+	serving, served, last := s.stale.snapshot()
+	h := cacheHealth{
+		Backend:      stats.Backend,
+		TTL:          durationString(ttl),
+		Entries:      stats.Entries,
+		StaleEntries: stats.StaleEntries,
+		Bytes:        stats.Bytes,
+		ServingStale: serving,
+		StaleServed:  served,
+	}
+	if !last.IsZero() {
+		h.LastStale = last.UTC().Format(time.RFC3339)
+	}
+	return h
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	probe := `["=","certname","pdbmux-healthz-probe"]`
 	results := s.fanOut(r.Context(), nodesPath, queryParams(probe))
 
-	report := healthReport{Backends: map[string]string{}}
+	report := healthReport{Backends: map[string]string{}, Cache: s.cacheHealth()}
 	healthy := 0
 	for _, res := range results {
 		if res.err != nil {
