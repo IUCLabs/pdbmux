@@ -161,6 +161,11 @@ func printConfig(cfg Config) {
 	fmt.Printf("merge        : %s\n", cfg.Merge)
 	fmt.Printf("timeout      : %s\n", durationString(cfg.Timeout))
 	fmt.Printf("freshness_ttl: %s\n", durationString(cfg.FreshnessTTL))
+	if cfg.SourceFactEnabled {
+		fmt.Printf("source_fact  : %s\n", cfg.SourceFact)
+	} else {
+		fmt.Printf("source_fact  : disabled\n")
+	}
 	fmt.Println("backends:")
 	for _, b := range cfg.Backends {
 		fmt.Printf("  - %-8s %s\n", b.Name, b.URL)

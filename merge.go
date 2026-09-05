@@ -11,12 +11,16 @@ type record struct {
 	Certname        string
 	ReportTimestamp string // only populated for /nodes records
 	Hash            string // only populated for /reports records
+	Name            string // only populated for /facts records
+	Environment     string
 }
 
 type recordMeta struct {
 	Certname        string `json:"certname"`
 	ReportTimestamp string `json:"report_timestamp"`
 	Hash            string `json:"hash"`
+	Name            string `json:"name"`
+	Environment     string `json:"environment"`
 }
 
 func decodeRecords(body []byte) ([]record, error) {
@@ -33,6 +37,8 @@ func decodeRecords(body []byte) ([]record, error) {
 			Certname:        m.Certname,
 			ReportTimestamp: m.ReportTimestamp,
 			Hash:            m.Hash,
+			Name:            m.Name,
+			Environment:     m.Environment,
 		})
 	}
 	return out, nil
@@ -50,10 +56,12 @@ func parseTimestamp(s string) time.Time {
 }
 
 // Ties keep the earlier backend's record — a deterministic tie-break, not a preference.
-func mergeNodes(results []backendResult) []json.RawMessage {
+// A non-nil inject stamps each surviving record with the backend that supplied it.
+func mergeNodes(results []backendResult, inject *sourceInjector) []json.RawMessage {
 	type pick struct {
-		raw json.RawMessage
-		ts  time.Time
+		raw     json.RawMessage
+		ts      time.Time
+		backend string
 	}
 	best := map[string]pick{}
 	var order []string
@@ -62,18 +70,19 @@ func mergeNodes(results []backendResult) []json.RawMessage {
 			ts := parseTimestamp(rec.ReportTimestamp)
 			cur, ok := best[rec.Certname]
 			if !ok {
-				best[rec.Certname] = pick{raw: rec.Raw, ts: ts}
+				best[rec.Certname] = pick{raw: rec.Raw, ts: ts, backend: res.name}
 				order = append(order, rec.Certname)
 				continue
 			}
 			if ts.After(cur.ts) {
-				best[rec.Certname] = pick{raw: rec.Raw, ts: ts}
+				best[rec.Certname] = pick{raw: rec.Raw, ts: ts, backend: res.name}
 			}
 		}
 	}
 	out := make([]json.RawMessage, 0, len(order))
 	for _, cn := range order {
-		out = append(out, best[cn].raw)
+		p := best[cn]
+		out = append(out, inject.stamp(p.raw, p.backend))
 	}
 	return out
 }
@@ -105,16 +114,17 @@ func buildFreshness(results []backendResult) freshness {
 }
 
 // owner names the winning backend per certname; a nil owner (static merge), or one holding no facts for that certname, falls back to configured order.
-func mergeFacts(results []backendResult, owner func(certname string) string) []json.RawMessage {
+// A non-nil inject appends the synthetic source fact after each certname's block, naming the backend that won.
+func mergeFacts(results []backendResult, owner func(certname string) string, inject *sourceInjector) []json.RawMessage {
 	present := map[string][]string{} // certname -> backend names, in configured order
-	byKey := map[string][]json.RawMessage{}
+	byKey := map[string][]record{}
 	for _, res := range results {
 		for _, rec := range res.records {
 			key := rec.Certname + "\x00" + res.name
 			if _, ok := byKey[key]; !ok {
 				present[rec.Certname] = append(present[rec.Certname], res.name)
 			}
-			byKey[key] = append(byKey[key], rec.Raw)
+			byKey[key] = append(byKey[key], rec)
 		}
 	}
 
@@ -140,9 +150,28 @@ func mergeFacts(results []backendResult, owner func(certname string) string) []j
 		if !contains(backends, chosen) {
 			chosen = backends[0]
 		}
-		out = append(out, byKey[cn+"\x00"+chosen]...)
+		recs := byKey[cn+"\x00"+chosen]
+		for _, rec := range recs {
+			// An upstream fact of the same name is dropped: pdbmux's own value is authoritative.
+			if inject.claims(rec.Name) {
+				continue
+			}
+			out = append(out, rec.Raw)
+		}
+		if synth := inject.factRecord(cn, chosen, environmentOf(recs)); synth != nil {
+			out = append(out, synth)
+		}
 	}
 	return out
+}
+
+func environmentOf(recs []record) string {
+	for _, rec := range recs {
+		if rec.Environment != "" {
+			return rec.Environment
+		}
+	}
+	return ""
 }
 
 func contains(s []string, v string) bool {

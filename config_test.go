@@ -118,6 +118,69 @@ func TestApplyEnv_Backends(t *testing.T) {
 	}
 }
 
+func TestDefaultConfig_SourceFact(t *testing.T) {
+	cfg := DefaultConfig()
+	if cfg.SourceFact != defaultSourceFact || !cfg.SourceFactEnabled {
+		t.Errorf("source fact defaults to %q enabled=%v, want %q enabled=true",
+			cfg.SourceFact, cfg.SourceFactEnabled, defaultSourceFact)
+	}
+}
+
+func TestApplyEnv_SourceFact(t *testing.T) {
+	cfg := testConfigValid()
+	env := map[string]string{envPrefix + "SOURCE_FACT": "origin_pdb"}
+	applyEnv(&cfg, func(k string) string { return env[k] })
+	if cfg.SourceFact != "origin_pdb" || !cfg.SourceFactEnabled {
+		t.Errorf("name override failed: %q enabled=%v", cfg.SourceFact, cfg.SourceFactEnabled)
+	}
+
+	cfg = testConfigValid()
+	env = map[string]string{envPrefix + "SOURCE_FACT_ENABLED": "false"}
+	applyEnv(&cfg, func(k string) string { return env[k] })
+	if cfg.SourceFactEnabled {
+		t.Error("PDBMUX_SOURCE_FACT_ENABLED=false must disable injection")
+	}
+
+	// A junk boolean leaves the default alone rather than disabling silently.
+	cfg = testConfigValid()
+	env = map[string]string{envPrefix + "SOURCE_FACT_ENABLED": "maybe"}
+	applyEnv(&cfg, func(k string) string { return env[k] })
+	if !cfg.SourceFactEnabled {
+		t.Error("unparseable bool must not change the setting")
+	}
+}
+
+// A config file omitting the key keeps the default; setting it false wins.
+func TestLoad_SourceFactFileOverride(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", dir)
+	path := filepath.Join(dir, appName, configFileName)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write := func(body string) Config {
+		t.Helper()
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := Load("")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return cfg
+	}
+
+	cfg := write("backends:\n  - name: a\n    url: http://a:8080\n")
+	if cfg.SourceFact != defaultSourceFact || !cfg.SourceFactEnabled {
+		t.Errorf("omitted keys must keep defaults: %q enabled=%v", cfg.SourceFact, cfg.SourceFactEnabled)
+	}
+
+	cfg = write("backends:\n  - name: a\n    url: http://a:8080\nsource_fact: origin_pdb\nsource_fact_enabled: false\n")
+	if cfg.SourceFact != "origin_pdb" || cfg.SourceFactEnabled {
+		t.Errorf("file override failed: %q enabled=%v", cfg.SourceFact, cfg.SourceFactEnabled)
+	}
+}
+
 func TestValidate(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -130,6 +193,8 @@ func TestValidate(t *testing.T) {
 		{"missing url", func(c *Config) { c.Backends[0].URL = "" }, true},
 		{"bad merge", func(c *Config) { c.Merge = "wrong" }, true},
 		{"zero timeout", func(c *Config) { c.Timeout = 0 }, true},
+		{"empty source fact while enabled", func(c *Config) { c.SourceFact = "" }, true},
+		{"empty source fact while disabled", func(c *Config) { c.SourceFact = ""; c.SourceFactEnabled = false }, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -24,8 +24,8 @@ not PQL) is forwarded verbatim.
 
 | Path | Behaviour |
 |---|---|
-| `GET /pdb/query/v4/nodes` | Fan out to all backends, dedupe by `certname`, keep the record with the newer `report_timestamp`. |
-| `GET /pdb/query/v4/facts` | Fan out to all, and per `certname` keep **all** facts from the backend that owns that node (see merge semantics). |
+| `GET /pdb/query/v4/nodes` | Fan out to all backends, dedupe by `certname`, keep the record with the newer `report_timestamp`. Stamped with the winning backend's name (see provenance). |
+| `GET /pdb/query/v4/facts` | Fan out to all, and per `certname` keep **all** facts from the backend that owns that node (see merge semantics), plus a synthetic `pdbmux_source` fact naming it. |
 | `GET /pdb/query/v4/reports` | Fan out to all and serve the **union**, deduped by report `hash`, re-ordered and re-paged across backends. |
 | `GET /pdb/query/v4/events` | Fan out to all and serve the **union**, deduped by record identity, re-ordered and re-paged. |
 | `GET /pdb/query/v4/event-counts` | Fan out to all and **sum** each subject's counts into one row per subject. |
@@ -77,6 +77,62 @@ unknown fields survive untouched.
   - `include_total=true` on a summed endpoint reports the **merged** row count,
     not the sum of the backends' `X-Records`, since shared keys collapse.
 
+### Provenance: the `pdbmux_source` fact
+
+Once several PuppetDBs sit behind one endpoint, a consumer can no longer tell
+which backend a node's data came from. `pdbmux` makes that visible in the
+response itself, so nothing has to query each backend to find out:
+
+- **`/facts`** gains one extra fact record per `certname`, alongside the node's
+  real facts, in the shape of a real fact record — `certname`, `name`, `value`,
+  `environment` — with `value` set to the **backend name** from `backends` /
+  `PDBMUX_BACKENDS`. `environment` is copied from that node's own facts (all
+  four keys are always present, since clients index them directly).
+- **`/nodes`** gains a `pdbmux_source` **key** on each merged node record. A
+  node record carries no facts, so this is a synthetic field, not a fact — the
+  one key outside PuppetDB's documented node schema. Clients read node fields by
+  name, so an extra key is ignored by anything that doesn't want it.
+
+The value always names the backend **whose data won that endpoint's merge**, not
+a backend that merely holds the node. The two endpoints resolve their winner
+separately, so under `merge: static` they can legitimately disagree: `/facts`
+attributes a shared node to the first backend in configured order, while
+`/nodes` always attributes it to the backend holding the newer
+`report_timestamp`. Each answer describes the record it is attached to.
+
+If a backend genuinely reports a fact of the configured name, `pdbmux`
+**overrides** it — the upstream record is dropped and replaced, never duplicated,
+so the fact means exactly one thing and a node never carries two of it. Rename
+the synthetic fact via `source_fact` if the real one matters more.
+
+**Injection is skipped**, and the response passes through untouched, when:
+
+- the query has a top-level `extract` — it projects a column subset, and with a
+  `["function", ...]` column it aggregates. Injecting there would break the row
+  shape or silently inflate a `count()`, so **aggregate results are never
+  changed**;
+- (`/facts` only) the query constrains `name` — `["=","name","osfamily"]` and
+  friends ask for specific facts, and the synthetic record is not one of them.
+  Only the outer query is inspected: a `name` filter inside an `in`/`select_facts`
+  subquery narrows which *nodes* match, not which facts come back, so injection
+  still happens;
+- injection is turned off (see `source_fact_enabled`).
+
+**Not supported in v1: server-side filtering on the fact.** A query that selects
+it — `["=","name","pdbmux_source"]`, or an `extract` naming it — is forwarded to
+the backends like any other, and they return nothing, because the fact does not
+exist upstream. `pdbmux` does not evaluate the AST itself, so it cannot answer
+such a query correctly for every operator (`not`, `or`, subqueries) and does not
+pretend to for some. Read the fact from an unfiltered (or `certname`-filtered)
+`/facts` response and filter client-side. The same applies to the
+`/pdb/query/v4/facts/<name>` route, which is served unmerged pass-through.
+
+**Not covered:** `/factsets` and `/inventory`. Both carry facts, but `pdbmux`
+does not merge either today — they take the unmerged pass-through path, where
+the answer comes from whichever backend replied first rather than from a merge
+winner, so there is no owner to attribute. Injecting there would state a
+provenance that isn't true.
+
 ### Paging and ordering on the merged endpoints
 
 Each backend applies `order_by`/`limit`/`offset` to its own slice only, so
@@ -117,6 +173,8 @@ backends:                          # order is a tie-break only, not a ranking
 merge: freshness      # freshness | static
 timeout: 10s          # per-upstream request timeout
 freshness_ttl: 30s    # freshness-map cache TTL (freshness merge only)
+source_fact: pdbmux_source   # name of the synthetic provenance fact
+source_fact_enabled: true    # false serves backends' records untouched
 ```
 
 `backends[*].url` is a **base** URL (`scheme://host[:port]`); `pdbmux` appends
@@ -130,6 +188,8 @@ the `/pdb/query/v4/...` path per request.
 | `PDBMUX_TIMEOUT` | `timeout` (Go duration, e.g. `10s`) |
 | `PDBMUX_FRESHNESS_TTL` | `freshness_ttl` |
 | `PDBMUX_BACKENDS` | whole backend list, as `name=url,name=url` |
+| `PDBMUX_SOURCE_FACT` | `source_fact` (default `pdbmux_source`) |
+| `PDBMUX_SOURCE_FACT_ENABLED` | `source_fact_enabled` (default `true`); `false` disables injection |
 
 Flags: `--config`, `--listen`, `--merge`.
 
