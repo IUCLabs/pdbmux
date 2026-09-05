@@ -237,42 +237,60 @@ not answering.
   request* is evidence about the probe instead: the other `4xx` are the backend
   answering that our request is the problem (`404`/`410` the path is not there,
   `405` it does not take a `GET`, `401`/`403` we are not allowed to ask), and
-  `501` says it does not implement the
-  endpoint. A backend answering that way is **left in service** — still queried,
-  still contributing records — and reported as `probe_unsupported` rather than
-  `healthy`, so an operator can tell "verified healthy" from "not actually being
-  checked". A probe path that is wrong for one backend alone can therefore never
-  strand a working backend. The misconfiguration is logged once per transition,
-  naming the backend, the probe path and the status.
+  `501` says it does not implement the endpoint.
+- **A backend is only gated on a probe that has worked for it.** Each backend
+  carries one latch: has its probe endpoint ever *answered* — replied with
+  something readable as healthy or unhealthy — since `pdbmux` started? A
+  rejection refused the request and a transport failure never reached the
+  endpoint, so neither one sets it; a `200`, a `503` or a degraded body does.
+  The latch decides which rule applies, and it never clears, so no repeating
+  pattern of failures can argue a backend back into service.
+  - **Never answered** — there is no health signal for this backend, so nothing
+    gates on one. It is **left in service** — still queried, still contributing
+    records — permanently, reported as `probe_unsupported` rather than
+    `healthy` so an operator can tell "verified healthy" from "not actually
+    being checked". Real failures do not take it out either: no conclusion about
+    a backend can be drawn from a probe that cannot run. This is the
+    misconfigured-path case, and it degrades that backend to the behaviour from
+    before health checks existed, which is the right floor. The
+    misconfiguration is logged once, naming the backend, the probe path and the
+    status. A backend that has been unreachable since `pdbmux` started has not
+    answered either, so it is not gated until it answers once — `reachable` on
+    `/healthz` is what reports it in the meantime.
+  - **Answered at least once** — the path works, so the probe is trusted and the
+    ordinary thresholds below apply. A later run of *rejections* counts as
+    failure, not `probe_unsupported`: a path that answered before and refuses
+    now has moved or changed its authorization, which is logged loudly when the
+    run starts.
 - **Thresholds** — a healthy backend leaves the pool after
   `health_probe_failures` (default 3) **consecutive** unsuccessful probes; a down
   one comes back after `health_probe_successes` (default 2) consecutive
-  successes, and the same thresholds gate `probe_unsupported` in and out. One
-  blip cannot flap a backend out, and one lucky reply cannot flap it back in.
-  The run counts every unsuccessful probe whatever its kind, so a backend that
-  fails every probe in mixed ways — a `503`, then a `404`, then a timeout —
-  still trips the threshold; only a success resets the run. A down backend keeps
+  successes, and the same failure threshold debounces the `probe_unsupported`
+  warning. One blip cannot flap a backend out, and one lucky reply cannot flap
+  it back in. The run counts every unsuccessful probe whatever its kind, so a
+  backend that fails every probe in mixed ways — a `503`, then a `404`, then a
+  timeout — still trips the threshold; only a success resets the run. Probes
+  from before the latch was set do not count toward it. A down backend keeps
   being probed, so recovery is automatic.
-- **A window decides which state the run enters.** The run is a *failure* run —
-  `unhealthy`, backend skipped — whenever a real failure landed within the last
-  `health_probe_failures` probes, floored at 3 so the window always spans a
-  reject-heavy cycle. A run whose whole window holds nothing but refusals is
-  `probe_unsupported` and keeps serving queries. A backend flipping between kinds
-  — `404`, `503`, `404`, timeout — therefore keeps a failure inside every window
-  and stays out of the pool, while a backend whose probe path is merely wrong
-  returns to service one window after the single transient failure it suffered.
-  Bounding the evidence to a window is what makes that possible: a wrong probe
-  path can never answer a probe successfully, so a failure held against the whole
-  run would be held forever and would strand a backend that is answering queries
-  perfectly. A success clears the window along with the run.
+- **Accepted trade-off: a probe path that is removed.** If a backend's probe
+  path works and later goes away — an upgrade, a proxy change — the latch is
+  already set, so the refusals count as failures and that backend is excluded
+  even though it is serving queries fine. Global fail-open still covers the case
+  where this happens to every backend, `/healthz` shows the state, and the log
+  line names the probe path: fix `health_probe_path`, or set
+  `health_probe_enabled: false`. There is no machinery to detect this
+  automatically — any rule that readmits a backend on "no real failure lately"
+  flaps a genuinely dead backend into service on a periodic failure pattern.
 - **Fails open** — if the prober has marked **every** backend down, `pdbmux`
   queries them all anyway. A wrong `health_probe_path`, a broken prober or a
   partition that only the prober sees can therefore never black-hole traffic;
   the worst case is today's behaviour.
 - **Serves immediately** — the listener never waits for a first probe round, and
   a backend nobody has probed yet counts as healthy, so a restart drops nothing.
-- **Quiet** — only *transitions* (up→down, down→up, in and out of
-  `probe_unsupported`) are logged, never individual probes.
+- **Quiet** — only *transitions* are logged, never individual probes: up→down,
+  down→up, a probe that has never answered reaching its failure threshold, the
+  first answer after that, and the start of a rejection run on a probe that used
+  to answer.
 - **Partial responses stay partial.** Health state changes which backends are
   asked, never what a merged answer means: a response built from a subset is
   still served, as before. Every merged response carries `X-Backends:
