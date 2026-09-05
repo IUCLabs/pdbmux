@@ -354,7 +354,7 @@ func TestHandler_Health(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &hr); err != nil {
 		t.Fatal(err)
 	}
-	if hr.Status != "ok" || hr.Backends["a"] != "ok" || hr.Backends["b"] != "ok" {
+	if hr.Status != "ok" || hr.Backends["a"].Reachable != "ok" || hr.Backends["b"].Reachable != "ok" {
 		t.Fatalf("unexpected health: %+v", hr)
 	}
 }

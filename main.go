@@ -20,10 +20,11 @@ var version = "dev"
 
 func main() {
 	var (
-		cfg        Config
-		configPath string
-		listen     string
-		merge      string
+		cfg         Config
+		configPath  string
+		listen      string
+		merge       string
+		healthProbe bool
 	)
 
 	// Loaded lazily: --config is only known once cobra has parsed flags.
@@ -46,6 +47,9 @@ func main() {
 		if cmd.Flags().Changed("merge") {
 			cfg.Merge = merge
 		}
+		if cmd.Flags().Changed("health-probe") {
+			cfg.HealthProbe = healthProbe
+		}
 		if err := cfg.Validate(); err != nil {
 			return err
 		}
@@ -67,6 +71,7 @@ func main() {
 	pf.StringVar(&configPath, "config", "", "Config file path (overrides PDBMUX_CONFIG and the default search path)")
 	pf.StringVar(&listen, "listen", defaultListen, "HTTP listen address (overrides config and PDBMUX_LISTEN)")
 	pf.StringVar(&merge, "merge", mergeFreshness, "Facts merge strategy: freshness or static")
+	pf.BoolVar(&healthProbe, "health-probe", true, "Probe backend health and skip backends that are down")
 
 	serveCmd := &cobra.Command{
 		Use:          "serve",
@@ -120,6 +125,8 @@ func main() {
 func runServer(cfg Config) error {
 	logger := log.New(os.Stderr, "pdbmux: ", log.LstdFlags)
 	srv := NewServer(cfg, logger)
+	srv.StartProbes(context.Background())
+	defer srv.StopProbes()
 
 	httpSrv := &http.Server{
 		Addr:              cfg.Listen,
@@ -163,6 +170,15 @@ func factsTTLString(cfg Config) string {
 	return s
 }
 
+func healthProbeString(cfg Config) string {
+	if !cfg.HealthProbe {
+		return "disabled"
+	}
+	return fmt.Sprintf("%s every %s (timeout %s, %d failures down / %d successes up)",
+		cfg.HealthProbePath, durationString(cfg.HealthProbeInterval),
+		durationString(cfg.HealthProbeTimeout), cfg.HealthProbeFailures, cfg.HealthProbeSuccesses)
+}
+
 func printConfig(cfg Config) {
 	if p := cfg.SourcePath(); p != "" {
 		fmt.Printf("config file  : %s (loaded)\n", p)
@@ -180,6 +196,7 @@ func printConfig(cfg Config) {
 	}
 	fmt.Printf("facts_ttl    : %s\n", factsTTLString(cfg))
 	fmt.Printf("facts_cache  : %d bytes\n", cfg.CacheBytes)
+	fmt.Printf("health_probe : %s\n", healthProbeString(cfg))
 	fmt.Println("backends:")
 	for _, b := range cfg.Backends {
 		fmt.Printf("  - %-8s %s\n", b.Name, b.URL)
