@@ -86,6 +86,19 @@ func markDown(t *testing.T, p *prober, name string) {
 	}
 }
 
+func markUnsupported(t *testing.T, p *prober, name string) {
+	t.Helper()
+	for i := 0; i < p.failures; i++ {
+		p.record(name, &probeRejectedError{status: http.StatusNotFound, path: p.path})
+	}
+	if !p.healthy(name) {
+		t.Fatalf("backend %q was excluded by a rejected probe", name)
+	}
+	if state := p.snapshot()[name].stateName(); state != stateProbeUnsupported {
+		t.Fatalf("state = %q, want %q", state, stateProbeUnsupported)
+	}
+}
+
 func TestProber_FailureThresholdDebouncesABlip(t *testing.T) {
 	cfg := healthConfig("http://a.invalid", "http://b.invalid")
 	cfg.HealthProbeFailures = 3
@@ -485,6 +498,215 @@ func TestBackendsHeader_CountsContributors(t *testing.T) {
 	b.fail = true
 	if got := doGet(t, srv.Handler(), nodesPath, "").Header().Get(backendsHeader); got != "1/2" {
 		t.Errorf("%s = %q, want 1/2", backendsHeader, got)
+	}
+}
+
+// A reply that refuses the probe request says nothing about the backend, so the
+// backend must keep serving queries instead of being stranded out of the pool.
+func TestProber_RejectedProbeKeepsBackendInService(t *testing.T) {
+	codes := []int{
+		http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden,
+		http.StatusNotFound, http.StatusMethodNotAllowed, http.StatusGone,
+		http.StatusTooManyRequests, http.StatusNotImplemented,
+	}
+	for _, code := range codes {
+		sb := newStatusBackend(t)
+		sb.reply(code, "nope")
+		p := newTestProber(t, healthConfig(sb.srv.URL, "http://b.invalid"))
+
+		err := p.probe(t.Context(), Backend{Name: "a", URL: sb.srv.URL})
+		if classifyProbe(err) != outcomeRejected {
+			t.Fatalf("HTTP %d classified as %v, want a rejected probe (err %v)", code, classifyProbe(err), err)
+		}
+		for i := 0; i < p.failures+3; i++ {
+			p.record("a", err)
+			if !p.healthy("a") {
+				t.Fatalf("HTTP %d excluded backend a after %d probes", code, i+1)
+			}
+		}
+		snap := p.snapshot()["a"]
+		if got := snap.stateName(); got != stateProbeUnsupported {
+			t.Errorf("HTTP %d state = %q, want %q", code, got, stateProbeUnsupported)
+		}
+		if !strings.Contains(snap.LastErr, defaultHealthProbePath) {
+			t.Errorf("HTTP %d last_error %q does not name the probe path", code, snap.LastErr)
+		}
+	}
+}
+
+// 503 is trapperkeeper's answer when its services are not nominal, so it stays a
+// real failure; so does anything that never got an HTTP reply at all.
+func TestProber_ServerErrorsAndTransportFailuresStillMarkDown(t *testing.T) {
+	for _, code := range []int{http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout} {
+		sb := newStatusBackend(t)
+		sb.reply(code, degradedStatusBody("error"))
+		p := newTestProber(t, healthConfig(sb.srv.URL, "http://b.invalid"))
+
+		err := p.probe(t.Context(), Backend{Name: "a", URL: sb.srv.URL})
+		if classifyProbe(err) != outcomeFailure {
+			t.Fatalf("HTTP %d classified as %v, want a real failure", code, classifyProbe(err))
+		}
+		for i := 0; i < p.failures; i++ {
+			p.record("a", err)
+		}
+		if p.healthy("a") {
+			t.Errorf("HTTP %d left backend a in service", code)
+		}
+		if got := p.snapshot()["a"].stateName(); got != stateUnhealthy {
+			t.Errorf("HTTP %d state = %q, want %q", code, got, stateUnhealthy)
+		}
+	}
+
+	dead := httptest.NewServer(http.NotFoundHandler())
+	deadURL := dead.URL
+	dead.Close()
+	p := newTestProber(t, healthConfig(deadURL, "http://b.invalid"))
+	err := p.probe(t.Context(), Backend{Name: "a", URL: deadURL})
+	if classifyProbe(err) != outcomeFailure {
+		t.Fatalf("a refused connection classified as %v, want a real failure (err %v)", classifyProbe(err), err)
+	}
+	for i := 0; i < p.failures; i++ {
+		p.record("a", err)
+	}
+	if p.healthy("a") {
+		t.Error("a refused connection left the backend in service")
+	}
+}
+
+func TestProber_RejectedRunAndFailureRunDoNotAddUp(t *testing.T) {
+	p := newTestProber(t, healthConfig("http://a.invalid", "http://b.invalid"))
+	markUnsupported(t, p, "a")
+	for i := 0; i < 20; i++ {
+		p.record("a", &probeRejectedError{status: http.StatusNotFound, path: p.path})
+	}
+
+	// One real failure on top of a long rejected run must not trip the threshold.
+	p.record("a", errors.New("boom"))
+	if !p.healthy("a") {
+		t.Fatal("a single real failure after a rejected run marked the backend down")
+	}
+	for i := 1; i < p.failures; i++ {
+		p.record("a", errors.New("boom"))
+	}
+	if p.healthy("a") {
+		t.Fatal("a full run of real failures should mark the backend down")
+	}
+	if got := p.snapshot()["a"].stateName(); got != stateUnhealthy {
+		t.Errorf("state = %q, want %q", got, stateUnhealthy)
+	}
+}
+
+func TestProber_RecoversFromProbeUnsupported(t *testing.T) {
+	p := newTestProber(t, healthConfig("http://a.invalid", "http://b.invalid"))
+	markUnsupported(t, p, "a")
+
+	for i := 0; i < p.successes; i++ {
+		p.record("a", nil)
+	}
+	if !p.healthy("a") {
+		t.Fatal("backend left the pool while recovering")
+	}
+	if got := p.snapshot()["a"].stateName(); got != stateHealthy {
+		t.Fatalf("state = %q, want %q", got, stateHealthy)
+	}
+}
+
+// A rejected probe re-admits a backend the prober had already marked down: the
+// evidence that condemned it has been replaced by no evidence at all.
+func TestProber_RejectedProbeReadmitsADownBackend(t *testing.T) {
+	p := newTestProber(t, healthConfig("http://a.invalid", "http://b.invalid"))
+	markDown(t, p, "a")
+	markUnsupported(t, p, "a")
+}
+
+func TestProber_LogsProbeRejectionOncePerTransition(t *testing.T) {
+	var buf strings.Builder
+	p := newProber(healthConfig("http://a.invalid", "http://b.invalid"), log.New(&buf, "", 0))
+	if p == nil {
+		t.Fatal("newProber returned nil for an enabled config")
+	}
+
+	rejected := &probeRejectedError{status: http.StatusNotFound, path: p.path}
+	for i := 0; i < 50; i++ {
+		p.record("a", rejected)
+	}
+	if n := strings.Count(buf.String(), "rejected the health probe"); n != 1 {
+		t.Fatalf("logged the misconfiguration %d times, want once:\n%s", n, buf.String())
+	}
+	if !strings.Contains(buf.String(), `backend "a"`) || !strings.Contains(buf.String(), defaultHealthProbePath) {
+		t.Errorf("log line names neither the backend nor the probe path: %s", buf.String())
+	}
+	if !strings.Contains(buf.String(), "404") {
+		t.Errorf("log line does not name the status: %s", buf.String())
+	}
+
+	// Recovery logs its own single line, and a second rejected run logs again.
+	for i := 0; i < p.successes+5; i++ {
+		p.record("a", nil)
+	}
+	if n := strings.Count(buf.String(), "usable again"); n != 1 {
+		t.Fatalf("logged recovery %d times, want once:\n%s", n, buf.String())
+	}
+	for i := 0; i < 50; i++ {
+		p.record("a", rejected)
+	}
+	if n := strings.Count(buf.String(), "rejected the health probe"); n != 2 {
+		t.Fatalf("second rejected run logged %d times in total, want 2:\n%s", n, buf.String())
+	}
+}
+
+// The regression this guards: a backend whose probe path is wrong for it alone
+// still answers queries perfectly, and must keep contributing records.
+func TestFanOut_ProbeUnsupportedBackendStillContributes(t *testing.T) {
+	a := newFakeBackend(t, `[`+node("h1", "2026-07-20T00:00:00Z")+`]`, `[]`)
+	b := newFakeBackend(t, `[`+node("h2", "2026-07-20T00:00:00Z")+`]`, `[]`)
+	srv := newTestServer(healthConfig(a.srv.URL, b.srv.URL))
+	markUnsupported(t, srv.health, "b")
+
+	rec := doGet(t, srv.Handler(), nodesPath, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+	}
+	if _, asked := b.params(nodesPath); !asked {
+		t.Fatal("a backend with an unusable probe path was not queried")
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "h1") || !strings.Contains(body, "h2") {
+		t.Fatalf("both backends should have contributed: %s", body)
+	}
+	if got := rec.Header().Get(backendsHeader); got != "2/2" {
+		t.Errorf("%s = %q, want 2/2", backendsHeader, got)
+	}
+}
+
+func TestHealthz_ReportsProbeUnsupported(t *testing.T) {
+	a := newFakeBackend(t, `[]`, `[]`)
+	b := newFakeBackend(t, `[]`, `[]`)
+	srv := newTestServer(healthConfig(a.srv.URL, b.srv.URL))
+	srv.health.record("a", nil)
+	markUnsupported(t, srv.health, "b")
+
+	rec := doGet(t, srv.Handler(), "/healthz", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+	}
+	var hr healthReport
+	if err := json.Unmarshal(rec.Body.Bytes(), &hr); err != nil {
+		t.Fatal(err)
+	}
+	if got := hr.Backends["a"].State; got != stateHealthy {
+		t.Errorf("a state = %q, want %q", got, stateHealthy)
+	}
+	// Distinct from both "verified healthy" and "excluded".
+	unsupported := hr.Backends["b"]
+	if unsupported.State != stateProbeUnsupported {
+		t.Errorf("b state = %q, want %q", unsupported.State, stateProbeUnsupported)
+	}
+	if unsupported.Reachable != "ok" {
+		t.Errorf("b reachable = %q, want ok", unsupported.Reachable)
+	}
+	if unsupported.LastError == "" || unsupported.LastProbe == "" {
+		t.Errorf("b is missing last_error/last_probe: %+v", unsupported)
 	}
 }
 

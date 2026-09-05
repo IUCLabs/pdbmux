@@ -676,7 +676,7 @@ type healthReport struct {
 // prober's running state for the same backend.
 type backendReport struct {
 	Reachable string `json:"reachable"` // "ok" | error text
-	State     string `json:"state"`     // healthy | unhealthy | unprobed | unmonitored
+	State     string `json:"state"`     // healthy | unhealthy | probe_unsupported | unprobed | unmonitored
 	Failures  int    `json:"consecutive_failures"`
 	Successes int    `json:"consecutive_successes"`
 	LastProbe string `json:"last_probe,omitempty"`

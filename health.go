@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -19,40 +20,88 @@ const probeBodyLimit = 1 << 20
 const runningState = "running"
 
 const (
-	stateHealthy     = "healthy"
-	stateUnhealthy   = "unhealthy"
-	stateUnprobed    = "unprobed"
-	stateUnmonitored = "unmonitored"
+	stateHealthy          = "healthy"
+	stateUnhealthy        = "unhealthy"
+	stateUnprobed         = "unprobed"
+	stateUnmonitored      = "unmonitored"
+	stateProbeUnsupported = "probe_unsupported"
+)
+
+// probeOutcome is what one probe reply said. A rejected probe is deliberately
+// neither a success nor a failure: it is evidence about the probe request, not
+// about the backend behind it.
+type probeOutcome int
+
+const (
+	outcomeOK probeOutcome = iota
+	outcomeFailure
+	outcomeRejected
 )
 
 type probeState struct {
-	healthy   bool
-	probed    bool
-	failures  int
-	successes int
-	lastProbe time.Time
-	lastErr   string
+	healthy     bool
+	unsupported bool
+	probed      bool
+	outcome     probeOutcome
+	failures    int
+	successes   int
+	lastProbe   time.Time
+	lastErr     string
 }
 
 // backendHealth is a copy of one backend's probe state, safe to read outside the
 // prober's lock.
 type backendHealth struct {
-	Healthy   bool
-	Probed    bool
-	Failures  int
-	Successes int
-	LastProbe time.Time
-	LastErr   string
+	Healthy     bool
+	Unsupported bool
+	Probed      bool
+	Failures    int
+	Successes   int
+	LastProbe   time.Time
+	LastErr     string
 }
 
 func (h backendHealth) stateName() string {
 	switch {
 	case !h.Probed:
 		return stateUnprobed
+	case h.Unsupported:
+		return stateProbeUnsupported
 	case h.Healthy:
 		return stateHealthy
 	default:
 		return stateUnhealthy
+	}
+}
+
+// probeRejectedError marks a reply that refused the probe request itself rather
+// than reporting the backend unwell.
+type probeRejectedError struct {
+	status int
+	path   string
+}
+
+func (e *probeRejectedError) Error() string {
+	return fmt.Sprintf("HTTP %d: probe path %q is not usable on this backend", e.status, e.path)
+}
+
+// probeRejects reports whether a status code refuses the probe request rather
+// than reporting the service unhealthy. Every 4xx is the backend answering that
+// our request is the problem, and 501 says it does not implement the endpoint.
+// Other 5xx stay real evidence: trapperkeeper answers 503 exactly when its
+// services are not nominal.
+func probeRejects(code int) bool {
+	return (code >= 400 && code < 500) || code == http.StatusNotImplemented
+}
+
+func classifyProbe(err error) probeOutcome {
+	switch {
+	case err == nil:
+		return outcomeOK
+	case errors.As(err, new(*probeRejectedError)):
+		return outcomeRejected
+	default:
+		return outcomeFailure
 	}
 }
 
@@ -163,12 +212,13 @@ func (p *prober) snapshot() map[string]backendHealth {
 	out := make(map[string]backendHealth, len(p.states))
 	for name, st := range p.states {
 		out[name] = backendHealth{
-			Healthy:   st.healthy,
-			Probed:    st.probed,
-			Failures:  st.failures,
-			Successes: st.successes,
-			LastProbe: st.lastProbe,
-			LastErr:   st.lastErr,
+			Healthy:     st.healthy,
+			Unsupported: st.unsupported,
+			Probed:      st.probed,
+			Failures:    st.failures,
+			Successes:   st.successes,
+			LastProbe:   st.lastProbe,
+			LastErr:     st.lastErr,
 		}
 	}
 	return out
@@ -193,24 +243,49 @@ func (p *prober) record(name string, err error) {
 		p.mu.Unlock()
 		return
 	}
+	outcome := classifyProbe(err)
+	// A run only counts while the outcome keeps its kind, so a rejected-probe run
+	// and a real-failure run never add up to one threshold.
+	if outcome != st.outcome {
+		st.failures, st.successes = 0, 0
+	}
+	st.outcome = outcome
 	st.probed = true
 	st.lastProbe = p.now()
+
 	var transition string
-	if err != nil {
-		st.lastErr = err.Error()
-		st.successes = 0
-		st.failures++
-		if st.healthy && st.failures >= p.failures {
-			st.healthy = false
-			transition = fmt.Sprintf("warning: backend %q is down after %d consecutive probe failures: %v", name, st.failures, err)
-		}
-	} else {
+	switch outcome {
+	case outcomeOK:
 		st.lastErr = ""
-		st.failures = 0
 		st.successes++
-		if !st.healthy && st.successes >= p.successes {
-			st.healthy = true
-			transition = fmt.Sprintf("info: backend %q is up after %d consecutive probe successes", name, st.successes)
+		if st.successes >= p.successes {
+			switch {
+			case st.unsupported:
+				st.unsupported = false
+				transition = fmt.Sprintf("info: backend %q health probe %q is usable again", name, p.path)
+			case !st.healthy:
+				st.healthy = true
+				transition = fmt.Sprintf("info: backend %q is up after %d consecutive probe successes", name, st.successes)
+			}
+		}
+	case outcomeRejected:
+		st.lastErr = err.Error()
+		st.failures++
+		if !st.unsupported && st.failures >= p.failures {
+			// The backend answered and refused the probe request itself, so this says
+			// nothing about its health: it keeps serving queries, unverified.
+			st.unsupported, st.healthy = true, true
+			transition = fmt.Sprintf("warning: backend %q rejected the health probe %d times: %v; leaving it in service but unverified, fix health_probe_path or its authorization", name, st.failures, err)
+		}
+	default:
+		st.lastErr = err.Error()
+		st.failures++
+		if st.failures >= p.failures {
+			st.unsupported = false
+			if st.healthy {
+				st.healthy = false
+				transition = fmt.Sprintf("warning: backend %q is down after %d consecutive probe failures: %v", name, st.failures, err)
+			}
 		}
 	}
 	p.mu.Unlock()
@@ -235,6 +310,9 @@ func (p *prober) probe(ctx context.Context, b Backend) error {
 	body, err := io.ReadAll(io.LimitReader(resp.Body, probeBodyLimit))
 	if err != nil {
 		return err
+	}
+	if probeRejects(resp.StatusCode) {
+		return &probeRejectedError{status: resp.StatusCode, path: p.path}
 	}
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))

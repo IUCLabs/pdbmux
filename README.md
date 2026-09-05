@@ -228,19 +228,36 @@ not answering.
   or `unknown` counts as a failure. A body that is not in that shape is judged on
   its status code alone, so pointing `health_probe_path` at some other endpoint
   still works.
+- **A refused probe is not a sick backend.** Only evidence about the *backend*
+  takes it out of the pool: a transport failure (connection refused, DNS, TLS,
+  timeout) or a `5xx` — `503` included, since trapperkeeper answers `503` exactly
+  when its services are not nominal, so it stays a real failure. A reply that
+  refuses the *probe request* is evidence about the probe instead: every `4xx` is
+  the backend answering that our request is the problem (`404`/`410` the path is
+  not there, `405` it does not take a `GET`, `401`/`403` we are not allowed to
+  ask, `429` we asked too often), and `501` says it does not implement the
+  endpoint. A backend answering that way is **left in service** — still queried,
+  still contributing records — and reported as `probe_unsupported` rather than
+  `healthy`, so an operator can tell "verified healthy" from "not actually being
+  checked". A probe path that is wrong for one backend alone can therefore never
+  strand a working backend. The misconfiguration is logged once per transition,
+  naming the backend, the probe path and the status.
 - **Thresholds** — a healthy backend goes down after `health_probe_failures`
   (default 3) **consecutive** failures; a down one comes back after
-  `health_probe_successes` (default 2) consecutive successes. One blip cannot
-  flap a backend out, and one lucky reply cannot flap it back in. A down backend
-  keeps being probed, so recovery is automatic.
+  `health_probe_successes` (default 2) consecutive successes, and the same
+  thresholds gate `probe_unsupported` in and out. One blip cannot flap a backend
+  out, and one lucky reply cannot flap it back in. A run only counts while the
+  replies keep their kind, so a stretch of `404`s and a stretch of `503`s never
+  add up to one threshold. A down backend keeps being probed, so recovery is
+  automatic.
 - **Fails open** — if the prober has marked **every** backend down, `pdbmux`
   queries them all anyway. A wrong `health_probe_path`, a broken prober or a
   partition that only the prober sees can therefore never black-hole traffic;
   the worst case is today's behaviour.
 - **Serves immediately** — the listener never waits for a first probe round, and
   a backend nobody has probed yet counts as healthy, so a restart drops nothing.
-- **Quiet** — only *transitions* (up→down, down→up) are logged, never individual
-  probes.
+- **Quiet** — only *transitions* (up→down, down→up, in and out of
+  `probe_unsupported`) are logged, never individual probes.
 - **Partial responses stay partial.** Health state changes which backends are
   asked, never what a merged answer means: a response built from a subset is
   still served, as before. Every merged response carries `X-Backends:
@@ -248,7 +265,8 @@ not answering.
   a client can tell a full answer from a partial one. On a cache hit the header
   describes the stored body, not the current backend count.
 - **`/healthz`** gives each backend a `state` (`healthy`, `unhealthy`,
-  `unprobed`, or `unmonitored` when probing is off), `consecutive_failures`,
+  `probe_unsupported`, `unprobed`, or `unmonitored` when probing is off),
+  `consecutive_failures`,
   `consecutive_successes`, `last_probe` and `last_error`, alongside the
   `reachable` check `/healthz` runs itself — which always asks **every**
   backend, so a backend queries are skipping is still reported. A `query` object
