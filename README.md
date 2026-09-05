@@ -234,7 +234,9 @@ backend later without further handler changes.
 - **Bounded** — `facts_cache_bytes` (default 64 MiB) is a byte budget, evicted
   least-recently-used; reads count as use, so a stale entry that is still being
   asked for survives. A single response larger than the whole budget is not
-  cached at all.
+  cached at all. The budget counts stored response bodies only — cache keys and
+  the list/map bookkeeping are not accounted for, so it is a target for body
+  bytes rather than a hard cap on process memory.
 - **Single-flight** — concurrent requests for the same key collapse into one
   upstream fan-out; the rest wait for it and share the result.
 - **Visibility** — `/healthz` carries a `cache` object: `backend`

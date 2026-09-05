@@ -3,7 +3,9 @@ package main
 import (
 	"container/list"
 	"context"
+	"fmt"
 	"net/url"
+	"runtime/debug"
 	"sort"
 	"sync"
 	"time"
@@ -191,8 +193,20 @@ type flightCall struct {
 	err  error
 }
 
+// flightPanic is a panic from a flight's fn, reported to the leader and to every
+// waiter as an error so callers keep their error handling (stale fallback, 502)
+// instead of seeing a zero-value success.
+type flightPanic struct {
+	value any
+	stack []byte
+}
+
+func (p *flightPanic) Error() string {
+	return fmt.Sprintf("panic building response: %v\n%s", p.value, p.stack)
+}
+
 // Do returns fn's result and whether this caller shared another's in-flight run.
-func (g *flightGroup) Do(key string, fn func() (cachedResponse, error)) (cachedResponse, error, bool) {
+func (g *flightGroup) Do(key string, fn func() (cachedResponse, error)) (resp cachedResponse, err error, shared bool) {
 	g.mu.Lock()
 	if g.calls == nil {
 		g.calls = make(map[string]*flightCall)
@@ -208,6 +222,11 @@ func (g *flightGroup) Do(key string, fn func() (cachedResponse, error)) (cachedR
 	g.mu.Unlock()
 
 	defer func() {
+		if r := recover(); r != nil {
+			c.resp, c.err = cachedResponse{}, &flightPanic{value: r, stack: debug.Stack()}
+			resp, err = c.resp, c.err
+		}
+		// Done only after the results are stored, so waiters read them.
 		c.wg.Done()
 		g.mu.Lock()
 		delete(g.calls, key)

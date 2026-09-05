@@ -422,6 +422,170 @@ func TestFlightGroup_LeaderRunsOnce(t *testing.T) {
 	}
 }
 
+func TestFlightGroup_LeaderPanicFailsLeaderAndWaiters(t *testing.T) {
+	var g flightGroup
+	entered := make(chan struct{})
+	release := make(chan struct{})
+
+	type result struct {
+		resp   cachedResponse
+		err    error
+		shared bool
+	}
+	waiters := make([]result, 8)
+	var wg sync.WaitGroup
+
+	var leader result
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		leader.resp, leader.err, leader.shared = g.Do("k", func() (cachedResponse, error) {
+			close(entered)
+			<-release
+			panic("build exploded")
+		})
+	}()
+
+	<-entered
+	for i := range waiters {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			waiters[i].resp, waiters[i].err, waiters[i].shared = g.Do("k", func() (cachedResponse, error) {
+				t.Error("a waiter must not run its own fn")
+				return cachedResponse{}, nil
+			})
+		}(i)
+	}
+	// Park the waiters in Wait() before the leader panics.
+	time.Sleep(250 * time.Millisecond)
+	close(release)
+	wg.Wait()
+
+	if leader.err == nil {
+		t.Errorf("leader err = nil, want a panic error (resp %+v)", leader.resp)
+	}
+	for i, w := range waiters {
+		if !w.shared {
+			t.Errorf("waiter %d did not share the flight", i)
+		}
+		if w.err == nil {
+			t.Fatalf("waiter %d unblocked with err = nil and resp %+v, want an error", i, w.resp)
+		}
+		if !strings.Contains(w.err.Error(), "build exploded") {
+			t.Errorf("waiter %d err = %v, want the panic value", i, w.err)
+		}
+	}
+
+	// The key is released on the panic path, so a later call leads its own flight.
+	resp, err, shared := g.Do("k", func() (cachedResponse, error) {
+		return cachedResponse{Body: json.RawMessage(`[]`), Records: 0}, nil
+	})
+	if shared {
+		t.Error("a call after a panicking flight must start its own flight")
+	}
+	if err != nil || resp.Records != 0 {
+		t.Errorf("later call = (%+v, %v), want a clean success", resp, err)
+	}
+}
+
+func TestServeCached_BuildPanicIs502ThenStale(t *testing.T) {
+	a := newCountingBackend(t, map[string]string{factsPath: `[]`})
+	b := newCountingBackend(t, map[string]string{factsPath: `[]`})
+	srv, clk := newCachedServer(t, cacheTestConfig(a.srv.URL, b.srv.URL))
+
+	panicBuild := func() (cachedResponse, error) { panic("build exploded") }
+	serve := func(build func() (cachedResponse, error)) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, factsPath, nil)
+		srv.serveCached(rec, req, factsPath, nil, build)
+		return rec
+	}
+
+	// No entry to fall back to: a panicking build must not look like a success.
+	rec := serve(panicBuild)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status %d (%s), want 502", rec.Code, rec.Body.String())
+	}
+
+	stored := `[` + fact("h1", "role", "web", "") + `]`
+	rec = serve(func() (cachedResponse, error) {
+		return cachedResponse{Body: json.RawMessage(stored), Records: 1}, nil
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("priming status %d (%s)", rec.Code, rec.Body.String())
+	}
+
+	clk.advance(31 * time.Second)
+	rec = serve(panicBuild)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("stale fallback status %d (%s), want 200", rec.Code, rec.Body.String())
+	}
+	if got := strings.TrimSpace(rec.Body.String()); got != stored {
+		t.Errorf("stale body = %s, want %s", got, stored)
+	}
+	if got := rec.Header().Get(recordsHeader); got != "1" {
+		t.Errorf("%s = %q, want 1", recordsHeader, got)
+	}
+	if hr := health(t, srv); !hr.Cache.ServingStale || hr.Cache.StaleServed != 1 {
+		t.Errorf("panic fallback not counted as stale: %+v", hr.Cache)
+	}
+}
+
+func TestServeCached_BuildPanicFailsConcurrentWaiters(t *testing.T) {
+	a := newCountingBackend(t, map[string]string{factsPath: `[]`})
+	b := newCountingBackend(t, map[string]string{factsPath: `[]`})
+	srv, _ := newCachedServer(t, cacheTestConfig(a.srv.URL, b.srv.URL))
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	serve := func(build func() (cachedResponse, error)) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, factsPath, nil)
+		srv.serveCached(rec, req, factsPath, nil, build)
+		return rec
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	var leaderRec *httptest.ResponseRecorder
+	go func() {
+		defer wg.Done()
+		leaderRec = serve(func() (cachedResponse, error) {
+			close(entered)
+			<-release
+			panic("build exploded")
+		})
+	}()
+
+	<-entered
+	const waiters = 8
+	recs := make([]*httptest.ResponseRecorder, waiters)
+	for i := range waiters {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			recs[i] = serve(func() (cachedResponse, error) {
+				t.Error("a waiter must not run its own build")
+				return cachedResponse{}, nil
+			})
+		}(i)
+	}
+	time.Sleep(250 * time.Millisecond)
+	close(release)
+	wg.Wait()
+
+	if leaderRec.Code != http.StatusBadGateway {
+		t.Errorf("leader status %d, want 502", leaderRec.Code)
+	}
+	for i, rec := range recs {
+		if rec.Code != http.StatusBadGateway {
+			t.Fatalf("waiter %d got %d (%s), want 502 rather than an empty success",
+				i, rec.Code, rec.Body.String())
+		}
+	}
+}
+
 func TestHandler_HealthzReportsCacheState(t *testing.T) {
 	a := newCountingBackend(t, map[string]string{factsPath: `[` + fact("h1", "role", "web", "") + `]`})
 	b := newCountingBackend(t, map[string]string{factsPath: `[]`})
