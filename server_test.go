@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -590,5 +591,237 @@ func TestHandler_ReportsOneBackendDown(t *testing.T) {
 	}
 	if got := hashes(t, rec.Body.Bytes()); !slices.Equal(got, []string{"r1"}) {
 		t.Errorf("merged reports = %v, want [r1]", got)
+	}
+}
+
+// eventCount builds one /event-counts row for a certname.
+func eventCount(certname string, successes, failures, noops, skips int) string {
+	return `{"subject_type":"certname","subject":{"title":"` + certname + `"},` +
+		`"successes":` + strconv.Itoa(successes) +
+		`,"failures":` + strconv.Itoa(failures) +
+		`,"noops":` + strconv.Itoa(noops) +
+		`,"skips":` + strconv.Itoa(skips) + `}`
+}
+
+// counts decodes a numeric column out of a merged aggregate body, in order.
+func counts(t *testing.T, body []byte, field string) []float64 {
+	t.Helper()
+	var rows []map[string]any
+	if err := json.Unmarshal(body, &rows); err != nil {
+		t.Fatalf("unmarshal %s: %v", body, err)
+	}
+	out := make([]float64, 0, len(rows))
+	for _, r := range rows {
+		n, _ := r[field].(float64)
+		out = append(out, n)
+	}
+	return out
+}
+
+func TestHandler_EventCountsSummedPerSubject(t *testing.T) {
+	// A node reporting to both PuppetDBs has its run counted in each; the
+	// merged view is the sum, not two rows.
+	old := newFakeBackend(t, `[]`, `[]`)
+	old.bodies[eventCountsPath] = `[` + eventCount("h1", 4, 3, 1, 0) + `]`
+	nw := newFakeBackend(t, `[]`, `[]`)
+	nw.bodies[eventCountsPath] = `[` + eventCount("h1", 2, 1, 0, 0) + `,` + eventCount("h2", 5, 0, 0, 0) + `]`
+	srv := newTestServer(testConfig(old.srv.URL, nw.srv.URL, mergeStatic))
+
+	rec := doGetParams(t, srv.Handler(), eventCountsPath, url.Values{
+		"query":        {`["=","certname","h1"]`},
+		"summarize_by": {"certname"},
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+	}
+	// Precedence puts new (prefer) first, so h1 leads.
+	if got := counts(t, rec.Body.Bytes(), "successes"); !slices.Equal(got, []float64{6, 5}) {
+		t.Errorf("successes = %v, want [6 5]", got)
+	}
+	if got := counts(t, rec.Body.Bytes(), "failures"); !slices.Equal(got, []float64{4, 0}) {
+		t.Errorf("failures = %v, want [4 0]", got)
+	}
+}
+
+func TestHandler_EventCountsDisjointSubjectsPassThrough(t *testing.T) {
+	old := newFakeBackend(t, `[]`, `[]`)
+	old.bodies[eventCountsPath] = `[` + eventCount("h1", 1, 0, 0, 0) + `]`
+	nw := newFakeBackend(t, `[]`, `[]`)
+	nw.bodies[eventCountsPath] = `[` + eventCount("h2", 2, 0, 0, 0) + `]`
+	srv := newTestServer(testConfig(old.srv.URL, nw.srv.URL, mergeStatic))
+
+	rec := doGetParams(t, srv.Handler(), eventCountsPath, url.Values{"summarize_by": {"certname"}})
+	if got := counts(t, rec.Body.Bytes(), "successes"); !slices.Equal(got, []float64{2, 1}) {
+		t.Errorf("successes = %v, want [2 1] (both nodes, untouched)", got)
+	}
+	// summarize_by must reach the backends verbatim.
+	for name, fb := range map[string]*fakeBackend{"old": old, "new": nw} {
+		p, _ := fb.params(eventCountsPath)
+		if p.Get("summarize_by") != "certname" {
+			t.Errorf("%s backend got summarize_by=%q, want certname", name, p.Get("summarize_by"))
+		}
+	}
+}
+
+func TestHandler_EventCountsRecordsIsMergedRowCount(t *testing.T) {
+	// Each backend reports one row; they share a subject, so the merged total
+	// is one — not the two the backends' own X-Records add up to.
+	old := newFakeBackend(t, `[]`, `[]`)
+	old.bodies[eventCountsPath] = `[` + eventCount("h1", 1, 0, 0, 0) + `]`
+	old.totals[eventCountsPath] = 1
+	nw := newFakeBackend(t, `[]`, `[]`)
+	nw.bodies[eventCountsPath] = `[` + eventCount("h1", 2, 0, 0, 0) + `]`
+	nw.totals[eventCountsPath] = 1
+	srv := newTestServer(testConfig(old.srv.URL, nw.srv.URL, mergeStatic))
+
+	rec := doGetParams(t, srv.Handler(), eventCountsPath, url.Values{
+		"summarize_by":  {"certname"},
+		"include_total": {"true"},
+	})
+	if got := rec.Header().Get(recordsHeader); got != "1" {
+		t.Errorf("%s = %q, want 1 (merged rows, not 2)", recordsHeader, got)
+	}
+}
+
+func TestHandler_AggregateEventCountsSummed(t *testing.T) {
+	old := newFakeBackend(t, `[]`, `[]`)
+	old.bodies[aggregateEventCountsPath] =
+		`[{"successes":2,"failures":1,"noops":0,"skips":3,"total":6,"summarize_by":"certname"}]`
+	nw := newFakeBackend(t, `[]`, `[]`)
+	nw.bodies[aggregateEventCountsPath] =
+		`[{"successes":5,"failures":4,"noops":1,"skips":0,"total":10,"summarize_by":"certname"}]`
+	srv := newTestServer(testConfig(old.srv.URL, nw.srv.URL, mergeStatic))
+
+	rec := doGetParams(t, srv.Handler(), aggregateEventCountsPath, url.Values{"summarize_by": {"certname"}})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+	}
+	var got []map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("expected one summary object, got %d: %s", len(got), rec.Body.String())
+	}
+	want := map[string]any{
+		"successes": float64(7), "failures": float64(5), "noops": float64(1),
+		"skips": float64(3), "total": float64(16), "summarize_by": "certname",
+	}
+	if !reflect.DeepEqual(got[0], want) {
+		t.Errorf("summary = %v, want %v", got[0], want)
+	}
+}
+
+func TestHandler_AggregateEventCountsNullColumnSurvives(t *testing.T) {
+	// PuppetDB returns null totals for an empty result set; summing must not
+	// crash or blank out the backend that does have numbers.
+	old := newFakeBackend(t, `[]`, `[]`)
+	old.bodies[aggregateEventCountsPath] =
+		`[{"successes":null,"failures":null,"total":null,"summarize_by":"certname"}]`
+	nw := newFakeBackend(t, `[]`, `[]`)
+	nw.bodies[aggregateEventCountsPath] =
+		`[{"successes":3,"failures":0,"total":3,"summarize_by":"certname"}]`
+	srv := newTestServer(testConfig(old.srv.URL, nw.srv.URL, mergeStatic))
+
+	rec := doGetParams(t, srv.Handler(), aggregateEventCountsPath, url.Values{"summarize_by": {"certname"}})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+	}
+	if got := counts(t, rec.Body.Bytes(), "total"); !slices.Equal(got, []float64{3}) {
+		t.Errorf("total = %v, want [3]", got)
+	}
+}
+
+const statusCountQuery = `["extract",[["function","count"],"status"],["~","certname",".*"],["group_by","status"]]`
+
+func TestHandler_ReportsAggregateSummed(t *testing.T) {
+	// Puppetboard's daily-reports chart: each backend counts only its own
+	// reports, so the merged chart needs the per-status sums.
+	old := newFakeBackend(t, `[]`, `[]`)
+	old.bodies[reportsPath] = `[{"count":4,"status":"changed"},{"count":2,"status":"failed"}]`
+	nw := newFakeBackend(t, `[]`, `[]`)
+	nw.bodies[reportsPath] = `[{"count":3,"status":"changed"},{"count":9,"status":"unchanged"}]`
+	srv := newTestServer(testConfig(old.srv.URL, nw.srv.URL, mergeStatic))
+
+	rec := doGetParams(t, srv.Handler(), reportsPath, url.Values{"query": {statusCountQuery}})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+	}
+	var got []map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	byStatus := map[string]float64{}
+	for _, row := range got {
+		s, _ := row["status"].(string)
+		n, _ := row["count"].(float64)
+		byStatus[s] = n
+	}
+	want := map[string]float64{"changed": 7, "failed": 2, "unchanged": 9}
+	if !reflect.DeepEqual(byStatus, want) {
+		t.Errorf("counts = %v, want %v", byStatus, want)
+	}
+}
+
+func TestHandler_ReportsAggregateRecordsIsMergedRowCount(t *testing.T) {
+	old := newFakeBackend(t, `[]`, `[]`)
+	old.bodies[reportsPath] = `[{"count":4,"status":"changed"}]`
+	old.totals[reportsPath] = 1
+	nw := newFakeBackend(t, `[]`, `[]`)
+	nw.bodies[reportsPath] = `[{"count":3,"status":"changed"}]`
+	nw.totals[reportsPath] = 1
+	srv := newTestServer(testConfig(old.srv.URL, nw.srv.URL, mergeStatic))
+
+	rec := doGetParams(t, srv.Handler(), reportsPath, url.Values{
+		"query":         {statusCountQuery},
+		"include_total": {"true"},
+	})
+	if got := rec.Header().Get(recordsHeader); got != "1" {
+		t.Errorf("%s = %q, want 1 (one merged status row)", recordsHeader, got)
+	}
+}
+
+func TestHandler_ReportsNonAggregateStillUnioned(t *testing.T) {
+	// An extract with no function is a projection of real reports, so the
+	// union — not a sum — is still the right merge.
+	old := newFakeBackend(t, `[]`, `[]`)
+	old.bodies[reportsPath] = `[` + report("h1", "r1", "2026-07-01T00:00:00Z") + `]`
+	nw := newFakeBackend(t, `[]`, `[]`)
+	nw.bodies[reportsPath] = `[` + report("h1", "r2", "2026-07-02T00:00:00Z") + `]`
+	srv := newTestServer(testConfig(old.srv.URL, nw.srv.URL, mergeStatic))
+
+	rec := doGetParams(t, srv.Handler(), reportsPath, url.Values{
+		"query":    {`["extract",["hash","certname"],["=","certname","h1"]]`},
+		"order_by": {receiveDesc},
+	})
+	if got := hashes(t, rec.Body.Bytes()); !slices.Equal(got, []string{"r2", "r1"}) {
+		t.Errorf("merged reports = %v, want [r2 r1]", got)
+	}
+}
+
+func TestHandler_EventCountsOneBackendDown(t *testing.T) {
+	old := newFakeBackend(t, `[]`, `[]`)
+	old.fail = true
+	nw := newFakeBackend(t, `[]`, `[]`)
+	nw.bodies[eventCountsPath] = `[` + eventCount("h1", 2, 0, 0, 0) + `]`
+	srv := newTestServer(testConfig(old.srv.URL, nw.srv.URL, mergeStatic))
+
+	rec := doGetParams(t, srv.Handler(), eventCountsPath, url.Values{"summarize_by": {"certname"}})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 serving the survivor, got %d", rec.Code)
+	}
+	if got := counts(t, rec.Body.Bytes(), "successes"); !slices.Equal(got, []float64{2}) {
+		t.Errorf("successes = %v, want [2]", got)
+	}
+}
+
+func TestHandler_EventCountsBadPagingParam(t *testing.T) {
+	old := newFakeBackend(t, `[]`, `[]`)
+	nw := newFakeBackend(t, `[]`, `[]`)
+	srv := newTestServer(testConfig(old.srv.URL, nw.srv.URL, mergeStatic))
+
+	rec := doGetParams(t, srv.Handler(), eventCountsPath, url.Values{"limit": {"lots"}})
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for a malformed limit, got %d", rec.Code)
 	}
 }

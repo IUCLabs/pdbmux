@@ -30,6 +30,8 @@ not PQL) is forwarded verbatim.
 | `GET /pdb/query/v4/facts` | Fan out to all, and per `certname` keep **all** facts from the backend that owns that node (see merge semantics). |
 | `GET /pdb/query/v4/reports` | Fan out to all and serve the **union**, deduped by report `hash`, re-ordered and re-paged across backends. |
 | `GET /pdb/query/v4/events` | Fan out to all and serve the **union**, deduped by record identity, re-ordered and re-paged. |
+| `GET /pdb/query/v4/event-counts` | Fan out to all and **sum** each subject's counts into one row per subject. |
+| `GET /pdb/query/v4/aggregate-event-counts` | Fan out to all and **sum** the summary object's counts. |
 | `GET /pdb/query/v4/reports/<hash>/{events,logs,metrics}` | Ask every backend; serve the answer from whichever backend actually holds that report. `404` when neither does. |
 | `GET /pdb/query/v4/*` (any other) | Transparently proxied to the **primary** backend, unmerged, streamed verbatim. |
 | `GET /healthz` | Per-backend reachability. `200 {"status":"ok"}` if all reachable, `200 degraded` if some fail, `503 down` if all fail. |
@@ -60,9 +62,23 @@ unknown fields survive untouched.
   PuppetDB *and* the new one and both belong in the merged view. Reports dedupe
   on `hash`; events, which carry no id of their own, dedupe on the verbatim
   record (a node briefly reporting to both PuppetDBs stores identical records in
-  each). Records the merge cannot key — `extract`/`group_by` aggregate rows — are
-  never deduped, so every backend's rows pass through even when byte-identical;
-  summing those aggregates across backends is not implemented yet.
+  each).
+- **Aggregates** — `extract`/`group_by` rows are counts, not records, so each
+  backend returns a partial answer that has to be **added**, not deduped. This
+  covers `/event-counts`, `/aggregate-event-counts`, and a `/reports` query whose
+  `extract` carries a `["function", ...]` column.
+  - The grouping key is the row's non-aggregate fields: for `/reports` they come
+    from the query — the plain `extract` fields plus any `group_by` clause — and
+    for the event-count endpoints from the row itself (`subject_type`/`subject`,
+    or `summarize_by`), whose remaining fields are all counts.
+  - Rows sharing a key collapse into one with their numeric columns summed. A key
+    only one backend reported is passed through byte-for-byte. An aggregate column
+    that is absent or non-numeric in a row is skipped, never zeroed, so the
+    backends that did report a number still count.
+  - A `/reports` query with no `function` column is a projection of real reports,
+    not an aggregate, and stays on the union path.
+  - `include_total=true` on a summed endpoint reports the **merged** row count,
+    not the sum of the backends' `X-Records`, since shared keys collapse.
 
 ### Paging and ordering on the merged endpoints
 
@@ -73,9 +89,10 @@ Each backend applies `order_by`/`limit`/`offset` to its own slice only, so
   backend precedence). A record missing an ordered field sorts first.
 - Backends are asked for the first `offset + limit` records — never an `offset`
   — and the requested window is then cut from the merged, re-sorted set.
-- `include_total=true` makes `pdbmux` sum each backend's `X-Records` header into
-  one merged header. Deduped records are counted once per backend, so the total
-  is an upper bound.
+- `include_total=true` on a union endpoint makes `pdbmux` sum each backend's
+  `X-Records` header into one merged header. Deduped records are counted once per
+  backend, so the total is an upper bound. Summed endpoints report the merged row
+  count instead.
 - A malformed `limit`, `offset` or `order_by` gets a `400` rather than being
   forwarded.
 
