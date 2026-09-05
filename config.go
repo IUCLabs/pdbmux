@@ -25,6 +25,8 @@ const (
 
 	defaultTimeout      = 10 * time.Second
 	defaultFreshnessTTL = 30 * time.Second
+
+	defaultSourceFact = "pdbmux_source"
 )
 
 var exampleBackends = []Backend{
@@ -44,6 +46,9 @@ type Config struct {
 	Timeout      time.Duration `yaml:"timeout"`
 	FreshnessTTL time.Duration `yaml:"freshness_ttl"`
 
+	SourceFact        string `yaml:"source_fact"`
+	SourceFactEnabled bool   `yaml:"source_fact_enabled"`
+
 	sourcePath string // file this config was read from, empty if none was found
 }
 
@@ -57,10 +62,12 @@ const (
 
 func DefaultConfig() Config {
 	return Config{
-		Listen:       defaultListen,
-		Merge:        mergeFreshness,
-		Timeout:      defaultTimeout,
-		FreshnessTTL: defaultFreshnessTTL,
+		Listen:            defaultListen,
+		Merge:             mergeFreshness,
+		Timeout:           defaultTimeout,
+		FreshnessTTL:      defaultFreshnessTTL,
+		SourceFact:        defaultSourceFact,
+		SourceFactEnabled: true,
 	}
 }
 
@@ -159,6 +166,14 @@ func applyEnv(cfg *Config, getenv func(string) string) {
 			cfg.FreshnessTTL = d
 		}
 	}
+	if v := getenv(envPrefix + "SOURCE_FACT"); v != "" {
+		cfg.SourceFact = v
+	}
+	if v := getenv(envPrefix + "SOURCE_FACT_ENABLED"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			cfg.SourceFactEnabled = b
+		}
+	}
 	if v := getenv(envPrefix + "BACKENDS"); v != "" {
 		if bs := parseBackends(v); len(bs) > 0 {
 			cfg.Backends = bs
@@ -216,6 +231,9 @@ func (c Config) Validate() error {
 	if c.Timeout <= 0 {
 		return fmt.Errorf("timeout must be positive")
 	}
+	if c.SourceFactEnabled && c.SourceFact == "" {
+		return fmt.Errorf("source_fact must be non-empty, or set source_fact_enabled to false")
+	}
 	return nil
 }
 
@@ -231,7 +249,8 @@ func writeDefaultConfig(path string) error {
 		"# A merging proxy presenting one PuppetDB v4 query surface over several\n" +
 		"# PuppetDB backends. The backend URLs below are placeholders — edit them.\n" +
 		"# Env overrides: PDBMUX_LISTEN, PDBMUX_MERGE, PDBMUX_TIMEOUT,\n" +
-		"#   PDBMUX_FRESHNESS_TTL, PDBMUX_BACKENDS (name=url,name=url).\n\n")
+		"#   PDBMUX_FRESHNESS_TTL, PDBMUX_BACKENDS (name=url,name=url),\n" +
+		"#   PDBMUX_SOURCE_FACT, PDBMUX_SOURCE_FACT_ENABLED.\n\n")
 	if err := os.WriteFile(path, append(header, data...), 0o644); err != nil {
 		return fmt.Errorf("writing config: %w", err)
 	}

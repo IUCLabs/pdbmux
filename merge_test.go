@@ -92,7 +92,7 @@ func TestMergeNodes_NewerWins(t *testing.T) {
 	a := recs(t, "a", node("h1", "2026-07-01T00:00:00Z"), node("h2", "2026-07-10T00:00:00Z"))
 	b := recs(t, "b", node("h1", "2026-07-20T00:00:00Z"), node("h3", "2026-07-05T00:00:00Z"))
 
-	merged := mergeNodes([]backendResult{a, b})
+	merged := mergeNodes([]backendResult{a, b}, nil)
 	got := map[string]string{}
 	for _, r := range merged {
 		var m recordMeta
@@ -117,7 +117,7 @@ func TestMergeNodes_OneBackendOnly(t *testing.T) {
 	a := recs(t, "a", node("h1", "2026-07-01T00:00:00Z"))
 	// b returned nothing (e.g. empty result).
 	b := backendResult{name: "b"}
-	merged := mergeNodes([]backendResult{a, b})
+	merged := mergeNodes([]backendResult{a, b}, nil)
 	if len(merged) != 1 || certnames(t, merged)[0] != "h1" {
 		t.Fatalf("expected only h1, got %v", certnames(t, merged))
 	}
@@ -127,7 +127,7 @@ func TestMergeNodes_TieKeepsEarlierBackend(t *testing.T) {
 	// Equal timestamps: the backend listed first wins, as a tie-break.
 	first := recs(t, "b", node("h1", "2026-07-01T00:00:00Z"))
 	second := recs(t, "a", node("h1", "2026-07-01T00:00:00Z"))
-	merged := mergeNodes([]backendResult{first, second})
+	merged := mergeNodes([]backendResult{first, second}, nil)
 	if len(merged) != 1 {
 		t.Fatalf("expected 1 record, got %d", len(merged))
 	}
@@ -139,7 +139,7 @@ func TestMergeNodes_TieKeepsEarlierBackend(t *testing.T) {
 
 func TestMergeNodes_PreservesUnknownFields(t *testing.T) {
 	a := recs(t, "a", `{"certname":"h1","report_timestamp":"2026-07-01T00:00:00Z","extra":{"deep":42}}`)
-	merged := mergeNodes([]backendResult{a})
+	merged := mergeNodes([]backendResult{a}, nil)
 	if len(merged) != 1 {
 		t.Fatalf("expected 1 record")
 	}
@@ -156,7 +156,7 @@ func TestMergeFacts_NilOwnerUsesConfiguredOrder(t *testing.T) {
 	a := recs(t, "a", fact("h1", "role", "web-a", ""), fact("h2", "role", "db-a", ""))
 	b := recs(t, "b", fact("h1", "role", "web-b", ""))
 
-	merged := mergeFacts([]backendResult{b, a}, nil)
+	merged := mergeFacts([]backendResult{b, a}, nil, nil)
 	got := factValues(t, merged)
 	assertContains(t, got, "h1:role=web-b")
 	assertNotContains(t, got, "h1:role=web-a")
@@ -180,7 +180,7 @@ func TestMergeFacts_Freshness_NewerBackendWins(t *testing.T) {
 		}
 		return "b"
 	}
-	merged := mergeFacts([]backendResult{b, a}, owner)
+	merged := mergeFacts([]backendResult{b, a}, owner, nil)
 	got := factValues(t, merged)
 	// h1 -> all a facts, no b facts.
 	assertContains(t, got, "h1:role=web-a")
@@ -198,7 +198,7 @@ func TestMergeFacts_OwnerMissingFallsBackToConfiguredOrder(t *testing.T) {
 	// backend in the slice that has some.
 	first := recs(t, "b", fact("h1", "role", "web-b", ""))
 	second := recs(t, "a", fact("h1", "role", "web-a", ""))
-	merged := mergeFacts([]backendResult{first, second}, func(string) string { return "ghost" })
+	merged := mergeFacts([]backendResult{first, second}, func(string) string { return "ghost" }, nil)
 	got := factValues(t, merged)
 	assertContains(t, got, "h1:role=web-b") // b is first in slice
 	assertNotContains(t, got, "h1:role=web-a")

@@ -75,7 +75,7 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	case resourcesPath:
 		s.serveResources(w, r)
 	case factsPath:
-		s.serveMerged(w, r, factsPath, s.mergeFactsResponse)
+		s.serveMerged(w, r, factsPath, s.mergeFactsResponse(r))
 	case reportsPath:
 		s.serveReports(w, r)
 	case eventsPath:
@@ -146,7 +146,7 @@ func (s *Server) serveNodes(w http.ResponseWriter, r *http.Request) {
 		s.serveSummed(w, r, nodesPath, spec.columns)
 		return
 	}
-	s.serveMerged(w, r, nodesPath, s.mergeNodesResponse)
+	s.serveMerged(w, r, nodesPath, s.mergeNodesResponse(r))
 }
 
 // Only aggregates merge: a resource record has no cross-backend identity to dedupe on, so a plain query stays on the pass-through path.
@@ -248,16 +248,26 @@ func rawRecords(recs []record) []json.RawMessage {
 	return out
 }
 
-func (s *Server) mergeNodesResponse(results []backendResult) []json.RawMessage {
-	return mergeNodes(results)
+func (s *Server) mergeNodesResponse(r *http.Request) func([]backendResult) []json.RawMessage {
+	inject := s.newSourceInjector(r.URL.Query().Get("query"), false)
+	return func(results []backendResult) []json.RawMessage {
+		return mergeNodes(results, inject)
+	}
 }
 
-func (s *Server) mergeFactsResponse(results []backendResult) []json.RawMessage {
-	if s.cfg.Merge == mergeStatic {
-		return mergeFacts(results, nil)
+func (s *Server) mergeFactsResponse(r *http.Request) func([]backendResult) []json.RawMessage {
+	inject := s.newSourceInjector(r.URL.Query().Get("query"), true)
+	return func(results []backendResult) []json.RawMessage {
+		var merged []json.RawMessage
+		if s.cfg.Merge == mergeStatic {
+			merged = mergeFacts(results, nil, inject)
+		} else {
+			fresh := s.freshnessMap(context.Background(), results)
+			merged = mergeFacts(results, func(cn string) string { return fresh[cn] }, inject)
+		}
+		inject.logSuppressed(s.log)
+		return merged
 	}
-	fresh := s.freshnessMap(context.Background(), results)
-	return mergeFacts(results, func(cn string) string { return fresh[cn] })
 }
 
 // Queries /nodes unfiltered rather than reusing the request's results, because a /facts query's certname set can differ.

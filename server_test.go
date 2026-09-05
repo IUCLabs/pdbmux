@@ -133,11 +133,13 @@ func truncate(t *testing.T, body, limit string) string {
 
 func testConfig(aURL, bURL, merge string) Config {
 	return Config{
-		Listen:       ":0",
-		Backends:     []Backend{{Name: "a", URL: aURL}, {Name: "b", URL: bURL}},
-		Merge:        merge,
-		Timeout:      2 * time.Second,
-		FreshnessTTL: 30 * time.Second,
+		Listen:            ":0",
+		Backends:          []Backend{{Name: "a", URL: aURL}, {Name: "b", URL: bURL}},
+		Merge:             merge,
+		Timeout:           2 * time.Second,
+		FreshnessTTL:      30 * time.Second,
+		SourceFact:        defaultSourceFact,
+		SourceFactEnabled: true,
 	}
 }
 
