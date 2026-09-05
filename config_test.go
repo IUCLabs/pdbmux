@@ -3,26 +3,69 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
 
-func TestLoad_Defaults(t *testing.T) {
+// testConfigValid returns a minimal valid config for Validate/merge tests, with
+// neutral placeholder backends.
+func testConfigValid() Config {
+	cfg := DefaultConfig()
+	cfg.Backends = []Backend{
+		{Name: "old", URL: "http://localhost:18080"},
+		{Name: "new", URL: "http://localhost:18081"},
+	}
+	cfg.Primary = "new"
+	cfg.Prefer = "new"
+	return cfg
+}
+
+func TestDefaultConfig_NoBackends(t *testing.T) {
+	cfg := DefaultConfig()
+	if cfg.Listen != defaultListen {
+		t.Errorf("listen = %q, want %q", cfg.Listen, defaultListen)
+	}
+	if len(cfg.Backends) != 0 {
+		t.Errorf("defaults must not ship backends, got %+v", cfg.Backends)
+	}
+	if cfg.Merge != mergeFreshness {
+		t.Errorf("merge = %q, want %q", cfg.Merge, mergeFreshness)
+	}
+	if err := cfg.Validate(); err == nil {
+		t.Error("defaults alone must not validate: backends are required")
+	}
+}
+
+func TestLoad_NoBackendsLoadsButFailsValidation(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	clearEnv(t)
+
+	// Load itself must succeed so `config init` / `version` work unconfigured.
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	err = cfg.Validate()
+	if err == nil {
+		t.Fatal("expected a validation error when no backends are configured")
+	}
+	if !strings.Contains(err.Error(), envPrefix+"BACKENDS") {
+		t.Errorf("error should name the env var to set, got: %v", err)
+	}
+}
+
+func TestLoad_PrimaryDefaultsToFirstBackend(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	clearEnv(t)
+	t.Setenv(envPrefix+"BACKENDS", "a=http://localhost:18080,b=http://localhost:18081")
 
 	cfg, err := Load()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Listen != defaultListen {
-		t.Errorf("listen = %q, want %q", cfg.Listen, defaultListen)
-	}
-	if len(cfg.Backends) != 2 || cfg.Backends[0].Name != "old" || cfg.Backends[1].Name != "new" {
-		t.Errorf("unexpected default backends: %+v", cfg.Backends)
-	}
-	if cfg.Merge != mergeFreshness || cfg.Primary != "new" {
-		t.Errorf("unexpected defaults merge=%s primary=%s", cfg.Merge, cfg.Primary)
+	if cfg.Primary != "a" || cfg.Prefer != "a" {
+		t.Errorf("primary/prefer should default to first backend, got %q/%q", cfg.Primary, cfg.Prefer)
 	}
 }
 
@@ -35,7 +78,8 @@ func TestLoad_FileAndEnvOverride(t *testing.T) {
 	if err := os.MkdirAll(cfgDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	body := "listen: :9999\nmerge: static\nprimary: old\nprefer: old\n"
+	body := "listen: :9999\nmerge: static\nprimary: old\nprefer: old\n" +
+		"backends:\n  - name: old\n    url: http://localhost:18080\n  - name: new\n    url: http://localhost:18081\n"
 	if err := os.WriteFile(filepath.Join(cfgDir, configFileName), []byte(body), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -56,7 +100,7 @@ func TestLoad_FileAndEnvOverride(t *testing.T) {
 }
 
 func TestApplyEnv_Backends(t *testing.T) {
-	cfg := DefaultConfig()
+	cfg := testConfigValid()
 	env := map[string]string{
 		envPrefix + "BACKENDS":      "a=http://a:8080,b=http://b:8080",
 		envPrefix + "PRIMARY":       "a",
@@ -91,7 +135,7 @@ func TestValidate(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			cfg := DefaultConfig()
+			cfg := testConfigValid()
 			tc.mutate(&cfg)
 			err := cfg.Validate()
 			if (err != nil) != tc.wantErr {
@@ -112,9 +156,21 @@ func TestParseBackends(t *testing.T) {
 }
 
 func TestPrimaryBackend(t *testing.T) {
-	cfg := DefaultConfig()
-	if cfg.PrimaryBackend().URL != defaultNewURL {
-		t.Errorf("primary backend URL = %q, want %q", cfg.PrimaryBackend().URL, defaultNewURL)
+	cfg := testConfigValid()
+	if got, want := cfg.PrimaryBackend().URL, cfg.Backends[1].URL; got != want {
+		t.Errorf("primary backend URL = %q, want %q", got, want)
+	}
+}
+
+func TestExampleConfig_IsValidAndNeutral(t *testing.T) {
+	cfg := ExampleConfig()
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("example config must validate: %v", err)
+	}
+	for _, b := range cfg.Backends {
+		if !strings.Contains(b.URL, "example.com") {
+			t.Errorf("example backend %q must use a placeholder host, got %q", b.Name, b.URL)
+		}
 	}
 }
 

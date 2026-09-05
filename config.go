@@ -18,18 +18,17 @@ const (
 
 	// defaultListen is the default HTTP listen address.
 	defaultListen = ":8080"
-	// defaultOldURL / defaultNewURL are the two PuppetDBs merged during the
-	// VM -> k8s migration. old = legacy VM-registered puppetdbapi; new =
-	// the k8s PuppetDB behind the gateway (TLS terminated there).
-	defaultOldURL = "http://puppetdb.example.com:8080"
-	defaultNewURL = "https://puppetdb.k8s.example.net"
-	// defaultPrimary is the backend name used for pass-through (non-merged)
-	// /pdb/query/v4/* paths and as static precedence for merge fallback.
-	defaultPrimary = "new"
 
 	defaultTimeout      = 10 * time.Second
 	defaultFreshnessTTL = 30 * time.Second
 )
+
+// exampleBackends are the placeholder backends written by `config init`. They
+// are a scaffold to edit, not a working configuration.
+var exampleBackends = []Backend{
+	{Name: "primary", URL: "http://puppetdb1.example.com:8080"},
+	{Name: "secondary", URL: "http://puppetdb2.example.com:8080"},
+}
 
 // Backend is one upstream PuppetDB. URL is the base URL (scheme://host[:port]),
 // without the /pdb/query/v4/... path — that is appended per request.
@@ -67,21 +66,26 @@ const (
 	mergeStatic    = "static"
 )
 
-// DefaultConfig returns the built-in defaults: both migration PuppetDBs,
-// freshness merge, "new" primary/preferred.
+// DefaultConfig returns the built-in defaults. Backends have no default: they
+// must come from the config file or PDBMUX_BACKENDS. Primary and Prefer default
+// to the first configured backend (see normalize).
 func DefaultConfig() Config {
 	return Config{
-		Listen: defaultListen,
-		Backends: []Backend{
-			{Name: "old", URL: defaultOldURL},
-			{Name: "new", URL: defaultNewURL},
-		},
-		Primary:      defaultPrimary,
+		Listen:       defaultListen,
 		Merge:        mergeFreshness,
-		Prefer:       defaultPrimary,
 		Timeout:      defaultTimeout,
 		FreshnessTTL: defaultFreshnessTTL,
 	}
+}
+
+// ExampleConfig returns DefaultConfig with placeholder backends filled in, as
+// written by `config init`.
+func ExampleConfig() Config {
+	cfg := DefaultConfig()
+	cfg.Backends = append([]Backend(nil), exampleBackends...)
+	cfg.Primary = exampleBackends[0].Name
+	cfg.Prefer = exampleBackends[0].Name
+	return cfg
 }
 
 // ConfigDir returns the XDG_CONFIG_HOME/pdbmux directory.
@@ -103,6 +107,10 @@ func ConfigPath() string {
 // Precedence (lowest -> highest): defaults < config file < env vars < flags
 // (flags are applied by the caller). Backends can be overridden wholesale via
 // PDBMUX_BACKENDS ("name=url,name=url").
+//
+// Load reports only read/parse errors; the result is not validated, so commands
+// that do not serve (config init, version) still work on an unconfigured host.
+// Callers that serve must call Validate after applying flags.
 func Load() (Config, error) {
 	cfg := DefaultConfig()
 
@@ -118,10 +126,7 @@ func Load() (Config, error) {
 	}
 
 	applyEnv(&cfg, os.Getenv)
-
-	if err := cfg.Validate(); err != nil {
-		return cfg, err
-	}
+	cfg.normalize()
 	return cfg, nil
 }
 
@@ -175,10 +180,25 @@ func parseBackends(s string) []Backend {
 	return out
 }
 
+// normalize fills in values that default to something derived rather than
+// constant: Primary and Prefer both fall back to the first configured backend.
+func (c *Config) normalize() {
+	if len(c.Backends) == 0 {
+		return
+	}
+	if c.Primary == "" {
+		c.Primary = c.Backends[0].Name
+	}
+	if c.Prefer == "" {
+		c.Prefer = c.Backends[0].Name
+	}
+}
+
 // Validate checks the config is internally consistent and usable.
 func (c Config) Validate() error {
 	if len(c.Backends) == 0 {
-		return fmt.Errorf("no backends configured")
+		return fmt.Errorf("no backends configured: set %sBACKENDS to \"name=url,name=url\" or add a backends list to %s",
+			envPrefix, ConfigPath())
 	}
 	seen := map[string]bool{}
 	for _, b := range c.Backends {
@@ -228,9 +248,10 @@ func writeDefaultConfig() error {
 	if _, err := os.Stat(path); err == nil {
 		return fmt.Errorf("config already exists at %s", path)
 	}
-	data, _ := yaml.Marshal(DefaultConfig())
+	data, _ := yaml.Marshal(ExampleConfig())
 	header := []byte("# pdbmux configuration\n" +
-		"# A merging proxy over two PuppetDBs (old VM + new k8s) during migration.\n" +
+		"# A merging proxy presenting one PuppetDB v4 query surface over several\n" +
+		"# PuppetDB backends. The backend URLs below are placeholders — edit them.\n" +
 		"# Env overrides: PDBMUX_LISTEN, PDBMUX_PRIMARY, PDBMUX_MERGE, PDBMUX_PREFER,\n" +
 		"#   PDBMUX_TIMEOUT, PDBMUX_FRESHNESS_TTL, PDBMUX_BACKENDS (name=url,name=url).\n\n")
 	if err := os.WriteFile(path, append(header, data...), 0o644); err != nil {
