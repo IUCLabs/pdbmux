@@ -13,17 +13,19 @@ import (
 // Reports and events are immutable history, so a certname that migrated between
 // PuppetDBs legitimately has records in both and the union — not a per-node
 // winner — is the correct merged view. results must be ordered by precedence;
-// the first backend holding a key supplies the record.
-func mergeUnion(results []backendResult, key func(record) string) []json.RawMessage {
+// the first backend holding a key supplies the record. A key func returning
+// ok=false means the record has no dedupe identity and is always kept.
+func mergeUnion(results []backendResult, key func(record) (string, bool)) []json.RawMessage {
 	seen := make(map[string]bool)
 	out := []json.RawMessage{}
 	for _, res := range results {
 		for _, rec := range res.records {
-			k := key(rec)
-			if seen[k] {
-				continue
+			if k, ok := key(rec); ok {
+				if seen[k] {
+					continue
+				}
+				seen[k] = true
 			}
-			seen[k] = true
 			out = append(out, rec.Raw)
 		}
 	}
@@ -32,18 +34,19 @@ func mergeUnion(results []backendResult, key func(record) string) []json.RawMess
 
 // reportKey identifies a report by its content hash, which PuppetDB guarantees
 // is unique per report. An `extract`/`group_by` query returns synthetic rows
-// with no hash, so those fall back to raw identity and are all kept.
-func reportKey(rec record) string {
+// with no hash and no identity — two backends can emit byte-identical aggregate
+// rows that both count — so those are never deduped.
+func reportKey(rec record) (string, bool) {
 	if rec.Hash == "" {
-		return rawKey(rec)
+		return "", false
 	}
-	return "hash\x00" + rec.Hash
+	return "hash\x00" + rec.Hash, true
 }
 
 // rawKey identifies a record by its verbatim JSON. Events carry no unique id,
 // but two byte-identical events from the same PuppetDB serialiser describe the
 // same resource change, so raw equality is a safe dedupe key.
-func rawKey(rec record) string { return "raw\x00" + string(rec.Raw) }
+func rawKey(rec record) (string, bool) { return "raw\x00" + string(rec.Raw), true }
 
 // orderField is one entry of PuppetDB's order_by param.
 type orderField struct {

@@ -127,7 +127,7 @@ func (s *Server) serveMerged(w http.ResponseWriter, r *http.Request, path string
 // and events — and serves the deduped union of every backend. Because each
 // backend ordered and paged only its own slice, the union is re-ordered and
 // re-paged here from the client's order_by/limit/offset.
-func (s *Server) serveUnion(w http.ResponseWriter, r *http.Request, path string, key func(record) string) {
+func (s *Server) serveUnion(w http.ResponseWriter, r *http.Request, path string, key func(record) (string, bool)) {
 	in := r.URL.Query()
 	page, err := parsePaging(in)
 	if err != nil {

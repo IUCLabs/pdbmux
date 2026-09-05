@@ -59,7 +59,7 @@ unknown fields survive untouched.
   on `hash`; events, which carry no id of their own, dedupe on the verbatim
   record (a node briefly reporting to both PuppetDBs stores identical records in
   each). Records the merge cannot key — `extract`/`group_by` aggregate rows — are
-  all kept rather than collapsed, so no backend's rows are silently dropped;
+  never deduped, so every backend's rows pass through even when byte-identical;
   summing those aggregates across backends is not implemented yet.
 
 ### Paging and ordering on the merged endpoints

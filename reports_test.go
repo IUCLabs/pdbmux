@@ -35,6 +35,16 @@ func TestMergeUnion_HashlessRowsAreAllKept(t *testing.T) {
 	}
 }
 
+func TestMergeUnion_IdenticalHashlessRowsAreNotCollapsed(t *testing.T) {
+	// Two backends can legitimately produce the same aggregate row; collapsing
+	// them as duplicates undercounts the merged result.
+	same := `{"status":"changed","count":1}`
+	merged := mergeUnion([]backendResult{recs(t, "old", same), recs(t, "new", same)}, reportKey)
+	if len(merged) != 2 {
+		t.Errorf("expected both backends' aggregate rows, got %d: %v", len(merged), merged)
+	}
+}
+
 func TestMergeUnion_EventsDedupeOnRawIdentity(t *testing.T) {
 	same := event("h1", "r1", "Package[nginx]")
 	other := event("h1", "r1", "Service[nginx]")
