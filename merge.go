@@ -114,7 +114,7 @@ func buildFreshness(results []backendResult) freshness {
 }
 
 // owner names the winning backend per certname; a nil owner (static merge), or one holding no facts for that certname, falls back to configured order.
-// A non-nil inject appends the synthetic source fact after each certname's block, naming the backend that won.
+// inject appends the synthetic source fact after each certname's block, naming the backend that won, and always drops upstream facts of that name.
 func mergeFacts(results []backendResult, owner func(certname string) string, inject *sourceInjector) []json.RawMessage {
 	present := map[string][]string{} // certname -> backend names, in configured order
 	byKey := map[string][]record{}
@@ -152,11 +152,16 @@ func mergeFacts(results []backendResult, owner func(certname string) string, inj
 		}
 		recs := byKey[cn+"\x00"+chosen]
 		for _, rec := range recs {
-			// An upstream fact of the same name is dropped: pdbmux's own value is authoritative.
+			// An upstream fact of the configured name is dropped on every query shape,
+			// injected or not: while the feature is on the name is pdbmux's alone.
 			if inject.claims(rec.Name) {
+				inject.suppressed++
 				continue
 			}
 			out = append(out, rec.Raw)
+		}
+		if !inject.injects() {
+			continue
 		}
 		if synth := inject.factRecord(cn, chosen, environmentOf(recs)); synth != nil {
 			out = append(out, synth)

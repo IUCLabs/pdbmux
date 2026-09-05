@@ -114,17 +114,25 @@ attributes a shared node to the first backend in configured order, while
 `/nodes` always attributes it to the backend holding the newer
 `report_timestamp`. Each answer describes the record it is attached to.
 
-If a backend genuinely reports a fact of the configured name, `pdbmux`
-**overrides** it — the upstream record is dropped and replaced, never duplicated,
-so the fact means exactly one thing and a node never carries two of it. Rename
-the synthetic fact via `source_fact` if the real one matters more.
+While the fact is enabled the configured name is `pdbmux`'s alone. A `/facts`
+record of that name coming from a backend is **always dropped**, on every query
+shape — including the shapes below, where nothing is injected in its place — so
+the fact means exactly one thing and a node never carries two of it. Each request
+that drops one logs it once. Only `source_fact_enabled: false` restores upstream
+records of that name; rename the synthetic fact via `source_fact` if the real one
+matters more.
 
-**Injection is skipped**, and the response passes through untouched, when:
+**Injection is skipped**, and no synthetic record is added, when:
 
-- the query has a top-level `extract` — it projects a column subset, and with a
-  `["function", ...]` column it aggregates. Injecting there would break the row
-  shape or silently inflate a `count()`, so **aggregate results are never
-  changed**;
+- the query contains an `extract` anywhere outside an `in` subquery — it projects
+  a column subset, and with a `["function", ...]` column it aggregates. Injecting
+  there would break the row shape or silently inflate a `count()`, so **aggregate
+  results are never changed**. The whole query is walked, so an `extract` nested
+  under `and`/`or`/`not`/`from` skips injection too; an `extract` inside an `in`
+  operand projects the subquery rather than the response, so it does not;
+- the query is not an AST array — every **PQL-syntax** query (`facts { certname
+  = "web1" }`) lands here. `pdbmux` cannot tell what such a query projects, so it
+  never injects into a PQL response. Use the AST form to get the fact;
 - (`/facts` only) the query constrains `name` — `["=","name","osfamily"]` and
   friends ask for specific facts, and the synthetic record is not one of them.
   Only the outer query is inspected: a `name` filter inside an `in`/`select_facts`

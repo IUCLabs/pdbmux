@@ -1,7 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
+	"io"
+	"log"
 	"net/http"
 	"slices"
 	"strings"
@@ -220,9 +223,90 @@ func TestHandler_UpstreamSourceFactOverridden(t *testing.T) {
 	}
 }
 
-// A count() must report the backends' real fact count, not one inflated by a
-// record pdbmux invented.
-func TestHandler_SourceNotInjectedOnAggregate(t *testing.T) {
+// The configured name means one thing on every query shape: an upstream fact of
+// that name is dropped whether or not the query gate allows synthesis.
+func TestHandler_UpstreamSourceFactSuppressedOnEveryGateState(t *testing.T) {
+	const upstream = "REAL-UPSTREAM-VALUE"
+	tests := []struct {
+		name  string
+		query string
+		want  string // synthetic value, or "" when the gate blocks injection
+	}{
+		{"injection on", "", "a"},
+		{"gated by extract", `["extract",["certname","name","value"],["=","certname","h1"]]`, ""},
+		{"gated by name filter", `["=","name","` + defaultSourceFact + `"]`, ""},
+		{"gated by nested extract", `["and",["=","certname","h1"],["extract",["certname"]]]`, ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			a := newFakeBackend(t, `[`+node("h1", "2026-07-20T00:00:00Z")+`]`,
+				`[`+fact("h1", "role", "web", "")+`,`+fact("h1", defaultSourceFact, upstream, "")+`]`)
+			b := newFakeBackend(t, `[]`, `[]`)
+			srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic))
+
+			rec := doGet(t, srv.Handler(), factsPath, tc.query)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+			}
+			if strings.Contains(rec.Body.String(), upstream) {
+				t.Fatalf("upstream value survived: %s", rec.Body.String())
+			}
+			got, n := sourceValues(t, rec.Body.Bytes(), defaultSourceFact)
+			if tc.want == "" {
+				if n != 0 {
+					t.Errorf("gated query produced %d %s records: %s", n, defaultSourceFact, rec.Body.String())
+				}
+			} else if n != 1 || got["h1"] != tc.want {
+				t.Errorf("provenance = %v (%d records), want h1=%s: %s", got, n, tc.want, rec.Body.String())
+			}
+			if !strings.Contains(rec.Body.String(), `"role"`) {
+				t.Errorf("real facts were dropped: %s", rec.Body.String())
+			}
+		})
+	}
+}
+
+// Dropping an upstream record is invisible in the response, so it is logged —
+// once per request, not once per record.
+func TestHandler_SuppressedUpstreamFactLoggedOncePerRequest(t *testing.T) {
+	a := newFakeBackend(t,
+		`[`+node("h1", "2026-07-20T00:00:00Z")+`,`+node("h2", "2026-07-20T00:00:00Z")+`]`,
+		`[`+fact("h1", defaultSourceFact, "old-h1", "")+`,`+fact("h2", defaultSourceFact, "old-h2", "")+`]`)
+	b := newFakeBackend(t, `[]`, `[]`)
+	var buf bytes.Buffer
+	srv := NewServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic), log.New(&buf, "", 0))
+
+	doGet(t, srv.Handler(), factsPath, "")
+	if n := strings.Count(buf.String(), defaultSourceFact); n != 1 {
+		t.Fatalf("expected 1 log line naming the fact, got %d: %s", n, buf.String())
+	}
+	if !strings.Contains(buf.String(), "dropped 2") {
+		t.Errorf("log does not report the number dropped: %s", buf.String())
+	}
+}
+
+// Disabled means untouched: an upstream fact of the configured name is served as
+// the backend reported it.
+func TestHandler_SourceDisabledKeepsUpstreamFact(t *testing.T) {
+	a := newFakeBackend(t, `[`+node("h1", "2026-07-20T00:00:00Z")+`]`,
+		`[`+fact("h1", defaultSourceFact, "upstream-value", "")+`]`)
+	b := newFakeBackend(t, `[]`, `[]`)
+	cfg := testConfig(a.srv.URL, b.srv.URL, mergeStatic)
+	cfg.SourceFactEnabled = false
+	srv := newTestServer(cfg)
+
+	rec := doGet(t, srv.Handler(), factsPath, "")
+	got, n := sourceValues(t, rec.Body.Bytes(), defaultSourceFact)
+	if n != 1 || got["h1"] != "upstream-value" {
+		t.Errorf("disabled injection altered the upstream fact: %s", rec.Body.String())
+	}
+}
+
+// Covers only that an aggregate /facts response gains no synthetic record and no
+// rewritten row. It does not cover whether the aggregate rows are correct:
+// /facts has no parseAggregate branch, so its rows take the certname merge
+// instead of serveSummed and are not summed across backends.
+func TestHandler_SourceNotInjectedOnFactsAggregate(t *testing.T) {
 	a := newFakeBackend(t, `[`+node("h1", "2026-07-20T00:00:00Z")+`]`, `[]`)
 	b := newFakeBackend(t, `[]`, `[]`)
 	a.bodies[factsPath] = `[{"count":3}]`
@@ -333,6 +417,16 @@ func TestInjectable(t *testing.T) {
 		{"name only inside subquery", `["in","certname",["extract",["certname"],["select_facts",["=","name","os"]]]]`, true, true},
 		{"top-level extract", `["extract",["certname","value"],["=","certname","h1"]]`, true, false},
 		{"aggregate extract", `["extract",[["function","count"]]]`, true, false},
+		// openvoxdb hands each boolean operand back to user-node->plan-node, which
+		// builds an extract node from it, so a nested extract can reshape the rows.
+		{"extract under and", `["and",["=","certname","h1"],["extract",["certname"]]]`, true, false},
+		{"extract under or", `["or",["extract",["certname"]],["=","certname","h1"]]`, true, false},
+		{"extract under not", `["not",["extract",["certname"]]]`, true, false},
+		{"extract nested two deep", `["and",["or",["extract",[["function","count"]]]]]`, true, false},
+		{"extract under from", `["from","facts",["extract",["certname"]]]`, true, false},
+		{"nested extract on nodes", `["and",["extract",["certname"]]]`, false, false},
+		// An extract inside an `in` operand projects the subquery, not the response.
+		{"extract under in stays injectable", `["in","certname",["extract",["certname"],["select_facts",["=","name","os"]]]]`, true, true},
 		{"nodes name filter is not a fact filter", `["=","name","os"]`, false, true},
 		{"nodes extract", `["extract",["certname"]]`, false, false},
 		{"unparseable query", `not json`, true, false},
@@ -350,7 +444,7 @@ func TestInjectable(t *testing.T) {
 // pypuppetdb reads certname/name/value/environment by direct index, so a
 // missing key is a KeyError there — all four are always present.
 func TestSourceInjector_FactRecordHasEveryFactKey(t *testing.T) {
-	si := &sourceInjector{name: defaultSourceFact}
+	si := &sourceInjector{name: defaultSourceFact, inject: true}
 	for _, env := range []string{"production", ""} {
 		var obj map[string]json.RawMessage
 		if err := json.Unmarshal(si.factRecord("h1", "a", env), &obj); err != nil {
@@ -373,6 +467,10 @@ func TestSourceInjector_NilIsInert(t *testing.T) {
 	if si.claims(defaultSourceFact) {
 		t.Error("nil injector claims a fact name")
 	}
+	if si.injects() {
+		t.Error("nil injector injects")
+	}
+	si.logSuppressed(log.New(io.Discard, "", 0))
 	if si.factRecord("h1", "a", "production") != nil {
 		t.Error("nil injector produced a record")
 	}
@@ -385,7 +483,7 @@ func TestSourceInjector_NilIsInert(t *testing.T) {
 // A response element that is not a JSON object cannot be stamped, and must be
 // passed through rather than dropped or mangled.
 func TestSourceInjector_StampNonObject(t *testing.T) {
-	si := &sourceInjector{name: defaultSourceFact}
+	si := &sourceInjector{name: defaultSourceFact, inject: true}
 	for _, raw := range []string{`"scalar"`, `[1,2]`, `null`} {
 		if got := si.stamp(json.RawMessage(raw), "a"); string(got) != raw {
 			t.Errorf("stamp(%s) = %s, want unchanged", raw, got)
@@ -393,10 +491,53 @@ func TestSourceInjector_StampNonObject(t *testing.T) {
 	}
 }
 
+// A gated injector suppresses without synthesising anything, on either endpoint.
+func TestSourceInjector_GatedSuppressesButDoesNotInject(t *testing.T) {
+	si := &sourceInjector{name: defaultSourceFact}
+	if !si.claims(defaultSourceFact) {
+		t.Error("gated injector does not claim its own fact name")
+	}
+	if si.factRecord("h1", "a", "production") != nil {
+		t.Error("gated injector produced a record")
+	}
+	raw := json.RawMessage(`{"certname":"h1"}`)
+	if got := si.stamp(raw, "a"); string(got) != string(raw) {
+		t.Errorf("gated injector rewrote %s to %s", raw, got)
+	}
+}
+
+// The disabled path must return the backends' records verbatim, source fact
+// included.
+func TestMergeFacts_DisabledIsUntouched(t *testing.T) {
+	a := recs(t, "a", fact("h1", "role", "web-a", ""), fact("h1", defaultSourceFact, "upstream", ""))
+	merged := mergeFacts([]backendResult{a}, nil, nil)
+
+	got := factValues(t, merged)
+	want := []string{"h1:role=web-a", "h1:" + defaultSourceFact + "=upstream"}
+	if !slices.Equal(got, want) {
+		t.Errorf("merged = %v, want %v", got, want)
+	}
+}
+
+// A gated query still gets the upstream record removed, and nothing added.
+func TestMergeFacts_GatedSuppressesUpstream(t *testing.T) {
+	a := recs(t, "a", fact("h1", "role", "web-a", ""), fact("h1", defaultSourceFact, "upstream", ""))
+	si := &sourceInjector{name: defaultSourceFact}
+	merged := mergeFacts([]backendResult{a}, nil, si)
+
+	got := factValues(t, merged)
+	if !slices.Equal(got, []string{"h1:role=web-a"}) {
+		t.Errorf("merged = %v, want only the real fact", got)
+	}
+	if si.suppressed != 1 {
+		t.Errorf("suppressed = %d, want 1", si.suppressed)
+	}
+}
+
 func TestMergeFacts_SourceOrderedAfterOwnersFacts(t *testing.T) {
 	a := recs(t, "a", fact("h1", "role", "web-a", ""), fact("h1", "kernel", "Linux", ""))
 	b := recs(t, "b", fact("h1", "role", "web-b", ""))
-	merged := mergeFacts([]backendResult{a, b}, nil, &sourceInjector{name: defaultSourceFact})
+	merged := mergeFacts([]backendResult{a, b}, nil, &sourceInjector{name: defaultSourceFact, inject: true})
 
 	got := factValues(t, merged)
 	want := []string{"h1:role=web-a", "h1:kernel=Linux", "h1:" + defaultSourceFact + "=a"}

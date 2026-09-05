@@ -1,28 +1,48 @@
 package main
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"log"
+)
 
-// sourceInjector synthesises the provenance fact naming the backend whose data
-// won the merge for a given certname. A nil *sourceInjector is the disabled
-// case, so every method is nil-safe and callers need no branch.
+// sourceInjector owns the configured fact name for one request. A nil
+// *sourceInjector is the feature-disabled case, so every method is nil-safe and
+// callers need no branch.
 type sourceInjector struct {
 	name string
+	// inject is false when the query shape rules synthesis out. Suppression of an
+	// upstream fact of the same name does not depend on it.
+	inject     bool
+	suppressed int
 }
 
-// newSourceInjector returns nil when injection is off for this request.
+// newSourceInjector returns nil only when the feature is off; a gated query
+// yields an injector that suppresses but does not synthesise.
 func (s *Server) newSourceInjector(query string, factEntity bool) *sourceInjector {
 	if !s.cfg.SourceFactEnabled || s.cfg.SourceFact == "" {
 		return nil
 	}
-	if !injectable(query, factEntity) {
-		return nil
-	}
-	return &sourceInjector{name: s.cfg.SourceFact}
+	return &sourceInjector{name: s.cfg.SourceFact, inject: injectable(query, factEntity)}
 }
 
-// claims reports whether an upstream record is the one the injector replaces.
+// claims reports whether an upstream record carries the name pdbmux owns. While
+// the feature is enabled the name means one thing on every query shape, so such
+// a record is dropped even when the query gate has ruled synthesis out.
 func (si *sourceInjector) claims(factName string) bool {
 	return si != nil && factName != "" && factName == si.name
+}
+
+// injects reports whether this response may carry the synthetic record.
+func (si *sourceInjector) injects() bool {
+	return si != nil && si.inject
+}
+
+// logSuppressed reports, once per request, that upstream records were dropped.
+func (si *sourceInjector) logSuppressed(l *log.Logger) {
+	if si == nil || si.suppressed == 0 || l == nil {
+		return
+	}
+	l.Printf("info: dropped %d upstream %q fact record(s); pdbmux owns that fact name", si.suppressed, si.name)
 }
 
 // factRecord builds the synthetic /facts record, or nil when disabled.
@@ -30,7 +50,7 @@ func (si *sourceInjector) claims(factName string) bool {
 // record are always emitted, empty environment included: pypuppetdb indexes them
 // directly (types.py Fact.create_from_dict), so an omitted key is a KeyError.
 func (si *sourceInjector) factRecord(certname, backend, environment string) json.RawMessage {
-	if si == nil {
+	if !si.injects() {
 		return nil
 	}
 	raw, err := json.Marshal(struct {
@@ -48,7 +68,7 @@ func (si *sourceInjector) factRecord(certname, backend, environment string) json
 // stamp adds the provenance key to a /nodes record, overwriting any existing
 // key of that name. A record that is not a JSON object passes through untouched.
 func (si *sourceInjector) stamp(raw json.RawMessage, backend string) json.RawMessage {
-	if si == nil {
+	if !si.injects() {
 		return raw
 	}
 	var obj map[string]json.RawMessage
@@ -68,12 +88,14 @@ func (si *sourceInjector) stamp(raw json.RawMessage, backend string) json.RawMes
 }
 
 // injectable reports whether a response to this query may carry the synthetic
-// record. Two shapes are excluded, both because the client asked for something
+// record. Three shapes are excluded, each because the client asked for something
 // the synthetic record is not part of:
 //
-//   - a top-level `extract`, which projects a column subset and, with a
-//     `["function", ...]` column, aggregates — injecting there would corrupt the
-//     row shape or silently inflate a count();
+//   - a query that is not an AST array, which includes every PQL-syntax query:
+//     pdbmux cannot tell what it projects, so it changes nothing;
+//   - an `extract` anywhere in the query's own projection scope, which projects a
+//     column subset and, with a `["function", ...]` column, aggregates — injecting
+//     there would corrupt the row shape or silently inflate a count();
 //   - on the facts entity, any outer constraint on `name`, which selects
 //     specific facts. Subquery operands are not descended into: they choose which
 //     nodes match, not which facts come back.
@@ -90,13 +112,48 @@ func injectable(query string, factEntity bool) bool {
 	if json.Unmarshal(ast[0], &op) != nil {
 		return false
 	}
-	if op == "extract" {
+	if hasExtract(ast) {
 		return false
 	}
 	if !factEntity {
 		return true
 	}
 	return !constrainsField(ast, "name")
+}
+
+// hasExtract reports whether an extract appears anywhere in the query's own
+// projection scope. openvoxdb accepts an extract as an operand of a boolean
+// operator — engine.clj's user-node->plan-node sends every and/or/not operand
+// back through itself (src/puppetlabs/puppetdb/query_eng/engine.clj:2697-2733)
+// and valid-operator? lists "extract" (:2780-2784) — so the row shape can be
+// rewritten below the top level, and the whole tree is walked to fail closed.
+// `in` is the one operator not descended into: its operand becomes
+// InExpression's :subquery (:2705-2712), projecting the subquery rather than
+// the response.
+func hasExtract(parts []json.RawMessage) bool {
+	if len(parts) == 0 {
+		return false
+	}
+	var op string
+	if json.Unmarshal(parts[0], &op) != nil {
+		return false
+	}
+	switch op {
+	case "extract":
+		return true
+	case "in":
+		return false
+	}
+	for _, p := range parts[1:] {
+		var sub []json.RawMessage
+		if json.Unmarshal(p, &sub) != nil {
+			continue
+		}
+		if hasExtract(sub) {
+			return true
+		}
+	}
+	return false
 }
 
 // constrainsField walks the boolean skeleton of an AST node looking for a

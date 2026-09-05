@@ -258,11 +258,15 @@ func (s *Server) mergeNodesResponse(r *http.Request) func([]backendResult) []jso
 func (s *Server) mergeFactsResponse(r *http.Request) func([]backendResult) []json.RawMessage {
 	inject := s.newSourceInjector(r.URL.Query().Get("query"), true)
 	return func(results []backendResult) []json.RawMessage {
+		var merged []json.RawMessage
 		if s.cfg.Merge == mergeStatic {
-			return mergeFacts(results, nil, inject)
+			merged = mergeFacts(results, nil, inject)
+		} else {
+			fresh := s.freshnessMap(context.Background(), results)
+			merged = mergeFacts(results, func(cn string) string { return fresh[cn] }, inject)
 		}
-		fresh := s.freshnessMap(context.Background(), results)
-		return mergeFacts(results, func(cn string) string { return fresh[cn] }, inject)
+		inject.logSuppressed(s.log)
+		return merged
 	}
 }
 
