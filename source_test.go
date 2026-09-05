@@ -302,6 +302,32 @@ func TestHandler_SourceDisabledKeepsUpstreamFact(t *testing.T) {
 	}
 }
 
+// Suppression matches a record's own name field, so rows from a projection that
+// filters on name without returning it are not self-identifying and pass
+// through. Pinned as a known limit of the guarantee, and documented as one.
+func TestHandler_ProjectionWithoutNameColumnCarriesUpstreamValue(t *testing.T) {
+	a := newFakeBackend(t, `[`+node("h1", "2026-07-20T00:00:00Z")+`]`, `[]`)
+	b := newFakeBackend(t, `[]`, `[]`)
+	a.bodies[factsPath] = `[{"certname":"h1","value":"upstream-value"}]`
+	var buf bytes.Buffer
+	srv := NewServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic), log.New(&buf, "", 0))
+
+	rec := doGet(t, srv.Handler(), factsPath,
+		`["extract",["certname","value"],["=","name","`+defaultSourceFact+`"]]`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Body.String(); !strings.Contains(got, "upstream-value") {
+		t.Errorf("unidentifiable row was dropped: %s", got)
+	}
+	if strings.Contains(buf.String(), "dropped") {
+		t.Errorf("a row with no name field was counted as suppressed: %s", buf.String())
+	}
+	if _, n := sourceValues(t, rec.Body.Bytes(), defaultSourceFact); n != 0 {
+		t.Errorf("gated projection gained %d synthetic records: %s", n, rec.Body.String())
+	}
+}
+
 // Covers only that an aggregate /facts response gains no synthetic record and no
 // rewritten row. It does not cover whether the aggregate rows are correct:
 // /facts has no parseAggregate branch, so its rows take the certname merge
@@ -427,6 +453,11 @@ func TestInjectable(t *testing.T) {
 		{"nested extract on nodes", `["and",["extract",["certname"]]]`, false, false},
 		// An extract inside an `in` operand projects the subquery, not the response.
 		{"extract under in stays injectable", `["in","certname",["extract",["certname"],["select_facts",["=","name","os"]]]]`, true, true},
+		// `subquery` is rewritten to ["in" ... ["extract" ... ["select_x" ...]]]
+		// before any plan node is built, so its operand is subquery-scoped too.
+		{"subquery operand stays injectable", `["and",["=","certname","h1"],["subquery","facts",["extract",["certname"],["=","name","os"]]]]`, true, true},
+		{"bare subquery stays injectable", `["subquery","facts",["extract",["certname"]]]`, true, true},
+		{"extract under select_facts stays injectable", `["and",["select_facts",["extract",["certname"]]]]`, true, true},
 		{"nodes name filter is not a fact filter", `["=","name","os"]`, false, true},
 		{"nodes extract", `["extract",["certname"]]`, false, false},
 		{"unparseable query", `not json`, true, false},

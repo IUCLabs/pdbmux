@@ -114,22 +114,26 @@ attributes a shared node to the first backend in configured order, while
 `/nodes` always attributes it to the backend holding the newer
 `report_timestamp`. Each answer describes the record it is attached to.
 
-While the fact is enabled the configured name is `pdbmux`'s alone. A `/facts`
-record of that name coming from a backend is **always dropped**, on every query
-shape — including the shapes below, where nothing is injected in its place — so
-the fact means exactly one thing and a node never carries two of it. Each request
-that drops one logs it once. Only `source_fact_enabled: false` restores upstream
+While the fact is enabled, any `/facts` record whose own `name` field equals the
+configured name is dropped, on every query shape — including the shapes below,
+where nothing is injected in its place. The rule reads the record, not the query,
+so a projection that filters on `name` without returning it — say
+`["extract",["certname","value"],["=","name","pdbmux_source"]]` — produces rows
+that no longer identify themselves, and an upstream value of that name comes
+through. Ask for the `name` column and the guarantee holds. Each request that
+drops a record logs it once. Only `source_fact_enabled: false` restores upstream
 records of that name; rename the synthetic fact via `source_fact` if the real one
 matters more.
 
 **Injection is skipped**, and no synthetic record is added, when:
 
-- the query contains an `extract` anywhere outside an `in` subquery — it projects
-  a column subset, and with a `["function", ...]` column it aggregates. Injecting
-  there would break the row shape or silently inflate a `count()`, so **aggregate
+- the query contains an `extract` outside a subquery — it projects a column
+  subset, and with a `["function", ...]` column it aggregates. Injecting there
+  would break the row shape or silently inflate a `count()`, so **aggregate
   results are never changed**. The whole query is walked, so an `extract` nested
-  under `and`/`or`/`not`/`from` skips injection too; an `extract` inside an `in`
-  operand projects the subquery rather than the response, so it does not;
+  under `and`/`or`/`not`/`from` skips injection too; an `extract` under `in`,
+  `subquery`, or `select_<entity>` projects that subquery rather than the
+  response, so it does not;
 - the query is not an AST array — every **PQL-syntax** query (`facts { certname
   = "web1" }`) lands here. `pdbmux` cannot tell what such a query projects, so it
   never injects into a PQL response. Use the AST form to get the fact;

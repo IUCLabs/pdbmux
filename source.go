@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"log"
+	"strings"
 )
 
 // sourceInjector owns the configured fact name for one request. A nil
@@ -25,9 +26,10 @@ func (s *Server) newSourceInjector(query string, factEntity bool) *sourceInjecto
 	return &sourceInjector{name: s.cfg.SourceFact, inject: injectable(query, factEntity)}
 }
 
-// claims reports whether an upstream record carries the name pdbmux owns. While
-// the feature is enabled the name means one thing on every query shape, so such
-// a record is dropped even when the query gate has ruled synthesis out.
+// claims reports whether an upstream record carries the name pdbmux owns, and is
+// keyed on the record's own name field: a projection that omits the name column
+// yields records that cannot be identified, so they pass through. Suppression
+// does not depend on the query gate.
 func (si *sourceInjector) claims(factName string) bool {
 	return si != nil && factName != "" && factName == si.name
 }
@@ -95,7 +97,8 @@ func (si *sourceInjector) stamp(raw json.RawMessage, backend string) json.RawMes
 //     pdbmux cannot tell what it projects, so it changes nothing;
 //   - an `extract` anywhere in the query's own projection scope, which projects a
 //     column subset and, with a `["function", ...]` column, aggregates — injecting
-//     there would corrupt the row shape or silently inflate a count();
+//     there would corrupt the row shape or silently inflate a count(). Operands
+//     scoped to a subquery are excluded; see hasExtract;
 //   - on the facts entity, any outer constraint on `name`, which selects
 //     specific facts. Subquery operands are not descended into: they choose which
 //     nodes match, not which facts come back.
@@ -125,11 +128,18 @@ func injectable(query string, factEntity bool) bool {
 // projection scope. openvoxdb accepts an extract as an operand of a boolean
 // operator — engine.clj's user-node->plan-node sends every and/or/not operand
 // back through itself (src/puppetlabs/puppetdb/query_eng/engine.clj:2697-2733)
-// and valid-operator? lists "extract" (:2780-2784) — so the row shape can be
+// and valid-operator? lists "extract" (:2779-2784) — so the row shape can be
 // rewritten below the top level, and the whole tree is walked to fail closed.
-// `in` is the one operator not descended into: its operand becomes
-// InExpression's :subquery (:2705-2712), projecting the subquery rather than
-// the response.
+//
+// Operators whose operand is scoped to a subquery are not descended into,
+// because an extract there projects the subquery rather than the response:
+//
+//   - `in`, whose operand becomes InExpression's :subquery (:2705-2712);
+//   - `subquery`, which the AST-rewrite stage expands into
+//     ["in" cols ["extract" cols ["select_<entity>" expr]]] (:2111-2123)
+//     before any plan node is built;
+//   - `select_<entity>`, the explicit subquery form (:1889-1911), reachable
+//     only under one of the two above in a query openvoxdb accepts.
 func hasExtract(parts []json.RawMessage) bool {
 	if len(parts) == 0 {
 		return false
@@ -138,10 +148,10 @@ func hasExtract(parts []json.RawMessage) bool {
 	if json.Unmarshal(parts[0], &op) != nil {
 		return false
 	}
-	switch op {
-	case "extract":
+	switch {
+	case op == "extract":
 		return true
-	case "in":
+	case op == "in", op == "subquery", strings.HasPrefix(op, "select_"):
 		return false
 	}
 	for _, p := range parts[1:] {
