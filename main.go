@@ -1,4 +1,4 @@
-// Command pdbmux serves one merged PuppetDB v4 query surface over two PuppetDBs.
+// Command pdbmux is a small merging HTTP proxy over several PuppetDB backends.
 package main
 
 import (
@@ -48,11 +48,11 @@ func main() {
 
 	root := &cobra.Command{
 		Use:   appName,
-		Short: "Merging HTTP proxy over two PuppetDB backends.",
-		Long: "pdbmux presents a single merged PuppetDB v4 query surface over the old\n" +
-			"(VM) and new (k8s) PuppetDBs during the migration, so PuppetDB clients\n" +
-			"and Puppetboard see one consistent view. Running pdbmux with\n" +
-			"no subcommand (or `pdbmux serve`) starts the proxy.",
+		Short: "Merging HTTP proxy over several PuppetDB backends.",
+		Long: "pdbmux presents a single merged PuppetDB v4 query surface over several\n" +
+			"PuppetDB backends, so clients see one consistent view of nodes, facts and\n" +
+			"reports spanning all of them. Running pdbmux with no subcommand (or\n" +
+			"`pdbmux serve`) starts the proxy.",
 		SilenceUsage: true,
 		RunE:         func(cmd *cobra.Command, args []string) error { return serve(cmd) },
 	}

@@ -16,14 +16,16 @@ const (
 	configFileName = "config.yaml"
 	envPrefix      = "PDBMUX_"
 
-	defaultListen  = ":8080"
-	defaultOldURL  = "http://puppetdb.example.com:8080"
-	defaultNewURL  = "https://puppetdb.k8s.example.net"
-	defaultPrimary = "new"
+	defaultListen = ":8080"
 
 	defaultTimeout      = 10 * time.Second
 	defaultFreshnessTTL = 30 * time.Second
 )
+
+var exampleBackends = []Backend{
+	{Name: "primary", URL: "http://puppetdb1.example.com:8080"},
+	{Name: "secondary", URL: "http://puppetdb2.example.com:8080"},
+}
 
 type Backend struct {
 	Name string `yaml:"name"`
@@ -47,17 +49,19 @@ const (
 
 func DefaultConfig() Config {
 	return Config{
-		Listen: defaultListen,
-		Backends: []Backend{
-			{Name: "old", URL: defaultOldURL},
-			{Name: "new", URL: defaultNewURL},
-		},
-		Primary:      defaultPrimary,
+		Listen:       defaultListen,
 		Merge:        mergeFreshness,
-		Prefer:       defaultPrimary,
 		Timeout:      defaultTimeout,
 		FreshnessTTL: defaultFreshnessTTL,
 	}
+}
+
+func ExampleConfig() Config {
+	cfg := DefaultConfig()
+	cfg.Backends = append([]Backend(nil), exampleBackends...)
+	cfg.Primary = exampleBackends[0].Name
+	cfg.Prefer = exampleBackends[0].Name
+	return cfg
 }
 
 func ConfigDir() string {
@@ -89,10 +93,7 @@ func Load() (Config, error) {
 	}
 
 	applyEnv(&cfg, os.Getenv)
-
-	if err := cfg.Validate(); err != nil {
-		return cfg, err
-	}
+	cfg.normalize()
 	return cfg, nil
 }
 
@@ -144,9 +145,22 @@ func parseBackends(s string) []Backend {
 	return out
 }
 
+func (c *Config) normalize() {
+	if len(c.Backends) == 0 {
+		return
+	}
+	if c.Primary == "" {
+		c.Primary = c.Backends[0].Name
+	}
+	if c.Prefer == "" {
+		c.Prefer = c.Backends[0].Name
+	}
+}
+
 func (c Config) Validate() error {
 	if len(c.Backends) == 0 {
-		return fmt.Errorf("no backends configured")
+		return fmt.Errorf("no backends configured: set %sBACKENDS to \"name=url,name=url\" or add a backends list to %s",
+			envPrefix, ConfigPath())
 	}
 	seen := map[string]bool{}
 	for _, b := range c.Backends {
@@ -193,9 +207,10 @@ func writeDefaultConfig() error {
 	if _, err := os.Stat(path); err == nil {
 		return fmt.Errorf("config already exists at %s", path)
 	}
-	data, _ := yaml.Marshal(DefaultConfig())
+	data, _ := yaml.Marshal(ExampleConfig())
 	header := []byte("# pdbmux configuration\n" +
-		"# A merging proxy over two PuppetDBs (old VM + new k8s) during migration.\n" +
+		"# A merging proxy presenting one PuppetDB v4 query surface over several\n" +
+		"# PuppetDB backends. The backend URLs below are placeholders — edit them.\n" +
 		"# Env overrides: PDBMUX_LISTEN, PDBMUX_PRIMARY, PDBMUX_MERGE, PDBMUX_PREFER,\n" +
 		"#   PDBMUX_TIMEOUT, PDBMUX_FRESHNESS_TTL, PDBMUX_BACKENDS (name=url,name=url).\n\n")
 	if err := os.WriteFile(path, append(header, data...), 0o644); err != nil {

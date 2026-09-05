@@ -1,21 +1,23 @@
 # pdbmux — merging PuppetDB proxy
 
-`pdbmux` is a small HTTP daemon that fronts **two** PuppetDB backends and serves
-a single, merged PuppetDB v4 query surface on one address. Point a PuppetDB client,
-Puppetboard, or anything else at `pdbmux` instead of a raw
-PuppetDB and it sees one consistent view spanning both.
+`pdbmux` is a small HTTP daemon that fronts **several** PuppetDB backends and
+serves a single, merged PuppetDB v4 query surface on one address. Point
+Puppetboard, or any other PuppetDB API client, at `pdbmux` instead of a raw
+PuppetDB and it sees one consistent view spanning all of them.
 
 ## Why
 
-During the VM→k8s Puppet migration there are two PuppetDBs:
+Running more than one PuppetDB — during a migration between two of them, or
+across regions — means a given node's current data lives in exactly one at any
+moment, and consumers have to know which, or query each in turn. Consider two
+backends being merged during a migration:
 
-- **old** — the legacy VM-registered `http://puppetdb.example.com:8080`
-- **new** — the k8s `https://puppetdb.k8s.example.net` (TLS terminated at
-  the gateway; backends are plain PuppetDB on 8080)
+- **old** — the PuppetDB nodes are moving off, e.g. `http://puppetdb1.example.com:8080`
+- **new** — the PuppetDB nodes are moving on to, e.g. `http://puppetdb2.example.com:8080`
 
-Nodes move from old to new as they migrate, so at any moment a given node's
-current data lives in exactly one of them. `pdbmux` merges both so consumers
+Nodes move from old to new as they migrate. `pdbmux` merges both so consumers
 don't have to know (or query twice) which PuppetDB a node currently lives in.
+The backend names are arbitrary labels; there is no fixed number of backends.
 
 ## Endpoints
 
@@ -24,16 +26,16 @@ not PQL) is forwarded verbatim.
 
 | Path | Behaviour |
 |---|---|
-| `GET /pdb/query/v4/nodes` | Fan out to both backends, dedupe by `certname`, keep the record with the newer `report_timestamp`. |
-| `GET /pdb/query/v4/facts` | Fan out to both, and per `certname` keep **all** facts from the backend that owns that node (see merge semantics). |
-| `GET /pdb/query/v4/reports` | Fan out to both and serve the **union**, deduped by report `hash`, re-ordered and re-paged across the two backends. |
-| `GET /pdb/query/v4/events` | Fan out to both and serve the **union**, deduped by record identity, re-ordered and re-paged. |
-| `GET /pdb/query/v4/reports/<hash>/{events,logs,metrics}` | Ask both; serve the answer from whichever backend actually holds that report. `404` when neither does. |
+| `GET /pdb/query/v4/nodes` | Fan out to all backends, dedupe by `certname`, keep the record with the newer `report_timestamp`. |
+| `GET /pdb/query/v4/facts` | Fan out to all, and per `certname` keep **all** facts from the backend that owns that node (see merge semantics). |
+| `GET /pdb/query/v4/reports` | Fan out to all and serve the **union**, deduped by report `hash`, re-ordered and re-paged across backends. |
+| `GET /pdb/query/v4/events` | Fan out to all and serve the **union**, deduped by record identity, re-ordered and re-paged. |
+| `GET /pdb/query/v4/reports/<hash>/{events,logs,metrics}` | Ask every backend; serve the answer from whichever backend actually holds that report. `404` when neither does. |
 | `GET /pdb/query/v4/*` (any other) | Transparently proxied to the **primary** backend, unmerged, streamed verbatim. |
 | `GET /healthz` | Per-backend reachability. `200 {"status":"ok"}` if all reachable, `200 degraded` if some fail, `503 down` if all fail. |
 
 Fan-out is concurrent. If one backend errors or times out, `pdbmux` serves the
-survivor's results and logs a warning; a merged endpoint only returns `502` when
+surviving backends' results and logs a warning; a merged endpoint only returns `502` when
 **every** backend fails. Response records are passed through as raw JSON so
 unknown fields survive untouched.
 
@@ -42,12 +44,12 @@ unknown fields survive untouched.
 - **`/nodes`** — dedupe by `certname`; the record with the strictly-newer
   `report_timestamp` wins. On a tie (or when a node exists in only one backend),
   the **preferred** backend's record is kept.
-- **`/facts`** — node-level granularity. For a `certname` present in both
-  backends, `pdbmux` keeps **all** of that node's facts from **one** backend and
+- **`/facts`** — node-level granularity. For a `certname` present in more than
+  one backend, `pdbmux` keeps **all** of that node's facts from **one** backend and
   drops the other's, chosen by the merge strategy:
   - **`freshness`** (default) — attribute each `certname` to whichever backend
     holds its newer `report_timestamp`. `pdbmux` derives this from a per-certname
-    freshness map built by querying `/nodes` from both backends, cached for
+    freshness map built by querying `/nodes` from every backend, cached for
     `freshness_ttl` (default 30s). Ties/fallbacks use `prefer`.
   - **`static`** — always keep the `prefer` backend's facts for shared nodes.
     No extra `/nodes` query.
@@ -81,16 +83,16 @@ Each backend applies `order_by`/`limit`/`offset` to its own slice only, so
 
 Precedence (lowest → highest): **defaults < config file < env vars (`PDBMUX_*`) < flags**.
 
-Config file: `$XDG_CONFIG_HOME/pdbmux/config.yaml`. In Kubernetes there is no
+Config file: `$XDG_CONFIG_HOME/pdbmux/config.yaml`. In a container there is no
 config file — everything comes from `PDBMUX_*` env vars.
 
 ```yaml
 listen: ":8080"
 backends:
   - name: old
-    url: http://puppetdb.example.com:8080
+    url: http://puppetdb1.example.com:8080
   - name: new
-    url: https://puppetdb.k8s.example.net
+    url: https://puppetdb2.example.com
 primary: new          # backend used for non-merged /pdb/query/v4/* pass-through
 merge: freshness      # freshness | static
 prefer: new           # winner on ties / static merge / fallback
@@ -116,11 +118,13 @@ Flags: `--listen`, `--primary`, `--merge`.
 ## Running
 
 Subcommands: `serve` (default), `config init`, `config show`, `version`. Run
-`pdbmux --help` for details.
+`pdbmux --help` for details. Any PuppetDB v4 client works against the `pdbmux`
+base URL in place of a PuppetDB one.
 
 ```bash
-PDBMUX_BACKENDS='old=http://puppetdb.example.com:8080,new=https://puppetdb.k8s.example.net' pdbmux
-curl -s http://localhost:8080/pdb/query/v4/facts
+PDBMUX_BACKENDS='old=http://puppetdb1.example.com:8080,new=http://puppetdb2.example.com:8080' pdbmux
+curl -s --get http://localhost:8080/pdb/query/v4/nodes \
+  --data-urlencode 'query=["=","certname","host1.example.com"]'
 ```
 
 ## Build
@@ -129,10 +133,11 @@ curl -s http://localhost:8080/pdb/query/v4/facts
 
 ## Deployment
 
-Kubernetes only — no RPM. Every `v*` tag builds and pushes
-`registry.example.com/internal/pdbmux:<tag>`
-(the release pipeline); tag with `make patch` / `minor` / `major`.
+Container image only — no OS package. Every `v*` tag builds and pushes the image
+(the release pipeline); registry and repository are pipeline settings. Tag
+with `make patch` / `minor` / `major`.
 
-Manifests live in your GitOps repo (namespace `pdbmux`,
-2 replicas). Use `/healthz` for liveness/readiness probes. Reachable from VMs and
-workstations at `https://pdbmux.k8s.example.net`.
+A static (`CGO_ENABLED=0`) binary on a distroless base, configured entirely via
+`PDBMUX_*` env vars; a container needs at minimum `PDBMUX_BACKENDS`. Stateless,
+so run as many replicas as you like; use `/healthz` for liveness/readiness
+probes.
