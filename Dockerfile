@@ -1,6 +1,5 @@
-# Container image for pdbmux, the merging PuppetDB proxy daemon. pdbmux is a
-# k8s-only service (deployed via GitOps), so it ships as a distroless
-# static image rather than an RPM.
+# Container image for pdbmux, the merging PuppetDB proxy daemon. It ships only
+# as a distroless static image; there is no OS package.
 FROM golang:1.25-alpine AS builder
 
 RUN apk add --no-cache git
