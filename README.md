@@ -228,13 +228,13 @@ not answering.
   or `unknown` counts as a failure. A body that is not in that shape is judged on
   its status code alone, so pointing `health_probe_path` at some other endpoint
   still works.
-- **A refused probe is not a sick backend.** Only evidence about the *backend*
-  takes it out of the pool: a transport failure (connection refused, DNS, TLS,
+- **A refused probe is not a sick backend.** Probe replies split in two. Evidence
+  about the *backend* is a transport failure (connection refused, DNS, TLS,
   timeout), a `5xx` — `503` included, since trapperkeeper answers `503` exactly
   when its services are not nominal — or a `429`, which is the backend reporting
   its own capacity rather than judging the request, so an overloaded backend gets
   backed off instead of kept at full traffic. A reply that refuses the *probe
-  request* is evidence about the probe instead: the other `4xx` are the backend
+  request* is evidence about the probe: the other `4xx` are the backend
   answering that our request is the problem (`404`/`410` the path is not there,
   `405` it does not take a `GET`, `401`/`403` we are not allowed to ask), and
   `501` says it does not implement the endpoint.
