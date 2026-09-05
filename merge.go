@@ -6,19 +6,21 @@ import (
 )
 
 // record is a single PuppetDB result element kept as raw JSON so unknown fields
-// survive the merge untouched. certname/report_timestamp are decoded only for
-// merge decisions.
+// survive the merge untouched. certname/report_timestamp/hash are decoded only
+// for merge decisions.
 type record struct {
 	Raw             json.RawMessage
 	Certname        string
 	ReportTimestamp string // only populated for /nodes records
+	Hash            string // only populated for /reports records
 }
 
-// recordMeta is the subset we decode from any /nodes or /facts element to drive
-// merge decisions.
+// recordMeta is the subset we decode from any /nodes, /facts or /reports element
+// to drive merge decisions.
 type recordMeta struct {
 	Certname        string `json:"certname"`
 	ReportTimestamp string `json:"report_timestamp"`
+	Hash            string `json:"hash"`
 }
 
 // decodeRecords turns a raw PuppetDB JSON array into records, preserving each
@@ -36,6 +38,7 @@ func decodeRecords(body []byte) ([]record, error) {
 			Raw:             raw,
 			Certname:        m.Certname,
 			ReportTimestamp: m.ReportTimestamp,
+			Hash:            m.Hash,
 		})
 	}
 	return out, nil
