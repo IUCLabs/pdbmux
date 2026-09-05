@@ -1,21 +1,27 @@
 // Command pdbmux is a small merging HTTP proxy over several PuppetDB backends.
 //
-// When an estate runs more than one PuppetDB — during a migration, or across
-// regions — a given node's current data lives in exactly one of them. pdbmux
-// presents a single merged PuppetDB v4 query surface so clients see one
-// consistent view:
+// Running more than one PuppetDB — during a migration between them, or across
+// regions — means a given node's current data lives in exactly one of them at
+// any moment. pdbmux presents a single merged PuppetDB v4 query surface so
+// clients see one consistent view:
 //
 //   - GET /pdb/query/v4/nodes  — fan out to all backends, dedupe by certname,
 //     keep the record with the newer report_timestamp.
 //   - GET /pdb/query/v4/facts  — fan out to all, and for a certname present in
 //     more than one keep ALL facts from the backend holding that node's newer
 //     report (freshness merge) or a static preferred backend (static merge).
+//   - GET /pdb/query/v4/reports and /events — fan out to all and serve the
+//     deduped union, re-ordered and re-paged across backends, because reports
+//     are immutable history and a moved node has some in each.
+//   - GET /pdb/query/v4/reports/<hash>/{events,logs,metrics} — served by
+//     whichever backend actually holds that report.
 //   - any other GET /pdb/query/v4/* — transparently proxied to the primary.
 //   - GET /healthz — per-backend reachability.
 //
-// The query param is forwarded verbatim (PuppetDB AST JSON). If one backend
-// errors/times out, the others' results are served; only if every backend fails
-// does a merged endpoint return 502.
+// The query param is forwarded verbatim (PuppetDB AST JSON); order_by, limit,
+// offset and include_total are re-applied over the merged result set. If one
+// backend errors/times out, the others' results are served; only if every
+// backend fails does a merged endpoint return 502.
 package main
 
 import (
@@ -67,9 +73,9 @@ func main() {
 		Use:   appName,
 		Short: "Merging HTTP proxy over several PuppetDB backends.",
 		Long: "pdbmux presents a single merged PuppetDB v4 query surface over several\n" +
-			"PuppetDB backends, so clients see one consistent view of nodes and facts\n" +
-			"spanning all of them. Running pdbmux with no subcommand (or `pdbmux serve`)\n" +
-			"starts the proxy.",
+			"PuppetDB backends, so clients see one consistent view of nodes, facts and\n" +
+			"reports spanning all of them. Running pdbmux with no subcommand (or\n" +
+			"`pdbmux serve`) starts the proxy.",
 		SilenceUsage: true,
 		RunE:         func(cmd *cobra.Command, args []string) error { return serve(cmd) },
 	}
