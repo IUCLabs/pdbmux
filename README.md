@@ -2,8 +2,8 @@
 
 `pdbmux` is a small HTTP daemon that fronts **two** PuppetDB backends and serves
 a single, merged PuppetDB v4 query surface on one address. Point a PuppetDB client,
-or anything else at `pdbmux` instead of a raw PuppetDB and it
-sees one consistent view spanning both.
+Puppetboard, or anything else at `pdbmux` instead of a raw
+PuppetDB and it sees one consistent view spanning both.
 
 ## Why
 
@@ -26,6 +26,9 @@ not PQL) is forwarded verbatim.
 |---|---|
 | `GET /pdb/query/v4/nodes` | Fan out to both backends, dedupe by `certname`, keep the record with the newer `report_timestamp`. |
 | `GET /pdb/query/v4/facts` | Fan out to both, and per `certname` keep **all** facts from the backend that owns that node (see merge semantics). |
+| `GET /pdb/query/v4/reports` | Fan out to both and serve the **union**, deduped by report `hash`, re-ordered and re-paged across the two backends. |
+| `GET /pdb/query/v4/events` | Fan out to both and serve the **union**, deduped by record identity, re-ordered and re-paged. |
+| `GET /pdb/query/v4/reports/<hash>/{events,logs,metrics}` | Ask both; serve the answer from whichever backend actually holds that report. `404` when neither does. |
 | `GET /pdb/query/v4/*` (any other) | Transparently proxied to the **primary** backend, unmerged, streamed verbatim. |
 | `GET /healthz` | Per-backend reachability. `200 {"status":"ok"}` if all reachable, `200 degraded` if some fail, `503 down` if all fail. |
 
@@ -50,6 +53,29 @@ unknown fields survive untouched.
     No extra `/nodes` query.
   - A node present in only one backend always appears (falls back to whichever
     backend actually returned facts for it).
+- **`/reports`, `/events`** — **union**, not a per-node winner. Reports are
+  immutable history, so a node that migrated legitimately has reports in the old
+  PuppetDB *and* the new one and both belong in the merged view. Reports dedupe
+  on `hash`; events, which carry no id of their own, dedupe on the verbatim
+  record (a node briefly reporting to both PuppetDBs stores identical records in
+  each). Records the merge cannot key — `extract`/`group_by` aggregate rows — are
+  all kept rather than collapsed, so no backend's rows are silently dropped;
+  summing those aggregates across backends is not implemented yet.
+
+### Paging and ordering on the merged endpoints
+
+Each backend applies `order_by`/`limit`/`offset` to its own slice only, so
+`pdbmux` re-does all three over the union:
+
+- `order_by` is parsed and the merged set re-sorted by those fields (ties keep
+  backend precedence). A record missing an ordered field sorts first.
+- Backends are asked for the first `offset + limit` records — never an `offset`
+  — and the requested window is then cut from the merged, re-sorted set.
+- `include_total=true` makes `pdbmux` sum each backend's `X-Records` header into
+  one merged header. Deduped records are counted once per backend, so the total
+  is an upper bound.
+- A malformed `limit`, `offset` or `order_by` gets a `400` rather than being
+  forwarded.
 
 ## Config
 

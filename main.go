@@ -3,19 +3,26 @@
 // During the VM -> k8s Puppet migration there are two PuppetDBs — the legacy
 // VM-registered one and the new k8s one — and nodes move between them as
 // they migrate. pdbmux presents a single merged PuppetDB v4 query surface so
-// PuppetDB clients (and anything else) see one consistent view:
+// PuppetDB clients and Puppetboard (and anything else) see one
+// consistent view:
 //
 //   - GET /pdb/query/v4/nodes  — fan out to both backends, dedupe by certname,
 //     keep the record with the newer report_timestamp.
 //   - GET /pdb/query/v4/facts  — fan out to both, and for a certname present in
 //     both keep ALL facts from the backend holding that node's newer report
 //     (freshness merge) or a static preferred backend (static merge).
+//   - GET /pdb/query/v4/reports and /events — fan out to both and serve the
+//     deduped union, re-ordered and re-paged across the two backends, because
+//     reports are immutable history and a migrated node has some in each.
+//   - GET /pdb/query/v4/reports/<hash>/{events,logs,metrics} — served by
+//     whichever backend actually holds that report.
 //   - any other GET /pdb/query/v4/* — transparently proxied to the primary.
 //   - GET /healthz — per-backend reachability.
 //
-// The query param is forwarded verbatim (PuppetDB AST JSON). If one backend
-// errors/times out, the other's results are served; only if both fail does a
-// merged endpoint return 502.
+// The query param is forwarded verbatim (PuppetDB AST JSON); order_by, limit,
+// offset and include_total are re-applied over the merged result set. If one
+// backend errors/times out, the other's results are served; only if both fail
+// does a merged endpoint return 502.
 package main
 
 import (
@@ -68,8 +75,8 @@ func main() {
 		Short: "Merging HTTP proxy over two PuppetDB backends.",
 		Long: "pdbmux presents a single merged PuppetDB v4 query surface over the old\n" +
 			"(VM) and new (k8s) PuppetDBs during the migration, so PuppetDB clients\n" +
-			"see one consistent view. Running pdbmux with no subcommand\n" +
-			"(or `pdbmux serve`) starts the proxy.",
+			"and Puppetboard see one consistent view. Running pdbmux with\n" +
+			"no subcommand (or `pdbmux serve`) starts the proxy.",
 		SilenceUsage: true,
 		RunE:         func(cmd *cobra.Command, args []string) error { return serve(cmd) },
 	}

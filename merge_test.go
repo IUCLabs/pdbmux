@@ -74,6 +74,20 @@ func fact(cn, name, val, ts string) string {
 	return `{"certname":"` + cn + `","name":"` + name + `","value":"` + val + `","report_timestamp":"` + ts + `"}`
 }
 
+// report builds a /reports record with the fields the merge and ordering paths
+// care about.
+func report(cn, hash, receive string) string {
+	return `{"certname":"` + cn + `","hash":"` + hash + `","receive_time":"` + receive +
+		`","end_time":"` + receive + `","status":"changed","environment":"production"}`
+}
+
+// event builds an /events record, which carries its report's hash but no id of
+// its own.
+func event(cn, reportHash, resource string) string {
+	return `{"certname":"` + cn + `","report":"` + reportHash + `","resource_title":"` + resource +
+		`","status":"success","timestamp":"2026-07-01T00:00:00Z"}`
+}
+
 func TestMergeNodes_NewerWins(t *testing.T) {
 	old := recs(t, "old", node("h1", "2026-07-01T00:00:00Z"), node("h2", "2026-07-10T00:00:00Z"))
 	nw := recs(t, "new", node("h1", "2026-07-20T00:00:00Z"), node("h3", "2026-07-05T00:00:00Z"))
