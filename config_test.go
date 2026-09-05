@@ -14,11 +14,9 @@ import (
 func testConfigValid() Config {
 	cfg := DefaultConfig()
 	cfg.Backends = []Backend{
-		{Name: "old", URL: "http://localhost:18080"},
-		{Name: "new", URL: "http://localhost:18081"},
+		{Name: "a", URL: "http://localhost:18080"},
+		{Name: "b", URL: "http://localhost:18081"},
 	}
-	cfg.Primary = "new"
-	cfg.Prefer = "new"
 	return cfg
 }
 
@@ -56,7 +54,7 @@ func TestLoad_NoBackendsLoadsButFailsValidation(t *testing.T) {
 	}
 }
 
-func TestLoad_PrimaryDefaultsToFirstBackend(t *testing.T) {
+func TestLoad_BackendsKeepConfiguredOrder(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	clearEnv(t)
 	t.Setenv(envPrefix+"BACKENDS", "a=http://localhost:18080,b=http://localhost:18081")
@@ -65,8 +63,11 @@ func TestLoad_PrimaryDefaultsToFirstBackend(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Primary != "a" || cfg.Prefer != "a" {
-		t.Errorf("primary/prefer should default to first backend, got %q/%q", cfg.Primary, cfg.Prefer)
+	if len(cfg.Backends) != 2 || cfg.Backends[0].Name != "a" || cfg.Backends[1].Name != "b" {
+		t.Errorf("backends should keep the configured order, got %+v", cfg.Backends)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("a bare backend list must validate: %v", err)
 	}
 }
 
@@ -79,8 +80,8 @@ func TestLoad_FileAndEnvOverride(t *testing.T) {
 	if err := os.MkdirAll(cfgDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	body := "listen: :9999\nmerge: static\nprimary: old\nprefer: old\n" +
-		"backends:\n  - name: old\n    url: http://localhost:18080\n  - name: new\n    url: http://localhost:18081\n"
+	body := "listen: :9999\nmerge: static\n" +
+		"backends:\n  - name: a\n    url: http://localhost:18080\n  - name: b\n    url: http://localhost:18081\n"
 	if err := os.WriteFile(filepath.Join(cfgDir, configFileName), []byte(body), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -95,8 +96,8 @@ func TestLoad_FileAndEnvOverride(t *testing.T) {
 	if cfg.Listen != "127.0.0.1:1234" {
 		t.Errorf("env should beat file for listen, got %q", cfg.Listen)
 	}
-	if cfg.Merge != mergeStatic || cfg.Primary != "old" {
-		t.Errorf("file override failed: merge=%s primary=%s", cfg.Merge, cfg.Primary)
+	if cfg.Merge != mergeStatic {
+		t.Errorf("file override failed: merge=%s", cfg.Merge)
 	}
 }
 
@@ -104,8 +105,6 @@ func TestApplyEnv_Backends(t *testing.T) {
 	cfg := testConfigValid()
 	env := map[string]string{
 		envPrefix + "BACKENDS":      "a=http://a:8080,b=http://b:8080",
-		envPrefix + "PRIMARY":       "a",
-		envPrefix + "PREFER":        "a",
 		envPrefix + "TIMEOUT":       "3s",
 		envPrefix + "FRESHNESS_TTL": "45s",
 	}
@@ -127,10 +126,8 @@ func TestValidate(t *testing.T) {
 	}{
 		{"ok", func(*Config) {}, false},
 		{"no backends", func(c *Config) { c.Backends = nil }, true},
-		{"dup name", func(c *Config) { c.Backends = append(c.Backends, Backend{Name: "old", URL: "x"}) }, true},
+		{"dup name", func(c *Config) { c.Backends = append(c.Backends, Backend{Name: "a", URL: "x"}) }, true},
 		{"missing url", func(c *Config) { c.Backends[0].URL = "" }, true},
-		{"primary not a backend", func(c *Config) { c.Primary = "ghost" }, true},
-		{"prefer not a backend", func(c *Config) { c.Prefer = "ghost" }, true},
 		{"bad merge", func(c *Config) { c.Merge = "wrong" }, true},
 		{"zero timeout", func(c *Config) { c.Timeout = 0 }, true},
 	}
@@ -156,13 +153,6 @@ func TestParseBackends(t *testing.T) {
 	}
 }
 
-func TestPrimaryBackend(t *testing.T) {
-	cfg := testConfigValid()
-	if got, want := cfg.PrimaryBackend().URL, cfg.Backends[1].URL; got != want {
-		t.Errorf("primary backend URL = %q, want %q", got, want)
-	}
-}
-
 func TestExampleConfig_IsValidAndNeutral(t *testing.T) {
 	cfg := ExampleConfig()
 	if err := cfg.Validate(); err != nil {
@@ -175,8 +165,8 @@ func TestExampleConfig_IsValidAndNeutral(t *testing.T) {
 	}
 }
 
-const testConfigBody = "listen: \":9999\"\nmerge: static\nprimary: old\nprefer: old\n" +
-	"backends:\n  - name: old\n    url: http://localhost:18080\n  - name: new\n    url: http://localhost:18081\n"
+const testConfigBody = "listen: \":9999\"\nmerge: static\n" +
+	"backends:\n  - name: a\n    url: http://localhost:18080\n  - name: b\n    url: http://localhost:18081\n"
 
 func writeConfigFile(t *testing.T, path string) {
 	t.Helper()
@@ -401,7 +391,7 @@ func captureStdout(t *testing.T, f func()) string {
 
 func clearEnv(t *testing.T) {
 	t.Helper()
-	for _, k := range []string{"CONFIG", "LISTEN", "PRIMARY", "MERGE", "PREFER", "TIMEOUT", "FRESHNESS_TTL", "BACKENDS"} {
+	for _, k := range []string{"CONFIG", "LISTEN", "MERGE", "TIMEOUT", "FRESHNESS_TTL", "BACKENDS"} {
 		t.Setenv(envPrefix+k, "")
 	}
 }

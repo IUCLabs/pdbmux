@@ -119,13 +119,11 @@ func truncate(t *testing.T, body, limit string) string {
 	return string(out)
 }
 
-func testConfig(oldURL, newURL, merge string) Config {
+func testConfig(aURL, bURL, merge string) Config {
 	return Config{
 		Listen:       ":0",
-		Backends:     []Backend{{Name: "old", URL: oldURL}, {Name: "new", URL: newURL}},
-		Primary:      "new",
+		Backends:     []Backend{{Name: "a", URL: aURL}, {Name: "b", URL: bURL}},
 		Merge:        merge,
-		Prefer:       "new",
 		Timeout:      2 * time.Second,
 		FreshnessTTL: 30 * time.Second,
 	}
@@ -148,11 +146,11 @@ func doGet(t *testing.T, h http.Handler, path, query string) *httptest.ResponseR
 }
 
 func TestHandler_NodesMerged(t *testing.T) {
-	old := newFakeBackend(t,
+	a := newFakeBackend(t,
 		`[`+node("h1", "2026-07-01T00:00:00Z")+`,`+node("h2", "2026-07-10T00:00:00Z")+`]`, `[]`)
-	nw := newFakeBackend(t,
+	b := newFakeBackend(t,
 		`[`+node("h1", "2026-07-20T00:00:00Z")+`]`, `[]`)
-	srv := newTestServer(testConfig(old.srv.URL, nw.srv.URL, mergeStatic))
+	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic))
 
 	rec := doGet(t, srv.Handler(), nodesPath, `["=","certname","h1"]`)
 	if rec.Code != http.StatusOK {
@@ -167,76 +165,78 @@ func TestHandler_NodesMerged(t *testing.T) {
 	}
 	for _, m := range got {
 		if m.Certname == "h1" && m.ReportTimestamp != "2026-07-20T00:00:00Z" {
-			t.Errorf("h1 should be new's newer record, got %s", m.ReportTimestamp)
+			t.Errorf("h1 should be the newer record, got %s", m.ReportTimestamp)
 		}
 	}
 }
 
 func TestHandler_QueryPassthrough(t *testing.T) {
-	old := newFakeBackend(t, `[]`, `[]`)
-	nw := newFakeBackend(t, `[]`, `[]`)
-	srv := newTestServer(testConfig(old.srv.URL, nw.srv.URL, mergeStatic))
+	a := newFakeBackend(t, `[]`, `[]`)
+	b := newFakeBackend(t, `[]`, `[]`)
+	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic))
 
 	q := `["=","certname","abc.example.net"]`
 	doGet(t, srv.Handler(), factsPath, q)
-	if old.gotQuery(factsPath) != q {
-		t.Errorf("old backend got query %q, want %q", old.gotQuery(factsPath), q)
+	if a.gotQuery(factsPath) != q {
+		t.Errorf("a backend got query %q, want %q", a.gotQuery(factsPath), q)
 	}
-	if nw.gotQuery(factsPath) != q {
-		t.Errorf("new backend got query %q, want %q", nw.gotQuery(factsPath), q)
+	if b.gotQuery(factsPath) != q {
+		t.Errorf("b backend got query %q, want %q", b.gotQuery(factsPath), q)
 	}
 }
 
 func TestHandler_FactsStaticMerge(t *testing.T) {
-	old := newFakeBackend(t, `[]`,
-		`[`+fact("h1", "role", "web-old", "")+`,`+fact("h2", "role", "db-old", "")+`]`)
-	nw := newFakeBackend(t, `[]`,
-		`[`+fact("h1", "role", "web-new", "")+`]`)
-	srv := newTestServer(testConfig(old.srv.URL, nw.srv.URL, mergeStatic))
+	// Static merge ignores timestamps: a shared certname resolves to the first
+	// backend in configured order that holds it.
+	a := newFakeBackend(t, `[]`,
+		`[`+fact("h1", "role", "web-a", "")+`,`+fact("h2", "role", "db-a", "")+`]`)
+	b := newFakeBackend(t, `[]`,
+		`[`+fact("h1", "role", "web-b", "")+`,`+fact("h3", "role", "db-b", "")+`]`)
+	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic))
 
 	rec := doGet(t, srv.Handler(), factsPath, `["=","name","role"]`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status %d", rec.Code)
 	}
 	body := rec.Body.String()
-	if !strings.Contains(body, "web-new") || strings.Contains(body, "web-old") {
-		t.Errorf("static prefer=new should keep web-new, drop web-old: %s", body)
+	if !strings.Contains(body, "web-a") || strings.Contains(body, "web-b") {
+		t.Errorf("h1 should resolve to the first backend holding it: %s", body)
 	}
-	if !strings.Contains(body, "db-old") {
-		t.Errorf("h2 only in old should survive: %s", body)
+	if !strings.Contains(body, "db-a") || !strings.Contains(body, "db-b") {
+		t.Errorf("nodes held by only one backend must all survive: %s", body)
 	}
 }
 
 func TestHandler_FactsFreshnessMerge(t *testing.T) {
-	// Freshness: old holds h1's newer report; new holds h2's newer report.
-	old := newFakeBackend(t,
+	// Freshness: a holds h1's newer report; b holds h2's newer report.
+	a := newFakeBackend(t,
 		`[`+node("h1", "2026-07-20T00:00:00Z")+`,`+node("h2", "2026-07-01T00:00:00Z")+`]`,
-		`[`+fact("h1", "role", "web-old", "")+`,`+fact("h2", "role", "db-old", "")+`]`)
-	nw := newFakeBackend(t,
+		`[`+fact("h1", "role", "web-a", "")+`,`+fact("h2", "role", "db-a", "")+`]`)
+	b := newFakeBackend(t,
 		`[`+node("h1", "2026-07-01T00:00:00Z")+`,`+node("h2", "2026-07-20T00:00:00Z")+`]`,
-		`[`+fact("h1", "role", "web-new", "")+`,`+fact("h2", "role", "db-new", "")+`]`)
-	srv := newTestServer(testConfig(old.srv.URL, nw.srv.URL, mergeFreshness))
+		`[`+fact("h1", "role", "web-b", "")+`,`+fact("h2", "role", "db-b", "")+`]`)
+	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeFreshness))
 
 	rec := doGet(t, srv.Handler(), factsPath, `["=","name","role"]`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
 	}
 	body := rec.Body.String()
-	// h1 -> old (newer report there); h2 -> new.
-	if !strings.Contains(body, "web-old") || strings.Contains(body, "web-new") {
-		t.Errorf("h1 should resolve to old: %s", body)
+	// h1 -> a (newer report there); h2 -> b.
+	if !strings.Contains(body, "web-a") || strings.Contains(body, "web-b") {
+		t.Errorf("h1 should resolve to a: %s", body)
 	}
-	if !strings.Contains(body, "db-new") || strings.Contains(body, "db-old") {
-		t.Errorf("h2 should resolve to new: %s", body)
+	if !strings.Contains(body, "db-b") || strings.Contains(body, "db-a") {
+		t.Errorf("h2 should resolve to b: %s", body)
 	}
 }
 
 func TestHandler_OneBackendDown(t *testing.T) {
-	old := newFakeBackend(t, `[]`, `[]`)
-	old.fail = true
-	nw := newFakeBackend(t,
+	a := newFakeBackend(t, `[]`, `[]`)
+	a.fail = true
+	b := newFakeBackend(t,
 		`[`+node("h1", "2026-07-20T00:00:00Z")+`]`, `[]`)
-	srv := newTestServer(testConfig(old.srv.URL, nw.srv.URL, mergeStatic))
+	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic))
 
 	rec := doGet(t, srv.Handler(), nodesPath, "")
 	if rec.Code != http.StatusOK {
@@ -248,10 +248,10 @@ func TestHandler_OneBackendDown(t *testing.T) {
 }
 
 func TestHandler_BothBackendsDown(t *testing.T) {
-	old := newFakeBackend(t, `[]`, `[]`)
-	nw := newFakeBackend(t, `[]`, `[]`)
-	old.fail, nw.fail = true, true
-	srv := newTestServer(testConfig(old.srv.URL, nw.srv.URL, mergeStatic))
+	a := newFakeBackend(t, `[]`, `[]`)
+	b := newFakeBackend(t, `[]`, `[]`)
+	a.fail, b.fail = true, true
+	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic))
 
 	rec := doGet(t, srv.Handler(), nodesPath, "")
 	if rec.Code != http.StatusBadGateway {
@@ -259,11 +259,12 @@ func TestHandler_BothBackendsDown(t *testing.T) {
 	}
 }
 
-func TestHandler_PassThroughToPrimary(t *testing.T) {
-	// A non-merged v4 path (e.g. /resources) goes only to the primary (new).
-	old := newFakeBackend(t, `[]`, `[]`)
-	nw := newFakeBackend(t, `[]`, `[]`)
-	srv := newTestServer(testConfig(old.srv.URL, nw.srv.URL, mergeStatic))
+func TestHandler_PassThroughFirstAnswer(t *testing.T) {
+	// A path with no merge rule (e.g. /resources) is served by the first backend
+	// that answers; the rest are not asked at all.
+	a := newFakeBackend(t, `[]`, `[]`)
+	b := newFakeBackend(t, `[]`, `[]`)
+	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic))
 
 	const path = "/pdb/query/v4/resources"
 	rec := doGet(t, srv.Handler(), path, `["=","certname","h1"]`)
@@ -273,19 +274,51 @@ func TestHandler_PassThroughToPrimary(t *testing.T) {
 	if !strings.Contains(rec.Body.String(), path) {
 		t.Errorf("expected pass-through body, got %s", rec.Body.String())
 	}
-	// Only primary (new) should have been queried.
-	if _, hit := old.params(path); hit {
-		t.Errorf("non-primary backend should not be queried for pass-through")
+	if _, hit := a.params(path); !hit {
+		t.Errorf("first backend should be queried for pass-through")
 	}
-	if _, hit := nw.params(path); !hit {
-		t.Errorf("primary backend should be queried for pass-through")
+	if _, hit := b.params(path); hit {
+		t.Errorf("later backends should not be queried once one answers")
+	}
+}
+
+func TestHandler_PassThroughFallsBackToNextBackend(t *testing.T) {
+	a := newFakeBackend(t, `[]`, `[]`)
+	a.fail = true
+	b := newFakeBackend(t, `[]`, `[]`)
+	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic))
+
+	const path = "/pdb/query/v4/resources"
+	rec := doGet(t, srv.Handler(), path, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected the surviving backend to serve it, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), path) {
+		t.Errorf("expected pass-through body, got %s", rec.Body.String())
+	}
+}
+
+func TestHandler_PassThroughReplaysUpstreamError(t *testing.T) {
+	// Every backend rejects it, so PuppetDB's own status reaches the client
+	// rather than a synthetic 502.
+	a := newFakeBackend(t, `[]`, `[]`)
+	b := newFakeBackend(t, `[]`, `[]`)
+	a.fail, b.fail = true, true
+	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic))
+
+	rec := doGet(t, srv.Handler(), "/pdb/query/v4/resources", "")
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("expected the upstream 500 replayed, got %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "boom") {
+		t.Errorf("expected the upstream body, got %s", rec.Body.String())
 	}
 }
 
 func TestHandler_PostRejected(t *testing.T) {
-	old := newFakeBackend(t, `[]`, `[]`)
-	nw := newFakeBackend(t, `[]`, `[]`)
-	srv := newTestServer(testConfig(old.srv.URL, nw.srv.URL, mergeStatic))
+	a := newFakeBackend(t, `[]`, `[]`)
+	b := newFakeBackend(t, `[]`, `[]`)
+	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic))
 	req := httptest.NewRequest(http.MethodPost, factsPath, nil)
 	rec := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rec, req)
@@ -295,9 +328,9 @@ func TestHandler_PostRejected(t *testing.T) {
 }
 
 func TestHandler_Health(t *testing.T) {
-	old := newFakeBackend(t, `[]`, `[]`)
-	nw := newFakeBackend(t, `[]`, `[]`)
-	srv := newTestServer(testConfig(old.srv.URL, nw.srv.URL, mergeStatic))
+	a := newFakeBackend(t, `[]`, `[]`)
+	b := newFakeBackend(t, `[]`, `[]`)
+	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic))
 
 	rec := doGet(t, srv.Handler(), "/healthz", "")
 	if rec.Code != http.StatusOK {
@@ -307,16 +340,16 @@ func TestHandler_Health(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &hr); err != nil {
 		t.Fatal(err)
 	}
-	if hr.Status != "ok" || hr.Backends["old"] != "ok" || hr.Backends["new"] != "ok" {
+	if hr.Status != "ok" || hr.Backends["a"] != "ok" || hr.Backends["b"] != "ok" {
 		t.Fatalf("unexpected health: %+v", hr)
 	}
 }
 
 func TestHandler_HealthDegradedAndDown(t *testing.T) {
-	old := newFakeBackend(t, `[]`, `[]`)
-	nw := newFakeBackend(t, `[]`, `[]`)
-	old.fail = true
-	srv := newTestServer(testConfig(old.srv.URL, nw.srv.URL, mergeStatic))
+	a := newFakeBackend(t, `[]`, `[]`)
+	b := newFakeBackend(t, `[]`, `[]`)
+	a.fail = true
+	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic))
 
 	rec := doGet(t, srv.Handler(), "/healthz", "")
 	var hr healthReport
@@ -328,7 +361,7 @@ func TestHandler_HealthDegradedAndDown(t *testing.T) {
 		t.Errorf("degraded should still be 200, got %d", rec.Code)
 	}
 
-	nw.fail = true
+	b.fail = true
 	rec = doGet(t, srv.Handler(), "/healthz", "")
 	_ = json.Unmarshal(rec.Body.Bytes(), &hr)
 	if hr.Status != "down" || rec.Code != http.StatusServiceUnavailable {
@@ -337,21 +370,21 @@ func TestHandler_HealthDegradedAndDown(t *testing.T) {
 }
 
 func TestFreshnessCache_Reused(t *testing.T) {
-	old := newFakeBackend(t,
+	a := newFakeBackend(t,
 		`[`+node("h1", "2026-07-20T00:00:00Z")+`]`,
-		`[`+fact("h1", "role", "web-old", "")+`]`)
-	nw := newFakeBackend(t,
+		`[`+fact("h1", "role", "web-a", "")+`]`)
+	b := newFakeBackend(t,
 		`[`+node("h1", "2026-07-01T00:00:00Z")+`]`,
-		`[`+fact("h1", "role", "web-new", "")+`]`)
-	srv := newTestServer(testConfig(old.srv.URL, nw.srv.URL, mergeFreshness))
+		`[`+fact("h1", "role", "web-b", "")+`]`)
+	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeFreshness))
 
 	// Two facts queries; the freshness /nodes probe should be cached after the
 	// first, so query recording only reflects the last observed nodes query but
-	// results stay consistent (h1 -> old).
+	// results stay consistent (h1 -> a).
 	for i := 0; i < 2; i++ {
 		rec := doGet(t, srv.Handler(), factsPath, `["=","name","role"]`)
-		if !strings.Contains(rec.Body.String(), "web-old") {
-			t.Fatalf("iteration %d: expected h1->old, got %s", i, rec.Body.String())
+		if !strings.Contains(rec.Body.String(), "web-a") {
+			t.Fatalf("iteration %d: expected h1->a, got %s", i, rec.Body.String())
 		}
 	}
 }
@@ -383,15 +416,15 @@ func hashes(t *testing.T, body []byte) []string {
 const receiveDesc = `[{"field":"receive_time","order":"desc"}]`
 
 func TestHandler_ReportsUnioned(t *testing.T) {
-	// h1 migrated: its pre-migration reports are in old, later ones in new.
+	// h1 moved between backends: earlier reports are in a, later ones in b.
 	// Both must show up, unlike /facts where one backend wins the node.
-	old := newFakeBackend(t, `[]`, `[]`)
-	old.bodies[reportsPath] = `[` + report("h1", "r2", "2026-07-10T00:00:00Z") + `,` +
+	a := newFakeBackend(t, `[]`, `[]`)
+	a.bodies[reportsPath] = `[` + report("h1", "r2", "2026-07-10T00:00:00Z") + `,` +
 		report("h1", "r1", "2026-07-01T00:00:00Z") + `]`
-	nw := newFakeBackend(t, `[]`, `[]`)
-	nw.bodies[reportsPath] = `[` + report("h1", "r4", "2026-07-30T00:00:00Z") + `,` +
+	b := newFakeBackend(t, `[]`, `[]`)
+	b.bodies[reportsPath] = `[` + report("h1", "r4", "2026-07-30T00:00:00Z") + `,` +
 		report("h1", "r3", "2026-07-20T00:00:00Z") + `]`
-	srv := newTestServer(testConfig(old.srv.URL, nw.srv.URL, mergeStatic))
+	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic))
 
 	rec := doGetParams(t, srv.Handler(), reportsPath, url.Values{
 		"query":    {`["=","certname","h1"]`},
@@ -411,11 +444,11 @@ func TestHandler_ReportsDedupedByHash(t *testing.T) {
 	// A node reporting to both PuppetDBs mid-migration stores the same report
 	// hash in each; the merged view must show it once.
 	dup := report("h1", "r1", "2026-07-01T00:00:00Z")
-	old := newFakeBackend(t, `[]`, `[]`)
-	old.bodies[reportsPath] = `[` + dup + `]`
-	nw := newFakeBackend(t, `[]`, `[]`)
-	nw.bodies[reportsPath] = `[` + dup + `]`
-	srv := newTestServer(testConfig(old.srv.URL, nw.srv.URL, mergeStatic))
+	a := newFakeBackend(t, `[]`, `[]`)
+	a.bodies[reportsPath] = `[` + dup + `]`
+	b := newFakeBackend(t, `[]`, `[]`)
+	b.bodies[reportsPath] = `[` + dup + `]`
+	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic))
 
 	rec := doGetParams(t, srv.Handler(), reportsPath, nil)
 	if got := hashes(t, rec.Body.Bytes()); !slices.Equal(got, []string{"r1"}) {
@@ -424,15 +457,15 @@ func TestHandler_ReportsDedupedByHash(t *testing.T) {
 }
 
 func TestHandler_ReportsPagedAcrossBackends(t *testing.T) {
-	old := newFakeBackend(t, `[]`, `[]`)
-	old.bodies[reportsPath] = `[` + report("h1", "r5", "2026-07-05T00:00:00Z") + `,` +
+	a := newFakeBackend(t, `[]`, `[]`)
+	a.bodies[reportsPath] = `[` + report("h1", "r5", "2026-07-05T00:00:00Z") + `,` +
 		report("h1", "r3", "2026-07-03T00:00:00Z") + `,` +
 		report("h1", "r1", "2026-07-01T00:00:00Z") + `]`
-	nw := newFakeBackend(t, `[]`, `[]`)
-	nw.bodies[reportsPath] = `[` + report("h1", "r6", "2026-07-06T00:00:00Z") + `,` +
+	b := newFakeBackend(t, `[]`, `[]`)
+	b.bodies[reportsPath] = `[` + report("h1", "r6", "2026-07-06T00:00:00Z") + `,` +
 		report("h1", "r4", "2026-07-04T00:00:00Z") + `,` +
 		report("h1", "r2", "2026-07-02T00:00:00Z") + `]`
-	srv := newTestServer(testConfig(old.srv.URL, nw.srv.URL, mergeStatic))
+	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic))
 
 	rec := doGetParams(t, srv.Handler(), reportsPath, url.Values{
 		"order_by": {receiveDesc},
@@ -448,7 +481,7 @@ func TestHandler_ReportsPagedAcrossBackends(t *testing.T) {
 	}
 	// Each backend must be asked for the first offset+limit records so the
 	// merged window is fully covered.
-	for name, fb := range map[string]*fakeBackend{"old": old, "new": nw} {
+	for name, fb := range map[string]*fakeBackend{"a": a, "b": b} {
 		p, ok := fb.params(reportsPath)
 		if !ok {
 			t.Fatalf("%s backend was not queried", name)
@@ -463,13 +496,13 @@ func TestHandler_ReportsPagedAcrossBackends(t *testing.T) {
 }
 
 func TestHandler_ReportsIncludeTotalSummed(t *testing.T) {
-	old := newFakeBackend(t, `[]`, `[]`)
-	old.bodies[reportsPath] = `[` + report("h1", "r1", "2026-07-01T00:00:00Z") + `]`
-	old.totals[reportsPath] = 40
-	nw := newFakeBackend(t, `[]`, `[]`)
-	nw.bodies[reportsPath] = `[` + report("h1", "r2", "2026-07-02T00:00:00Z") + `]`
-	nw.totals[reportsPath] = 60
-	srv := newTestServer(testConfig(old.srv.URL, nw.srv.URL, mergeStatic))
+	a := newFakeBackend(t, `[]`, `[]`)
+	a.bodies[reportsPath] = `[` + report("h1", "r1", "2026-07-01T00:00:00Z") + `]`
+	a.totals[reportsPath] = 40
+	b := newFakeBackend(t, `[]`, `[]`)
+	b.bodies[reportsPath] = `[` + report("h1", "r2", "2026-07-02T00:00:00Z") + `]`
+	b.totals[reportsPath] = 60
+	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic))
 
 	rec := doGetParams(t, srv.Handler(), reportsPath, url.Values{
 		"include_total": {"true"},
@@ -481,13 +514,13 @@ func TestHandler_ReportsIncludeTotalSummed(t *testing.T) {
 }
 
 func TestHandler_ReportsNoTotalWhenNotRequested(t *testing.T) {
-	old := newFakeBackend(t, `[]`, `[]`)
-	old.bodies[reportsPath] = `[]`
-	old.totals[reportsPath] = 40
-	nw := newFakeBackend(t, `[]`, `[]`)
-	nw.bodies[reportsPath] = `[]`
-	nw.totals[reportsPath] = 60
-	srv := newTestServer(testConfig(old.srv.URL, nw.srv.URL, mergeStatic))
+	a := newFakeBackend(t, `[]`, `[]`)
+	a.bodies[reportsPath] = `[]`
+	a.totals[reportsPath] = 40
+	b := newFakeBackend(t, `[]`, `[]`)
+	b.bodies[reportsPath] = `[]`
+	b.totals[reportsPath] = 60
+	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic))
 
 	rec := doGetParams(t, srv.Handler(), reportsPath, nil)
 	if got := rec.Header().Get(recordsHeader); got != "" {
@@ -496,9 +529,9 @@ func TestHandler_ReportsNoTotalWhenNotRequested(t *testing.T) {
 }
 
 func TestHandler_ReportsBadPagingParam(t *testing.T) {
-	old := newFakeBackend(t, `[]`, `[]`)
-	nw := newFakeBackend(t, `[]`, `[]`)
-	srv := newTestServer(testConfig(old.srv.URL, nw.srv.URL, mergeStatic))
+	a := newFakeBackend(t, `[]`, `[]`)
+	b := newFakeBackend(t, `[]`, `[]`)
+	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic))
 
 	for _, params := range []url.Values{
 		{"limit": {"lots"}},
@@ -515,11 +548,11 @@ func TestHandler_ReportsBadPagingParam(t *testing.T) {
 func TestHandler_EventsUnioned(t *testing.T) {
 	// Puppetboard fetches a report's events as /events?query=["=","report",hash],
 	// and the report may live in either backend.
-	old := newFakeBackend(t, `[]`, `[]`)
-	old.bodies[eventsPath] = `[` + event("h1", "r1", "Package[nginx]") + `]`
-	nw := newFakeBackend(t, `[]`, `[]`)
-	nw.bodies[eventsPath] = `[` + event("h1", "r2", "Service[nginx]") + `]`
-	srv := newTestServer(testConfig(old.srv.URL, nw.srv.URL, mergeStatic))
+	a := newFakeBackend(t, `[]`, `[]`)
+	a.bodies[eventsPath] = `[` + event("h1", "r1", "Package[nginx]") + `]`
+	b := newFakeBackend(t, `[]`, `[]`)
+	b.bodies[eventsPath] = `[` + event("h1", "r2", "Service[nginx]") + `]`
+	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic))
 
 	rec := doGet(t, srv.Handler(), eventsPath, `["=","certname","h1"]`)
 	if rec.Code != http.StatusOK {
@@ -533,11 +566,11 @@ func TestHandler_EventsUnioned(t *testing.T) {
 
 func TestHandler_EventsDedupedByIdentity(t *testing.T) {
 	dup := event("h1", "r1", "Package[nginx]")
-	old := newFakeBackend(t, `[]`, `[]`)
-	old.bodies[eventsPath] = `[` + dup + `]`
-	nw := newFakeBackend(t, `[]`, `[]`)
-	nw.bodies[eventsPath] = `[` + dup + `]`
-	srv := newTestServer(testConfig(old.srv.URL, nw.srv.URL, mergeStatic))
+	a := newFakeBackend(t, `[]`, `[]`)
+	a.bodies[eventsPath] = `[` + dup + `]`
+	b := newFakeBackend(t, `[]`, `[]`)
+	b.bodies[eventsPath] = `[` + dup + `]`
+	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic))
 
 	rec := doGet(t, srv.Handler(), eventsPath, "")
 	var got []json.RawMessage
@@ -550,27 +583,27 @@ func TestHandler_EventsDedupedByIdentity(t *testing.T) {
 }
 
 func TestHandler_ReportSubResourceFromHoldingBackend(t *testing.T) {
-	// Only old holds report r1, so its logs must come from old even though new
-	// is the primary — a pass-through would have 404'd.
+	// Only a holds report r1, so its logs come from a; an unmerged pass-through
+	// to whichever backend answered first could have 404'd.
 	const path = reportsPath + "/r1/logs"
-	old := newFakeBackend(t, `[]`, `[]`)
-	old.bodies[path] = `[{"level":"notice","message":"from-old"}]`
-	nw := newFakeBackend(t, `[]`, `[]`)
-	srv := newTestServer(testConfig(old.srv.URL, nw.srv.URL, mergeStatic))
+	a := newFakeBackend(t, `[]`, `[]`)
+	a.bodies[path] = `[{"level":"notice","message":"from-a"}]`
+	b := newFakeBackend(t, `[]`, `[]`)
+	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic))
 
 	rec := doGet(t, srv.Handler(), path, "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), "from-old") {
-		t.Errorf("expected old's logs, got %s", rec.Body.String())
+	if !strings.Contains(rec.Body.String(), "from-a") {
+		t.Errorf("expected the holding backend's logs, got %s", rec.Body.String())
 	}
 }
 
 func TestHandler_ReportSubResourceMissingEverywhere(t *testing.T) {
-	old := newFakeBackend(t, `[]`, `[]`)
-	nw := newFakeBackend(t, `[]`, `[]`)
-	srv := newTestServer(testConfig(old.srv.URL, nw.srv.URL, mergeStatic))
+	a := newFakeBackend(t, `[]`, `[]`)
+	b := newFakeBackend(t, `[]`, `[]`)
+	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic))
 
 	rec := doGet(t, srv.Handler(), reportsPath+"/nope/events", "")
 	if rec.Code != http.StatusNotFound {
@@ -579,11 +612,11 @@ func TestHandler_ReportSubResourceMissingEverywhere(t *testing.T) {
 }
 
 func TestHandler_ReportsOneBackendDown(t *testing.T) {
-	old := newFakeBackend(t, `[]`, `[]`)
-	old.fail = true
-	nw := newFakeBackend(t, `[]`, `[]`)
-	nw.bodies[reportsPath] = `[` + report("h1", "r1", "2026-07-01T00:00:00Z") + `]`
-	srv := newTestServer(testConfig(old.srv.URL, nw.srv.URL, mergeStatic))
+	a := newFakeBackend(t, `[]`, `[]`)
+	a.fail = true
+	b := newFakeBackend(t, `[]`, `[]`)
+	b.bodies[reportsPath] = `[` + report("h1", "r1", "2026-07-01T00:00:00Z") + `]`
+	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic))
 
 	rec := doGetParams(t, srv.Handler(), reportsPath, url.Values{"order_by": {receiveDesc}})
 	if rec.Code != http.StatusOK {
@@ -621,11 +654,11 @@ func counts(t *testing.T, body []byte, field string) []float64 {
 func TestHandler_EventCountsSummedPerSubject(t *testing.T) {
 	// A node reporting to both PuppetDBs has its run counted in each; the
 	// merged view is the sum, not two rows.
-	old := newFakeBackend(t, `[]`, `[]`)
-	old.bodies[eventCountsPath] = `[` + eventCount("h1", 4, 3, 1, 0) + `]`
-	nw := newFakeBackend(t, `[]`, `[]`)
-	nw.bodies[eventCountsPath] = `[` + eventCount("h1", 2, 1, 0, 0) + `,` + eventCount("h2", 5, 0, 0, 0) + `]`
-	srv := newTestServer(testConfig(old.srv.URL, nw.srv.URL, mergeStatic))
+	a := newFakeBackend(t, `[]`, `[]`)
+	a.bodies[eventCountsPath] = `[` + eventCount("h1", 4, 3, 1, 0) + `]`
+	b := newFakeBackend(t, `[]`, `[]`)
+	b.bodies[eventCountsPath] = `[` + eventCount("h1", 2, 1, 0, 0) + `,` + eventCount("h2", 5, 0, 0, 0) + `]`
+	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic))
 
 	rec := doGetParams(t, srv.Handler(), eventCountsPath, url.Values{
 		"query":        {`["=","certname","h1"]`},
@@ -634,7 +667,7 @@ func TestHandler_EventCountsSummedPerSubject(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
 	}
-	// Precedence puts new (prefer) first, so h1 leads.
+	// Rows come out in configured backend order, so h1 leads.
 	if got := counts(t, rec.Body.Bytes(), "successes"); !slices.Equal(got, []float64{6, 5}) {
 		t.Errorf("successes = %v, want [6 5]", got)
 	}
@@ -644,18 +677,18 @@ func TestHandler_EventCountsSummedPerSubject(t *testing.T) {
 }
 
 func TestHandler_EventCountsDisjointSubjectsPassThrough(t *testing.T) {
-	old := newFakeBackend(t, `[]`, `[]`)
-	old.bodies[eventCountsPath] = `[` + eventCount("h1", 1, 0, 0, 0) + `]`
-	nw := newFakeBackend(t, `[]`, `[]`)
-	nw.bodies[eventCountsPath] = `[` + eventCount("h2", 2, 0, 0, 0) + `]`
-	srv := newTestServer(testConfig(old.srv.URL, nw.srv.URL, mergeStatic))
+	a := newFakeBackend(t, `[]`, `[]`)
+	a.bodies[eventCountsPath] = `[` + eventCount("h1", 1, 0, 0, 0) + `]`
+	b := newFakeBackend(t, `[]`, `[]`)
+	b.bodies[eventCountsPath] = `[` + eventCount("h2", 2, 0, 0, 0) + `]`
+	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic))
 
 	rec := doGetParams(t, srv.Handler(), eventCountsPath, url.Values{"summarize_by": {"certname"}})
-	if got := counts(t, rec.Body.Bytes(), "successes"); !slices.Equal(got, []float64{2, 1}) {
-		t.Errorf("successes = %v, want [2 1] (both nodes, untouched)", got)
+	if got := counts(t, rec.Body.Bytes(), "successes"); !slices.Equal(got, []float64{1, 2}) {
+		t.Errorf("successes = %v, want [1 2] (both nodes, untouched)", got)
 	}
 	// summarize_by must reach the backends verbatim.
-	for name, fb := range map[string]*fakeBackend{"old": old, "new": nw} {
+	for name, fb := range map[string]*fakeBackend{"a": a, "b": b} {
 		p, _ := fb.params(eventCountsPath)
 		if p.Get("summarize_by") != "certname" {
 			t.Errorf("%s backend got summarize_by=%q, want certname", name, p.Get("summarize_by"))
@@ -666,13 +699,13 @@ func TestHandler_EventCountsDisjointSubjectsPassThrough(t *testing.T) {
 func TestHandler_EventCountsRecordsIsMergedRowCount(t *testing.T) {
 	// Each backend reports one row; they share a subject, so the merged total
 	// is one — not the two the backends' own X-Records add up to.
-	old := newFakeBackend(t, `[]`, `[]`)
-	old.bodies[eventCountsPath] = `[` + eventCount("h1", 1, 0, 0, 0) + `]`
-	old.totals[eventCountsPath] = 1
-	nw := newFakeBackend(t, `[]`, `[]`)
-	nw.bodies[eventCountsPath] = `[` + eventCount("h1", 2, 0, 0, 0) + `]`
-	nw.totals[eventCountsPath] = 1
-	srv := newTestServer(testConfig(old.srv.URL, nw.srv.URL, mergeStatic))
+	a := newFakeBackend(t, `[]`, `[]`)
+	a.bodies[eventCountsPath] = `[` + eventCount("h1", 1, 0, 0, 0) + `]`
+	a.totals[eventCountsPath] = 1
+	b := newFakeBackend(t, `[]`, `[]`)
+	b.bodies[eventCountsPath] = `[` + eventCount("h1", 2, 0, 0, 0) + `]`
+	b.totals[eventCountsPath] = 1
+	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic))
 
 	rec := doGetParams(t, srv.Handler(), eventCountsPath, url.Values{
 		"summarize_by":  {"certname"},
@@ -684,13 +717,13 @@ func TestHandler_EventCountsRecordsIsMergedRowCount(t *testing.T) {
 }
 
 func TestHandler_AggregateEventCountsSummed(t *testing.T) {
-	old := newFakeBackend(t, `[]`, `[]`)
-	old.bodies[aggregateEventCountsPath] =
+	a := newFakeBackend(t, `[]`, `[]`)
+	a.bodies[aggregateEventCountsPath] =
 		`[{"successes":2,"failures":1,"noops":0,"skips":3,"total":6,"summarize_by":"certname"}]`
-	nw := newFakeBackend(t, `[]`, `[]`)
-	nw.bodies[aggregateEventCountsPath] =
+	b := newFakeBackend(t, `[]`, `[]`)
+	b.bodies[aggregateEventCountsPath] =
 		`[{"successes":5,"failures":4,"noops":1,"skips":0,"total":10,"summarize_by":"certname"}]`
-	srv := newTestServer(testConfig(old.srv.URL, nw.srv.URL, mergeStatic))
+	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic))
 
 	rec := doGetParams(t, srv.Handler(), aggregateEventCountsPath, url.Values{"summarize_by": {"certname"}})
 	if rec.Code != http.StatusOK {
@@ -715,13 +748,13 @@ func TestHandler_AggregateEventCountsSummed(t *testing.T) {
 func TestHandler_AggregateEventCountsNullColumnSurvives(t *testing.T) {
 	// PuppetDB returns null totals for an empty result set; summing must not
 	// crash or blank out the backend that does have numbers.
-	old := newFakeBackend(t, `[]`, `[]`)
-	old.bodies[aggregateEventCountsPath] =
+	a := newFakeBackend(t, `[]`, `[]`)
+	a.bodies[aggregateEventCountsPath] =
 		`[{"successes":null,"failures":null,"total":null,"summarize_by":"certname"}]`
-	nw := newFakeBackend(t, `[]`, `[]`)
-	nw.bodies[aggregateEventCountsPath] =
+	b := newFakeBackend(t, `[]`, `[]`)
+	b.bodies[aggregateEventCountsPath] =
 		`[{"successes":3,"failures":0,"total":3,"summarize_by":"certname"}]`
-	srv := newTestServer(testConfig(old.srv.URL, nw.srv.URL, mergeStatic))
+	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic))
 
 	rec := doGetParams(t, srv.Handler(), aggregateEventCountsPath, url.Values{"summarize_by": {"certname"}})
 	if rec.Code != http.StatusOK {
@@ -737,11 +770,11 @@ const statusCountQuery = `["extract",[["function","count"],"status"],["~","certn
 func TestHandler_ReportsAggregateSummed(t *testing.T) {
 	// Puppetboard's daily-reports chart: each backend counts only its own
 	// reports, so the merged chart needs the per-status sums.
-	old := newFakeBackend(t, `[]`, `[]`)
-	old.bodies[reportsPath] = `[{"count":4,"status":"changed"},{"count":2,"status":"failed"}]`
-	nw := newFakeBackend(t, `[]`, `[]`)
-	nw.bodies[reportsPath] = `[{"count":3,"status":"changed"},{"count":9,"status":"unchanged"}]`
-	srv := newTestServer(testConfig(old.srv.URL, nw.srv.URL, mergeStatic))
+	a := newFakeBackend(t, `[]`, `[]`)
+	a.bodies[reportsPath] = `[{"count":4,"status":"changed"},{"count":2,"status":"failed"}]`
+	b := newFakeBackend(t, `[]`, `[]`)
+	b.bodies[reportsPath] = `[{"count":3,"status":"changed"},{"count":9,"status":"unchanged"}]`
+	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic))
 
 	rec := doGetParams(t, srv.Handler(), reportsPath, url.Values{"query": {statusCountQuery}})
 	if rec.Code != http.StatusOK {
@@ -764,13 +797,13 @@ func TestHandler_ReportsAggregateSummed(t *testing.T) {
 }
 
 func TestHandler_ReportsAggregateRecordsIsMergedRowCount(t *testing.T) {
-	old := newFakeBackend(t, `[]`, `[]`)
-	old.bodies[reportsPath] = `[{"count":4,"status":"changed"}]`
-	old.totals[reportsPath] = 1
-	nw := newFakeBackend(t, `[]`, `[]`)
-	nw.bodies[reportsPath] = `[{"count":3,"status":"changed"}]`
-	nw.totals[reportsPath] = 1
-	srv := newTestServer(testConfig(old.srv.URL, nw.srv.URL, mergeStatic))
+	a := newFakeBackend(t, `[]`, `[]`)
+	a.bodies[reportsPath] = `[{"count":4,"status":"changed"}]`
+	a.totals[reportsPath] = 1
+	b := newFakeBackend(t, `[]`, `[]`)
+	b.bodies[reportsPath] = `[{"count":3,"status":"changed"}]`
+	b.totals[reportsPath] = 1
+	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic))
 
 	rec := doGetParams(t, srv.Handler(), reportsPath, url.Values{
 		"query":         {statusCountQuery},
@@ -784,11 +817,11 @@ func TestHandler_ReportsAggregateRecordsIsMergedRowCount(t *testing.T) {
 func TestHandler_ReportsNonAggregateStillUnioned(t *testing.T) {
 	// An extract with no function is a projection of real reports, so the
 	// union — not a sum — is still the right merge.
-	old := newFakeBackend(t, `[]`, `[]`)
-	old.bodies[reportsPath] = `[` + report("h1", "r1", "2026-07-01T00:00:00Z") + `]`
-	nw := newFakeBackend(t, `[]`, `[]`)
-	nw.bodies[reportsPath] = `[` + report("h1", "r2", "2026-07-02T00:00:00Z") + `]`
-	srv := newTestServer(testConfig(old.srv.URL, nw.srv.URL, mergeStatic))
+	a := newFakeBackend(t, `[]`, `[]`)
+	a.bodies[reportsPath] = `[` + report("h1", "r1", "2026-07-01T00:00:00Z") + `]`
+	b := newFakeBackend(t, `[]`, `[]`)
+	b.bodies[reportsPath] = `[` + report("h1", "r2", "2026-07-02T00:00:00Z") + `]`
+	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic))
 
 	rec := doGetParams(t, srv.Handler(), reportsPath, url.Values{
 		"query":    {`["extract",["hash","certname"],["=","certname","h1"]]`},
@@ -800,11 +833,11 @@ func TestHandler_ReportsNonAggregateStillUnioned(t *testing.T) {
 }
 
 func TestHandler_EventCountsOneBackendDown(t *testing.T) {
-	old := newFakeBackend(t, `[]`, `[]`)
-	old.fail = true
-	nw := newFakeBackend(t, `[]`, `[]`)
-	nw.bodies[eventCountsPath] = `[` + eventCount("h1", 2, 0, 0, 0) + `]`
-	srv := newTestServer(testConfig(old.srv.URL, nw.srv.URL, mergeStatic))
+	a := newFakeBackend(t, `[]`, `[]`)
+	a.fail = true
+	b := newFakeBackend(t, `[]`, `[]`)
+	b.bodies[eventCountsPath] = `[` + eventCount("h1", 2, 0, 0, 0) + `]`
+	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic))
 
 	rec := doGetParams(t, srv.Handler(), eventCountsPath, url.Values{"summarize_by": {"certname"}})
 	if rec.Code != http.StatusOK {
@@ -816,9 +849,9 @@ func TestHandler_EventCountsOneBackendDown(t *testing.T) {
 }
 
 func TestHandler_EventCountsBadPagingParam(t *testing.T) {
-	old := newFakeBackend(t, `[]`, `[]`)
-	nw := newFakeBackend(t, `[]`, `[]`)
-	srv := newTestServer(testConfig(old.srv.URL, nw.srv.URL, mergeStatic))
+	a := newFakeBackend(t, `[]`, `[]`)
+	b := newFakeBackend(t, `[]`, `[]`)
+	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic))
 
 	rec := doGetParams(t, srv.Handler(), eventCountsPath, url.Values{"limit": {"lots"}})
 	if rec.Code != http.StatusBadRequest {

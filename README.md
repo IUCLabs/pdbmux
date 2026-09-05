@@ -9,15 +9,13 @@ PuppetDB and it sees one consistent view spanning all of them.
 
 Running more than one PuppetDB — during a migration between two of them, or
 across regions — means a given node's current data lives in exactly one at any
-moment, and consumers have to know which, or query each in turn. Consider two
-backends being merged during a migration:
+moment, and consumers have to know which, or query each in turn. `pdbmux`
+merges them all so consumers don't have to know (or query twice) which PuppetDB
+a node currently lives in.
 
-- **old** — the PuppetDB nodes are moving off, e.g. `http://puppetdb1.example.com:8080`
-- **new** — the PuppetDB nodes are moving on to, e.g. `http://puppetdb2.example.com:8080`
-
-Nodes move from old to new as they migrate. `pdbmux` merges both so consumers
-don't have to know (or query twice) which PuppetDB a node currently lives in.
-The backend names are arbitrary labels; there is no fixed number of backends.
+All backends are equal — `pdbmux` is never told which one to favour. Backend
+names are arbitrary labels and there is no fixed number of them. The configured
+order is used only as a tie-break, so output is reproducible.
 
 ## Endpoints
 
@@ -32,8 +30,8 @@ not PQL) is forwarded verbatim.
 | `GET /pdb/query/v4/events` | Fan out to all and serve the **union**, deduped by record identity, re-ordered and re-paged. |
 | `GET /pdb/query/v4/event-counts` | Fan out to all and **sum** each subject's counts into one row per subject. |
 | `GET /pdb/query/v4/aggregate-event-counts` | Fan out to all and **sum** the summary object's counts. |
-| `GET /pdb/query/v4/reports/<hash>/{events,logs,metrics}` | Ask every backend; serve the answer from whichever backend actually holds that report. `404` when neither does. |
-| `GET /pdb/query/v4/*` (any other) | Transparently proxied to the **primary** backend, unmerged, streamed verbatim. |
+| `GET /pdb/query/v4/reports/<hash>/{events,logs,metrics}` | Ask every backend; serve the answer from whichever backend actually holds that report. `404` when none does. |
+| `GET /pdb/query/v4/*` (any other) | No merge rule, so backends are tried in configured order and the first success is streamed back verbatim; if all reject it, the first upstream error response is replayed. |
 | `GET /healthz` | Per-backend reachability. `200 {"status":"ok"}` if all reachable, `200 degraded` if some fail, `503 down` if all fail. |
 
 Fan-out is concurrent. If one backend errors or times out, `pdbmux` serves the
@@ -44,22 +42,22 @@ unknown fields survive untouched.
 ## Merge semantics
 
 - **`/nodes`** — dedupe by `certname`; the record with the strictly-newer
-  `report_timestamp` wins. On a tie (or when a node exists in only one backend),
-  the **preferred** backend's record is kept.
+  `report_timestamp` wins. On a tie, the backend listed first in `backends`
+  supplies the record — a tie-break only, so the merged output is deterministic.
 - **`/facts`** — node-level granularity. For a `certname` present in more than
   one backend, `pdbmux` keeps **all** of that node's facts from **one** backend and
-  drops the other's, chosen by the merge strategy:
+  drops the others', chosen by the merge strategy:
   - **`freshness`** (default) — attribute each `certname` to whichever backend
     holds its newer `report_timestamp`. `pdbmux` derives this from a per-certname
     freshness map built by querying `/nodes` from every backend, cached for
-    `freshness_ttl` (default 30s). Ties/fallbacks use `prefer`.
-  - **`static`** — always keep the `prefer` backend's facts for shared nodes.
-    No extra `/nodes` query.
+    `freshness_ttl` (default 30s).
+  - **`static`** — skip the extra `/nodes` query and take each shared node's
+    facts from the first backend in configured order that holds it.
   - A node present in only one backend always appears (falls back to whichever
     backend actually returned facts for it).
 - **`/reports`, `/events`** — **union**, not a per-node winner. Reports are
-  immutable history, so a node that migrated legitimately has reports in the old
-  PuppetDB *and* the new one and both belong in the merged view. Reports dedupe
+  immutable history, so a node that moved between PuppetDBs legitimately has
+  reports in both and both belong in the merged view. Reports dedupe
   on `hash`; events, which carry no id of their own, dedupe on the verbatim
   record (a node briefly reporting to both PuppetDBs stores identical records in
   each).
@@ -86,7 +84,7 @@ Each backend applies `order_by`/`limit`/`offset` to its own slice only, so
 `pdbmux` re-does all three over the union:
 
 - `order_by` is parsed and the merged set re-sorted by those fields (ties keep
-  backend precedence). A record missing an ordered field sorts first.
+  the merged set's existing order). A record missing an ordered field sorts first.
 - Backends are asked for the first `offset + limit` records — never an `offset`
   — and the requested window is then cut from the merged, re-sorted set.
 - `include_total=true` on a union endpoint makes `pdbmux` sum each backend's
@@ -112,14 +110,12 @@ or the paths it searched.
 
 ```yaml
 listen: ":8080"
-backends:
-  - name: old
+backends:                          # order is a tie-break only, not a ranking
+  - name: pdb-a
     url: http://puppetdb1.example.com:8080
-  - name: new
+  - name: pdb-b
     url: https://puppetdb2.example.com
-primary: new          # backend used for non-merged /pdb/query/v4/* pass-through
 merge: freshness      # freshness | static
-prefer: new           # winner on ties / static merge / fallback
 timeout: 10s          # per-upstream request timeout
 freshness_ttl: 30s    # freshness-map cache TTL (freshness merge only)
 ```
@@ -131,14 +127,12 @@ the `/pdb/query/v4/...` path per request.
 |---|---|
 | `PDBMUX_CONFIG` | config file path (not a file key) |
 | `PDBMUX_LISTEN` | `listen` |
-| `PDBMUX_PRIMARY` | `primary` |
 | `PDBMUX_MERGE` | `merge` |
-| `PDBMUX_PREFER` | `prefer` |
 | `PDBMUX_TIMEOUT` | `timeout` (Go duration, e.g. `10s`) |
 | `PDBMUX_FRESHNESS_TTL` | `freshness_ttl` |
 | `PDBMUX_BACKENDS` | whole backend list, as `name=url,name=url` |
 
-Flags: `--config`, `--listen`, `--primary`, `--merge`.
+Flags: `--config`, `--listen`, `--merge`.
 
 `config init` writes to `--config`/`PDBMUX_CONFIG` when set, else to
 `$XDG_CONFIG_HOME/pdbmux/config.yaml`.
@@ -150,7 +144,7 @@ Subcommands: `serve` (default), `config init`, `config show`, `version`. Run
 base URL in place of a PuppetDB one.
 
 ```bash
-PDBMUX_BACKENDS='old=http://puppetdb1.example.com:8080,new=http://puppetdb2.example.com:8080' pdbmux
+PDBMUX_BACKENDS='pdb-a=http://puppetdb1.example.com:8080,pdb-b=http://puppetdb2.example.com:8080' pdbmux
 curl -s --get http://localhost:8080/pdb/query/v4/nodes \
   --data-urlencode 'query=["=","certname","host1.example.com"]'
 ```

@@ -28,8 +28,8 @@ const (
 )
 
 var exampleBackends = []Backend{
-	{Name: "primary", URL: "http://puppetdb1.example.com:8080"},
-	{Name: "secondary", URL: "http://puppetdb2.example.com:8080"},
+	{Name: "pdb-a", URL: "http://puppetdb1.example.com:8080"},
+	{Name: "pdb-b", URL: "http://puppetdb2.example.com:8080"},
 }
 
 type Backend struct {
@@ -39,10 +39,8 @@ type Backend struct {
 
 type Config struct {
 	Listen       string        `yaml:"listen"`
-	Backends     []Backend     `yaml:"backends"`
-	Primary      string        `yaml:"primary"`
+	Backends     []Backend     `yaml:"backends"` // all equal; order is only a deterministic tie-break
 	Merge        string        `yaml:"merge"`
-	Prefer       string        `yaml:"prefer"` // wins under static merge, and breaks ties under freshness merge
 	Timeout      time.Duration `yaml:"timeout"`
 	FreshnessTTL time.Duration `yaml:"freshness_ttl"`
 
@@ -69,8 +67,6 @@ func DefaultConfig() Config {
 func ExampleConfig() Config {
 	cfg := DefaultConfig()
 	cfg.Backends = append([]Backend(nil), exampleBackends...)
-	cfg.Primary = exampleBackends[0].Name
-	cfg.Prefer = exampleBackends[0].Name
 	return cfg
 }
 
@@ -143,7 +139,6 @@ func Load(flagPath string) (Config, error) {
 	}
 
 	applyEnv(&cfg, os.Getenv)
-	cfg.normalize()
 	return cfg, nil
 }
 
@@ -151,14 +146,8 @@ func applyEnv(cfg *Config, getenv func(string) string) {
 	if v := getenv(envPrefix + "LISTEN"); v != "" {
 		cfg.Listen = v
 	}
-	if v := getenv(envPrefix + "PRIMARY"); v != "" {
-		cfg.Primary = v
-	}
 	if v := getenv(envPrefix + "MERGE"); v != "" {
 		cfg.Merge = v
-	}
-	if v := getenv(envPrefix + "PREFER"); v != "" {
-		cfg.Prefer = v
 	}
 	if v := getenv(envPrefix + "TIMEOUT"); v != "" {
 		if d, err := time.ParseDuration(v); err == nil {
@@ -195,18 +184,6 @@ func parseBackends(s string) []Backend {
 	return out
 }
 
-func (c *Config) normalize() {
-	if len(c.Backends) == 0 {
-		return
-	}
-	if c.Primary == "" {
-		c.Primary = c.Backends[0].Name
-	}
-	if c.Prefer == "" {
-		c.Prefer = c.Backends[0].Name
-	}
-}
-
 // configHint names the file a user should edit: the one actually loaded, else
 // the default write target.
 func (c Config) configHint() string {
@@ -231,30 +208,15 @@ func (c Config) Validate() error {
 		}
 		seen[b.Name] = true
 	}
-	if !seen[c.Primary] {
-		return fmt.Errorf("primary %q is not a configured backend", c.Primary)
-	}
 	switch c.Merge {
 	case mergeFreshness, mergeStatic:
 	default:
 		return fmt.Errorf("merge must be %q or %q, got %q", mergeFreshness, mergeStatic, c.Merge)
 	}
-	if !seen[c.Prefer] {
-		return fmt.Errorf("prefer %q is not a configured backend", c.Prefer)
-	}
 	if c.Timeout <= 0 {
 		return fmt.Errorf("timeout must be positive")
 	}
 	return nil
-}
-
-func (c Config) PrimaryBackend() Backend {
-	for _, b := range c.Backends {
-		if b.Name == c.Primary {
-			return b
-		}
-	}
-	return c.Backends[0]
 }
 
 func writeDefaultConfig(path string) error {
@@ -268,8 +230,8 @@ func writeDefaultConfig(path string) error {
 	header := []byte("# pdbmux configuration\n" +
 		"# A merging proxy presenting one PuppetDB v4 query surface over several\n" +
 		"# PuppetDB backends. The backend URLs below are placeholders — edit them.\n" +
-		"# Env overrides: PDBMUX_LISTEN, PDBMUX_PRIMARY, PDBMUX_MERGE, PDBMUX_PREFER,\n" +
-		"#   PDBMUX_TIMEOUT, PDBMUX_FRESHNESS_TTL, PDBMUX_BACKENDS (name=url,name=url).\n\n")
+		"# Env overrides: PDBMUX_LISTEN, PDBMUX_MERGE, PDBMUX_TIMEOUT,\n" +
+		"#   PDBMUX_FRESHNESS_TTL, PDBMUX_BACKENDS (name=url,name=url).\n\n")
 	if err := os.WriteFile(path, append(header, data...), 0o644); err != nil {
 		return fmt.Errorf("writing config: %w", err)
 	}

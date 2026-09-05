@@ -89,10 +89,10 @@ func event(cn, reportHash, resource string) string {
 }
 
 func TestMergeNodes_NewerWins(t *testing.T) {
-	old := recs(t, "old", node("h1", "2026-07-01T00:00:00Z"), node("h2", "2026-07-10T00:00:00Z"))
-	nw := recs(t, "new", node("h1", "2026-07-20T00:00:00Z"), node("h3", "2026-07-05T00:00:00Z"))
+	a := recs(t, "a", node("h1", "2026-07-01T00:00:00Z"), node("h2", "2026-07-10T00:00:00Z"))
+	b := recs(t, "b", node("h1", "2026-07-20T00:00:00Z"), node("h3", "2026-07-05T00:00:00Z"))
 
-	merged := mergeNodes([]backendResult{old, nw})
+	merged := mergeNodes([]backendResult{a, b})
 	got := map[string]string{}
 	for _, r := range merged {
 		var m recordMeta
@@ -100,13 +100,13 @@ func TestMergeNodes_NewerWins(t *testing.T) {
 		got[m.Certname] = m.ReportTimestamp
 	}
 	if got["h1"] != "2026-07-20T00:00:00Z" {
-		t.Errorf("h1: newer (new) should win, got %s", got["h1"])
+		t.Errorf("h1: newer (b) should win, got %s", got["h1"])
 	}
 	if got["h2"] != "2026-07-10T00:00:00Z" {
-		t.Errorf("h2: only in old, got %s", got["h2"])
+		t.Errorf("h2: only in a, got %s", got["h2"])
 	}
 	if got["h3"] != "2026-07-05T00:00:00Z" {
-		t.Errorf("h3: only in new, got %s", got["h3"])
+		t.Errorf("h3: only in b, got %s", got["h3"])
 	}
 	if len(merged) != 3 {
 		t.Errorf("expected 3 deduped nodes, got %d", len(merged))
@@ -114,20 +114,20 @@ func TestMergeNodes_NewerWins(t *testing.T) {
 }
 
 func TestMergeNodes_OneBackendOnly(t *testing.T) {
-	old := recs(t, "old", node("h1", "2026-07-01T00:00:00Z"))
-	// new returned nothing (e.g. empty result).
-	nw := backendResult{name: "new"}
-	merged := mergeNodes([]backendResult{old, nw})
+	a := recs(t, "a", node("h1", "2026-07-01T00:00:00Z"))
+	// b returned nothing (e.g. empty result).
+	b := backendResult{name: "b"}
+	merged := mergeNodes([]backendResult{a, b})
 	if len(merged) != 1 || certnames(t, merged)[0] != "h1" {
 		t.Fatalf("expected only h1, got %v", certnames(t, merged))
 	}
 }
 
 func TestMergeNodes_TieKeepsEarlierBackend(t *testing.T) {
-	// Equal timestamps: the backend listed first (precedence) wins.
-	prefer := recs(t, "new", node("h1", "2026-07-01T00:00:00Z"))
-	other := recs(t, "old", node("h1", "2026-07-01T00:00:00Z"))
-	merged := mergeNodes([]backendResult{prefer, other})
+	// Equal timestamps: the backend listed first wins, as a tie-break.
+	first := recs(t, "b", node("h1", "2026-07-01T00:00:00Z"))
+	second := recs(t, "a", node("h1", "2026-07-01T00:00:00Z"))
+	merged := mergeNodes([]backendResult{first, second})
 	if len(merged) != 1 {
 		t.Fatalf("expected 1 record, got %d", len(merged))
 	}
@@ -138,8 +138,8 @@ func TestMergeNodes_TieKeepsEarlierBackend(t *testing.T) {
 }
 
 func TestMergeNodes_PreservesUnknownFields(t *testing.T) {
-	old := recs(t, "old", `{"certname":"h1","report_timestamp":"2026-07-01T00:00:00Z","extra":{"deep":42}}`)
-	merged := mergeNodes([]backendResult{old})
+	a := recs(t, "a", `{"certname":"h1","report_timestamp":"2026-07-01T00:00:00Z","extra":{"deep":42}}`)
+	merged := mergeNodes([]backendResult{a})
 	if len(merged) != 1 {
 		t.Fatalf("expected 1 record")
 	}
@@ -150,69 +150,70 @@ func TestMergeNodes_PreservesUnknownFields(t *testing.T) {
 	}
 }
 
-func TestMergeFacts_Static_PreferWins(t *testing.T) {
-	// h1 in both; static prefer=new -> new's facts kept, old's dropped.
-	old := recs(t, "old", fact("h1", "role", "web-old", ""), fact("h2", "role", "db-old", ""))
-	nw := recs(t, "new", fact("h1", "role", "web-new", ""))
+func TestMergeFacts_NilOwnerUsesConfiguredOrder(t *testing.T) {
+	// Static merge passes no owner: h1 is in both, so the first backend in the
+	// slice supplies its facts.
+	a := recs(t, "a", fact("h1", "role", "web-a", ""), fact("h2", "role", "db-a", ""))
+	b := recs(t, "b", fact("h1", "role", "web-b", ""))
 
-	merged := mergeFacts([]backendResult{nw, old}, func(string) string { return "new" })
+	merged := mergeFacts([]backendResult{b, a}, nil)
 	got := factValues(t, merged)
-	assertContains(t, got, "h1:role=web-new")
-	assertNotContains(t, got, "h1:role=web-old")
-	// h2 only in old -> falls back to old.
-	assertContains(t, got, "h2:role=db-old")
+	assertContains(t, got, "h1:role=web-b")
+	assertNotContains(t, got, "h1:role=web-a")
+	// h2 only in a -> still served from a.
+	assertContains(t, got, "h2:role=db-a")
 }
 
 func TestMergeFacts_Freshness_NewerBackendWins(t *testing.T) {
-	// owner map says h1 belongs to old (older backend has the newer report),
-	// h2 belongs to new. Multiple facts per node must all come from the winner.
-	old := recs(t, "old",
-		fact("h1", "role", "web-old", ""), fact("h1", "ip", "192.0.2.1", ""),
-		fact("h2", "role", "db-old", ""))
-	nw := recs(t, "new",
-		fact("h1", "role", "web-new", ""), fact("h1", "ip", "192.0.2.99", ""),
-		fact("h2", "role", "db-new", ""), fact("h2", "ip", "192.0.2.2", ""))
+	// owner map says h1 belongs to a and h2 to b. Multiple facts per node must
+	// all come from the winner.
+	a := recs(t, "a",
+		fact("h1", "role", "web-a", ""), fact("h1", "ip", "192.0.2.1", ""),
+		fact("h2", "role", "db-a", ""))
+	b := recs(t, "b",
+		fact("h1", "role", "web-b", ""), fact("h1", "ip", "192.0.2.99", ""),
+		fact("h2", "role", "db-b", ""), fact("h2", "ip", "192.0.2.2", ""))
 
 	owner := func(cn string) string {
 		if cn == "h1" {
-			return "old"
+			return "a"
 		}
-		return "new"
+		return "b"
 	}
-	merged := mergeFacts([]backendResult{nw, old}, owner)
+	merged := mergeFacts([]backendResult{b, a}, owner)
 	got := factValues(t, merged)
-	// h1 -> all old facts, no new facts.
-	assertContains(t, got, "h1:role=web-old")
+	// h1 -> all a facts, no b facts.
+	assertContains(t, got, "h1:role=web-a")
 	assertContains(t, got, "h1:ip=192.0.2.1")
-	assertNotContains(t, got, "h1:role=web-new")
+	assertNotContains(t, got, "h1:role=web-b")
 	assertNotContains(t, got, "h1:ip=192.0.2.99")
-	// h2 -> all new facts.
-	assertContains(t, got, "h2:role=db-new")
+	// h2 -> all b facts.
+	assertContains(t, got, "h2:role=db-b")
 	assertContains(t, got, "h2:ip=192.0.2.2")
-	assertNotContains(t, got, "h2:role=db-old")
+	assertNotContains(t, got, "h2:role=db-a")
 }
 
-func TestMergeFacts_OwnerMissingFallsBackToPrecedence(t *testing.T) {
-	// owner returns a backend with no facts for h1 -> fall back to first
-	// backend present (precedence order of the slice).
-	prefer := recs(t, "new", fact("h1", "role", "web-new", ""))
-	other := recs(t, "old", fact("h1", "role", "web-old", ""))
-	merged := mergeFacts([]backendResult{prefer, other}, func(string) string { return "ghost" })
+func TestMergeFacts_OwnerMissingFallsBackToConfiguredOrder(t *testing.T) {
+	// owner returns a backend with no facts for h1 -> fall back to the first
+	// backend in the slice that has some.
+	first := recs(t, "b", fact("h1", "role", "web-b", ""))
+	second := recs(t, "a", fact("h1", "role", "web-a", ""))
+	merged := mergeFacts([]backendResult{first, second}, func(string) string { return "ghost" })
 	got := factValues(t, merged)
-	assertContains(t, got, "h1:role=web-new") // new is first in slice
-	assertNotContains(t, got, "h1:role=web-old")
+	assertContains(t, got, "h1:role=web-b") // b is first in slice
+	assertNotContains(t, got, "h1:role=web-a")
 }
 
 func TestBuildFreshness(t *testing.T) {
-	// old has newer report for h1; new has newer for h2.
-	old := recs(t, "old", node("h1", "2026-07-20T00:00:00Z"), node("h2", "2026-07-01T00:00:00Z"))
-	nw := recs(t, "new", node("h1", "2026-07-01T00:00:00Z"), node("h2", "2026-07-20T00:00:00Z"))
-	f := buildFreshness([]backendResult{old, nw})
-	if f["h1"] != "old" {
-		t.Errorf("h1 should belong to old, got %q", f["h1"])
+	// a holds the newer report for h1; b holds the newer one for h2.
+	a := recs(t, "a", node("h1", "2026-07-20T00:00:00Z"), node("h2", "2026-07-01T00:00:00Z"))
+	b := recs(t, "b", node("h1", "2026-07-01T00:00:00Z"), node("h2", "2026-07-20T00:00:00Z"))
+	f := buildFreshness([]backendResult{a, b})
+	if f["h1"] != "a" {
+		t.Errorf("h1 should belong to a, got %q", f["h1"])
 	}
-	if f["h2"] != "new" {
-		t.Errorf("h2 should belong to new, got %q", f["h2"])
+	if f["h2"] != "b" {
+		t.Errorf("h2 should belong to b, got %q", f["h2"])
 	}
 }
 
