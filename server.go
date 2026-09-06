@@ -682,7 +682,7 @@ type backendReport struct {
 	// every configured backend regardless of probe state: "ok" or the error text.
 	Reachable string `json:"reachable"`
 	// State is the background prober's verdict. probe_unsupported means the probe
-	// path is unusable on this backend, so its health is unknown — read Reachable
+	// has never answered on this backend, so its health is unknown — read Reachable
 	// to find out whether it is up.
 	State     string `json:"state"` // healthy | unhealthy | probe_unsupported | unprobed | unmonitored
 	Failures  int    `json:"consecutive_failures"`

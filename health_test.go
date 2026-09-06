@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -76,18 +77,37 @@ func healthConfig(aURL, bURL string) Config {
 	return cfg
 }
 
+// answeredProbe is a failure the probe endpoint itself reported — a 503, say —
+// so it proves the probe works and counts against the backend.
+func answeredProbe() error {
+	return &probeAnsweredError{msg: "HTTP 503: service is not running"}
+}
+
+// deadProbe never reached the endpoint, so it says nothing about whether the
+// probe works there.
+func deadProbe() error { return errors.New("dial tcp: connection refused") }
+
+func rejectedProbe(p *prober) error {
+	return &probeRejectedError{status: http.StatusNotFound, path: p.path}
+}
+
+// markUsable latches the probe as working without changing the backend's state.
+func markUsable(t *testing.T, p *prober, name string) {
+	t.Helper()
+	p.record(name, nil)
+	if p.snapshot()[name].Unsupported {
+		t.Fatalf("backend %q still reports an unusable probe after a success", name)
+	}
+}
+
 func markDown(t *testing.T, p *prober, name string) {
 	t.Helper()
 	for i := 0; i < p.failures; i++ {
-		p.record(name, errors.New("probe failed"))
+		p.record(name, answeredProbe())
 	}
 	if p.healthy(name) {
 		t.Fatalf("backend %q still healthy after %d probe failures", name, p.failures)
 	}
-}
-
-func rejectedProbe(p *prober) error {
-	return &probeRejectedError{status: http.StatusNotFound, path: p.path}
 }
 
 func markUnsupported(t *testing.T, p *prober, name string) {
@@ -109,19 +129,19 @@ func TestProber_FailureThresholdDebouncesABlip(t *testing.T) {
 	p := newTestProber(t, cfg)
 
 	for i := 1; i < 3; i++ {
-		p.record("a", errors.New("boom"))
+		p.record("a", answeredProbe())
 		if !p.healthy("a") {
 			t.Fatalf("backend went down after %d of 3 failures", i)
 		}
 	}
-	// A success inside the window resets the run, so the blip never flaps it out.
+	// A success resets the run, so the blip never flaps it out.
 	p.record("a", nil)
-	p.record("a", errors.New("boom"))
-	p.record("a", errors.New("boom"))
+	p.record("a", answeredProbe())
+	p.record("a", answeredProbe())
 	if !p.healthy("a") {
 		t.Fatal("a failure run interrupted by a success should not mark the backend down")
 	}
-	p.record("a", errors.New("boom"))
+	p.record("a", answeredProbe())
 	if p.healthy("a") {
 		t.Fatal("backend should be down after 3 consecutive failures")
 	}
@@ -138,7 +158,7 @@ func TestProber_SuccessThresholdDebouncesRecovery(t *testing.T) {
 		t.Fatal("one success should not bring a down backend back")
 	}
 	// A failure in between restarts the recovery run.
-	p.record("a", errors.New("boom"))
+	p.record("a", answeredProbe())
 	p.record("a", nil)
 	if p.healthy("a") {
 		t.Fatal("recovery run should restart after an interleaved failure")
@@ -574,6 +594,9 @@ func TestProber_ServerErrorsAndTransportFailuresStillMarkDown(t *testing.T) {
 	if classifyProbe(err) != outcomeFailure {
 		t.Fatalf("a refused connection classified as %v, want a real failure (err %v)", classifyProbe(err), err)
 	}
+	// A transport failure never reached the probe endpoint, so it is only evidence
+	// once the endpoint has answered before.
+	markUsable(t, p, "a")
 	for i := 0; i < p.failures; i++ {
 		p.record("a", err)
 	}
@@ -582,21 +605,73 @@ func TestProber_ServerErrorsAndTransportFailuresStillMarkDown(t *testing.T) {
 	}
 }
 
-// A real failure landing in a rejected run outranks the rejections: the run is
-// one run of unsuccessful probes, and its worst evidence decides the state.
-func TestProber_RealFailureInARejectedRunMarksDown(t *testing.T) {
+// Only a reply from the probe endpoint shows that the probe works there: a
+// transport failure never got one, and a rejection refused the request.
+func TestProbeAnswered_OnlyRepliesFromTheEndpointCount(t *testing.T) {
+	sb := newStatusBackend(t)
+	p := newTestProber(t, healthConfig(sb.srv.URL, "http://b.invalid"))
+	probe := func() error { return p.probe(t.Context(), Backend{Name: "a", URL: sb.srv.URL}) }
+
+	sb.reply(http.StatusOK, runningStatusBody)
+	if !probeAnswered(probe()) {
+		t.Error("a running status was not counted as an answer")
+	}
+	sb.reply(http.StatusServiceUnavailable, degradedStatusBody("error"))
+	if !probeAnswered(probe()) {
+		t.Error("a 503 from the probe endpoint was not counted as an answer")
+	}
+	sb.reply(http.StatusOK, degradedStatusBody("starting"))
+	if !probeAnswered(probe()) {
+		t.Error("a degraded body on a 200 was not counted as an answer")
+	}
+	sb.reply(http.StatusNotFound, "nope")
+	if probeAnswered(probe()) {
+		t.Error("a rejected probe was counted as an answer")
+	}
+	if probeAnswered(deadProbe()) {
+		t.Error("a transport failure was counted as an answer")
+	}
+}
+
+// Once the probe endpoint answers, its verdict gates the backend even if every
+// earlier probe was refused: the path works after all.
+func TestProber_AnsweredFailureAfterRejectionsMarksDown(t *testing.T) {
 	p := newTestProber(t, healthConfig("http://a.invalid", "http://b.invalid"))
 	markUnsupported(t, p, "a")
 	for i := 0; i < 20; i++ {
 		p.record("a", rejectedProbe(p))
 	}
 
-	p.record("a", errors.New("boom"))
+	for i := 0; i < p.failures; i++ {
+		p.record("a", answeredProbe())
+	}
 	if p.healthy("a") {
-		t.Fatal("a real failure inside a rejected run left the backend in service")
+		t.Fatal("the backend stayed in service after its probe endpoint answered with failures")
 	}
 	if got := p.snapshot()["a"].stateName(); got != stateUnhealthy {
 		t.Errorf("state = %q, want %q", got, stateUnhealthy)
+	}
+}
+
+// The rejections before the endpoint answered are not evidence about the
+// backend, so they do not count toward the threshold that takes it out.
+func TestProber_RejectionsBeforeTheLatchDoNotCountAsFailures(t *testing.T) {
+	cfg := healthConfig("http://a.invalid", "http://b.invalid")
+	cfg.HealthProbeFailures = 3
+	p := newTestProber(t, cfg)
+	for i := 0; i < 20; i++ {
+		p.record("a", rejectedProbe(p))
+	}
+
+	for i := 1; i < cfg.HealthProbeFailures; i++ {
+		p.record("a", answeredProbe())
+		if !p.healthy("a") {
+			t.Fatalf("backend went down after %d of %d failures from a working probe", i, cfg.HealthProbeFailures)
+		}
+	}
+	p.record("a", answeredProbe())
+	if p.healthy("a") {
+		t.Fatal("backend should be down after a full run of failures from a working probe")
 	}
 }
 
@@ -606,7 +681,7 @@ func TestProber_RealFailureInARejectedRunMarksDown(t *testing.T) {
 // other permanently failing backend.
 func TestProber_AlternatingOutcomeKindsStillMarkDown(t *testing.T) {
 	rejected := func(p *prober) error { return rejectedProbe(p) }
-	failed := func(*prober) error { return errors.New("boom") }
+	failed := func(*prober) error { return answeredProbe() }
 	ok := func(*prober) error { return nil }
 
 	cycles := map[string][]func(*prober) error{
@@ -667,12 +742,12 @@ func TestProber_SuccessResetsTheRunInEveryDirection(t *testing.T) {
 				case "rejected":
 					return rejectedProbe(p)
 				case "failure":
-					return errors.New("boom")
+					return answeredProbe()
 				default:
 					if i%2 == 0 {
 						return rejectedProbe(p)
 					}
-					return errors.New("boom")
+					return answeredProbe()
 				}
 			}
 			for i := 0; i < cfgFailures-1; i++ {
@@ -697,41 +772,167 @@ func TestProber_SuccessResetsTheRunInEveryDirection(t *testing.T) {
 	}
 }
 
-func TestProber_RecoversFromProbeUnsupported(t *testing.T) {
-	p := newTestProber(t, healthConfig("http://a.invalid", "http://b.invalid"))
-	markUnsupported(t, p, "a")
+// The misconfigured-path case: nothing has ever answered the probe on this
+// backend, so there is no health signal to gate on and it keeps serving queries
+// however its probes fail — including real failures, since a probe that cannot
+// run supports no conclusion about the backend behind it.
+func TestProber_NeverAnsweredProbeStaysInServiceForever(t *testing.T) {
+	for _, failures := range []int{1, 2, 3, 5, 9} {
+		cfg := healthConfig("http://a.invalid", "http://b.invalid")
+		cfg.HealthProbeFailures = failures
+		p := newTestProber(t, cfg)
 
-	for i := 0; i < p.successes; i++ {
-		p.record("a", nil)
-	}
-	if !p.healthy("a") {
-		t.Fatal("backend left the pool while recovering")
-	}
-	if got := p.snapshot()["a"].stateName(); got != stateHealthy {
-		t.Fatalf("state = %q, want %q", got, stateHealthy)
+		for i := 0; i < 500; i++ {
+			if i%3 == 2 {
+				p.record("a", deadProbe())
+			} else {
+				p.record("a", rejectedProbe(p))
+			}
+			if !p.healthy("a") {
+				t.Fatalf("threshold %d: backend left the pool at probe %d on a probe that never worked", failures, i+1)
+			}
+			if got := p.snapshot()["a"].stateName(); got != stateProbeUnsupported {
+				t.Fatalf("threshold %d: state = %q at probe %d, want %q", failures, got, i+1, stateProbeUnsupported)
+			}
+		}
 	}
 }
 
-// Rejections cannot talk a down backend back into the pool while its failure run
-// is unbroken — the failures are still the run's best evidence. A successful
-// probe ends the run, and rejections after that mean the probe stopped working
-// rather than the backend.
-func TestProber_RejectedProbeReadmitsADownBackendOnlyAfterASuccess(t *testing.T) {
+// Once the probe has answered, the latch is set for good: a later run of
+// rejections means the endpoint moved or its authorization changed, so it
+// counts as failure instead of putting the backend back into probe_unsupported.
+func TestProber_RejectionRunAfterTheLatchIsAFailureRun(t *testing.T) {
 	p := newTestProber(t, healthConfig("http://a.invalid", "http://b.invalid"))
-	markDown(t, p, "a")
+	markUsable(t, p, "a")
 
-	for i := 0; i < p.failures*5; i++ {
+	for i := 0; i < 100; i++ {
 		p.record("a", rejectedProbe(p))
-		if p.healthy("a") {
-			t.Fatal("rejections re-admitted a backend whose failure run never ended")
-		}
+	}
+	if p.healthy("a") {
+		t.Fatal("a rejection run after the probe had worked left the backend in service")
 	}
 	if got := p.snapshot()["a"].stateName(); got != stateUnhealthy {
 		t.Fatalf("state = %q, want %q", got, stateUnhealthy)
 	}
+}
 
-	p.record("a", nil)
-	markUnsupported(t, p, "a")
+// With the latch set the ordinary thresholds apply to every kind of
+// unsuccessful probe, in both directions.
+func TestProber_LatchedBackendExcludesAndReadmits(t *testing.T) {
+	for _, fail := range []func() error{answeredProbe, deadProbe} {
+		p := newTestProber(t, healthConfig("http://a.invalid", "http://b.invalid"))
+		markUsable(t, p, "a")
+
+		for i := 1; i < p.failures; i++ {
+			p.record("a", fail())
+			if !p.healthy("a") {
+				t.Fatalf("backend left the pool after %d of %d failures", i, p.failures)
+			}
+		}
+		p.record("a", fail())
+		if p.healthy("a") {
+			t.Fatal("backend stayed in service after a full failure run")
+		}
+		if got := p.snapshot()["a"].stateName(); got != stateUnhealthy {
+			t.Fatalf("state = %q, want %q", got, stateUnhealthy)
+		}
+
+		for i := 1; i < p.successes; i++ {
+			p.record("a", nil)
+			if p.healthy("a") {
+				t.Fatalf("backend came back after %d of %d successes", i, p.successes)
+			}
+		}
+		p.record("a", nil)
+		if !p.healthy("a") {
+			t.Fatal("backend did not come back after a full success run")
+		}
+		if got := p.snapshot()["a"].stateName(); got != stateHealthy {
+			t.Fatalf("state = %q, want %q", got, stateHealthy)
+		}
+	}
+}
+
+// Every state the prober can hold recovers on nothing but successes.
+func TestProber_RecoversFromEveryState(t *testing.T) {
+	setups := map[string]func(*testing.T, *prober){
+		stateUnprobed:         func(*testing.T, *prober) {},
+		stateUnhealthy:        func(t *testing.T, p *prober) { markDown(t, p, "a") },
+		stateProbeUnsupported: func(t *testing.T, p *prober) { markUnsupported(t, p, "a") },
+	}
+	for name, setup := range setups {
+		t.Run(name, func(t *testing.T) {
+			p := newTestProber(t, healthConfig("http://a.invalid", "http://b.invalid"))
+			setup(t, p)
+			for i := 0; i < p.successes; i++ {
+				p.record("a", nil)
+			}
+			if !p.healthy("a") {
+				t.Fatal("backend did not recover on consecutive successes")
+			}
+			if got := p.snapshot()["a"].stateName(); got != stateHealthy {
+				t.Fatalf("state = %q, want %q", got, stateHealthy)
+			}
+		})
+	}
+}
+
+// The regression this guards: the decaying rule it replaced readmitted a dead
+// backend on a repeating pattern of one failure followed by a run of
+// rejections, once per cycle, forever. Once the probe has answered, no pattern
+// of unsuccessful probes may put a backend back into service — only a success
+// may, and these backends never give one.
+func TestProber_MixedFailureCyclesNeverFlapBackIntoService(t *testing.T) {
+	rejected := func(p *prober) error { return rejectedProbe(p) }
+	failed := func(*prober) error { return answeredProbe() }
+	dead := func(*prober) error { return deadProbe() }
+
+	cycles := map[string][]func(*prober) error{
+		"rejected/failure":      {rejected, failed},
+		"failure/rejected":      {failed, rejected},
+		"failure-heavy 3-cycle": {rejected, failed, failed},
+		"paired 4-cycle":        {rejected, rejected, failed, failed},
+		"transport/rejected":    {dead, rejected},
+		"all rejections":        {rejected},
+	}
+	// The reviewer's exact counterexample, at every run length past any window the
+	// old rule used, in both failure flavours.
+	for n := 1; n <= 10; n++ {
+		run := make([]func(*prober) error, n)
+		for i := range run {
+			run[i] = rejected
+		}
+		cycles[fmt.Sprintf("failure then %d rejections", n)] = append([]func(*prober) error{failed}, run...)
+		cycles[fmt.Sprintf("transport failure then %d rejections", n)] = append([]func(*prober) error{dead}, run...)
+	}
+
+	for name, cycle := range cycles {
+		for failures := 1; failures <= 9; failures++ {
+			t.Run(fmt.Sprintf("%s/threshold %d", name, failures), func(t *testing.T) {
+				cfg := healthConfig("http://a.invalid", "http://b.invalid")
+				cfg.HealthProbeFailures = failures
+				p := newTestProber(t, cfg)
+				markUsable(t, p, "a")
+
+				down := false
+				for i := 0; i < 600; i++ {
+					p.record("a", cycle[i%len(cycle)](p))
+					switch {
+					case !p.healthy("a"):
+						down = true
+					case down:
+						t.Fatalf("backend flapped back into service at probe %d", i+1)
+					}
+				}
+				if !down {
+					t.Fatal("a backend that failed 600 probes never left the pool")
+				}
+				if got := p.snapshot()["a"].stateName(); got != stateUnhealthy {
+					t.Errorf("state = %q, want %q", got, stateUnhealthy)
+				}
+			})
+		}
+	}
 }
 
 func TestProber_LogsProbeRejectionOncePerTransition(t *testing.T) {
@@ -742,10 +943,17 @@ func TestProber_LogsProbeRejectionOncePerTransition(t *testing.T) {
 	}
 
 	rejected := &probeRejectedError{status: http.StatusNotFound, path: p.path}
+	// The warning is debounced by the failure threshold like every other verdict.
+	for i := 0; i < p.failures-1; i++ {
+		p.record("a", rejected)
+	}
+	if buf.Len() != 0 {
+		t.Fatalf("a sub-threshold rejection run was already logged:\n%s", buf.String())
+	}
 	for i := 0; i < 50; i++ {
 		p.record("a", rejected)
 	}
-	if n := strings.Count(buf.String(), "rejected the health probe"); n != 1 {
+	if n := strings.Count(buf.String(), "never answered the health probe"); n != 1 {
 		t.Fatalf("logged the misconfiguration %d times, want once:\n%s", n, buf.String())
 	}
 	if !strings.Contains(buf.String(), `backend "a"`) || !strings.Contains(buf.String(), defaultHealthProbePath) {
@@ -755,18 +963,49 @@ func TestProber_LogsProbeRejectionOncePerTransition(t *testing.T) {
 		t.Errorf("log line does not name the status: %s", buf.String())
 	}
 
-	// Recovery logs its own single line, and a second rejected run logs again.
+	// The probe starting to answer logs its own single line.
 	for i := 0; i < p.successes+5; i++ {
 		p.record("a", nil)
 	}
-	if n := strings.Count(buf.String(), "usable again"); n != 1 {
-		t.Fatalf("logged recovery %d times, want once:\n%s", n, buf.String())
+	if n := strings.Count(buf.String(), "now answers the health probe"); n != 1 {
+		t.Fatalf("logged the probe becoming usable %d times, want once:\n%s", n, buf.String())
 	}
+
+	// A rejection run once the probe has worked is a different event, logged loudly
+	// when it starts and never again while it lasts.
+	buf.Reset()
 	for i := 0; i < 50; i++ {
 		p.record("a", rejected)
 	}
-	if n := strings.Count(buf.String(), "rejected the health probe"); n != 2 {
-		t.Fatalf("second rejected run logged %d times in total, want 2:\n%s", n, buf.String())
+	if n := strings.Count(buf.String(), "now rejects the health probe"); n != 1 {
+		t.Fatalf("logged the rejection run %d times, want once:\n%s", n, buf.String())
+	}
+	if n := strings.Count(buf.String(), "never answered the health probe"); n != 0 {
+		t.Errorf("a rejection run after the probe worked was reported as an unusable probe:\n%s", buf.String())
+	}
+	if n := strings.Count(buf.String(), "is down after"); n != 1 {
+		t.Errorf("the backend going down was logged %d times, want once:\n%s", n, buf.String())
+	}
+}
+
+func TestProber_LogsEachDownAndUpTransitionOnce(t *testing.T) {
+	var buf strings.Builder
+	p := newProber(healthConfig("http://a.invalid", "http://b.invalid"), log.New(&buf, "", 0))
+	if p == nil {
+		t.Fatal("newProber returned nil for an enabled config")
+	}
+
+	for i := 0; i < p.failures+20; i++ {
+		p.record("a", answeredProbe())
+	}
+	for i := 0; i < p.successes+20; i++ {
+		p.record("a", nil)
+	}
+	if n := strings.Count(buf.String(), "is down after"); n != 1 {
+		t.Errorf("logged the backend going down %d times, want once:\n%s", n, buf.String())
+	}
+	if n := strings.Count(buf.String(), "is up after"); n != 1 {
+		t.Errorf("logged the backend coming back %d times, want once:\n%s", n, buf.String())
 	}
 }
 
