@@ -26,6 +26,8 @@ not PQL) is forwarded verbatim.
 |---|---|
 | `GET /pdb/query/v4/nodes` | Fan out to all backends, dedupe by `certname`, keep the record with the newer `report_timestamp`, stamped with the winning backend's name (see provenance). An `extract`/`count` query is **summed** instead. |
 | `GET /pdb/query/v4/facts` | Fan out to all, and per `certname` keep **all** facts from the backend that owns that node (see merge semantics), plus a synthetic `pdbmux_source` fact naming it. An `extract`/`count` query is **summed** instead. |
+| `GET /pdb/query/v4/facts/<name>[/<value>]` | Same fan-out and merge as `/facts`, and an `extract`/`count` query is **summed** the same way. The path segment is a `name` constraint, so no synthetic `pdbmux_source` record is added — except on the fact's own path, which is **synthesised** from the `/facts` merge (see provenance). |
+| `GET /pdb/query/v4/fact-names` | Fan out to all and serve the **union** of the flat name arrays, deduped and re-sorted, re-paged across backends, plus the `pdbmux_source` name while injection is on. `order_by` is only valid on `name`. |
 | `GET /pdb/query/v4/resources` | An `extract`/`count` query is fanned out and **summed**; any other query is an unmerged pass-through. |
 | `GET /pdb/query/v4/reports` | Fan out to all and serve the **union**, deduped by report `hash`, re-ordered and re-paged across backends. |
 | `GET /pdb/query/v4/events` | Fan out to all and serve the **union**, deduped by record identity, re-ordered and re-paged. |
@@ -67,6 +69,18 @@ paths add two more headers `pdbmux` sets itself, `X-Cache` and `Age` — see
     facts from the first backend in configured order that holds it.
   - A node present in only one backend always appears (falls back to whichever
     backend actually returned facts for it).
+  - `/facts/<name>` and `/facts/<name>/<value>` are the same records with one
+    more constraint applied upstream, so they take the same rule — and the same
+    aggregate branch, since a count row has no `certname` there either. The
+    `pdbmux_source` path is the exception: no backend holds that name, so it is
+    synthesised from the `/facts` merge (see provenance).
+- **`/fact-names`** — a flat array of strings, not records: **union**, deduped by
+  the name and re-sorted, ascending unless `order_by` says otherwise. `name` is
+  the only column the entity projects, so an `order_by` on any other field is
+  rejected with `400`, as the backends reject it. While injection is on the
+  `pdbmux_source` name is listed too, exactly once (see provenance).
+  `include_total=true` reports the deduped union's size, so the `limit` is applied
+  to the merged list rather than pushed upstream.
 - **`/reports`, `/events`** — **union**, not a per-node winner. Reports are
   immutable history, so a node's reports can legitimately exist in more than one
   backend and all of them belong in the merged view. Reports dedupe on `hash`;
@@ -75,17 +89,18 @@ paths add two more headers `pdbmux` sets itself, `X-Cache` and `Age` — see
 - **Aggregates** — `extract`/`group_by` rows are counts, not records, so each
   backend returns a partial answer that has to be **added**, not deduped. This
   covers `/event-counts`, `/aggregate-event-counts`, and any `/reports`,
-  `/nodes`, `/facts` or `/resources` query whose `extract` carries a
-  `["function", ...]` column.
+  `/nodes`, `/resources`, `/facts` or `/facts/<name>[/<value>]` query whose
+  `extract` carries a `["function", ...]` column.
   - The grouping key is the row's non-aggregate fields: for `/reports`,
-    `/nodes`, `/facts` and `/resources` they come from the query — the plain
-    `extract` fields plus any `group_by` clause — and for the event-count
-    endpoints from the row itself (`subject_type`/`subject`, or
+    `/nodes`, `/resources`, `/facts` and `/facts/<name>` they come from the
+    query — the plain `extract` fields plus any `group_by` clause — and for the
+    event-count endpoints from the row itself (`subject_type`/`subject`, or
     `summarize_by`), whose remaining fields are all counts.
-  - On `/nodes` and `/facts` this takes precedence over the `certname` merge: an
-    aggregate row has no `certname`, so deduping would collapse every backend's
-    rows into one backend's numbers. A query with no `function` column —
-    including a plain `extract` projection — still merges by `certname`.
+  - On `/nodes`, `/facts` and `/facts/<name>[/<value>]` this takes precedence
+    over the `certname` merge: an aggregate row has no `certname`, so deduping
+    would collapse every backend's rows into one backend's numbers. A query with
+    no `function` column — including a plain `extract` projection — still merges
+    by `certname`.
   - PuppetDB accepts `count`, `sum`, `avg`, `min`, `max`, `to_string` and
     `jsonb_typeof` as `extract` functions. Only `count` and `sum` are additive,
     so only those two merge correctly. `avg`, `min` and `max` are folded like any
@@ -155,7 +170,30 @@ matters more.
   Only the outer query is inspected: a `name` filter inside an `in`/`select_facts`
   subquery narrows which *nodes* match, not which facts come back, so injection
   still happens;
+- the path is `/facts/<name>` for any other fact. The path segment is the same
+  outer `name` constraint, so only the fact's own path carries the record;
 - injection is turned off (see `source_fact_enabled`).
+
+**The fact's own path is synthesised.** `/pdb/query/v4/fact-names` lists the name
+while injection is on, so a client that discovers names there can click through
+to it, and `/pdb/query/v4/facts/pdbmux_source` has to answer. No backend holds a
+record of that name, so the route does not serve its own fan-out: it takes the
+records from the `/facts` merge that produces them, which makes the `certname`
+set, the owner and the `environment` identical to the ones an unfiltered `/facts`
+response reports, and lets the request's own `query` narrow the result upstream.
+That costs one `/facts` fan-out per cache miss — the widest fan-out `pdbmux`
+makes — on a rare, user-initiated path.
+
+`/facts/pdbmux_source/<value>` pins the backend name, so it answers with the
+nodes that backend owns. The `<value>` segment never reaches that fan-out: the
+synthetic record's value is always a backend name, so a value naming none is
+answered `[]` from the configured names alone, with no fan-out at all, and a
+value naming one filters a record set fetched under a key the value is not part
+of. The record set is a property of the estate rather than of the filter, so
+every value of it — and the unfiltered path — share one entry and one fetch.
+An `extract`/`count` query still takes the summing branch, and the gated query
+shapes above still answer `[]`, as does every form while injection is off — with
+the name kept out of `/fact-names`, since nothing then produces it.
 
 **Not supported in v1: server-side filtering on the fact.** A query that selects
 it — `["=","name","pdbmux_source"]`, or an `extract` naming it — is forwarded to
@@ -163,8 +201,7 @@ the backends like any other, and they return nothing, because the fact does not
 exist upstream. `pdbmux` does not evaluate the AST itself, so it cannot answer
 such a query correctly for every operator (`not`, `or`, subqueries) and does not
 pretend to for some. Read the fact from an unfiltered (or `certname`-filtered)
-`/facts` response and filter client-side. The same applies to the
-`/pdb/query/v4/facts/<name>` route, which is served unmerged pass-through.
+`/facts` response, from the path route above, and filter client-side.
 
 **Not covered:** `/factsets` and `/inventory`. Both carry facts, but `pdbmux`
 does not merge either today — they take the unmerged pass-through path, where
@@ -323,9 +360,11 @@ not answering.
 
 ## Caching
 
-`pdbmux` caches merged `/nodes` and `/facts` record sets **in memory** so a busy
-Puppetboard does not re-fan-out the same query every few seconds. Everything else
-runs uncached — including `extract`/`count` aggregates on those two paths, and
+`pdbmux` caches merged `/nodes`, `/facts`, `/facts/<name>[/<value>]` and
+`/fact-names` record sets **in memory** so a busy Puppetboard does not re-fan-out
+the same query every few seconds — its facts overview and fact drilldown are two
+of the pages that hit hardest. Everything else runs uncached — including
+`extract`/`count` aggregates on those paths, and
 the `/pdb/meta/v1/*` and `/metrics/*` endpoints, which are served live on every
 request. The cache is an interface, and `/reports` gets its own (S3-backed)
 backend later without further handler changes.
@@ -374,7 +413,9 @@ backend later without further handler changes.
   requests can only share an entry when they share a key, and the key is path
   plus query, which is exactly what decides whether injection applies; a
   name-filtered `/facts` query and a plain one therefore cache separately and
-  neither is ever served the other's shape. `source_fact` and
+  neither is ever served the other's shape. The one path that keys on less than
+  it is asked is the `pdbmux_source` drilldown, whose `<value>` is dropped from
+  the key and applied to the shared entry instead. `source_fact` and
   `source_fact_enabled` are read once at startup, and the cache lives for the
   same process, so changing either cannot leave differently-shaped entries
   behind.
@@ -481,11 +522,7 @@ have drained.
 | `PDBMUX_E2E_TUNNEL_IMAGE` | `docker.io/library/alpine:3` |
 | `PDBMUX_E2E_NODE_LOOKUP` | path to a `node-lookup` binary (else `PATH`, else skipped) |
 
-Two tests skip rather than assert, each naming a known gap and failing if that
-gap closes: `/pdb/query/v4/facts/<name>` is served unmerged (so Puppetboard's
-single-fact drilldown silently loses the other backend's nodes), and
-`/fact-names` is likewise unmerged (so the facts overview lists only the first
-backend's fact names).
+Every test asserts; the suite records no known gaps.
 
 ## Deployment
 

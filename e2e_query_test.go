@@ -5,6 +5,8 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"net/http"
 	"net/url"
 	"reflect"
 	"sort"
@@ -57,6 +59,208 @@ func TestFactsUnionAcrossBackends(t *testing.T) {
 			t.Errorf("fact %s of %s = %v, want %q", tc.fact, tc.certname, got, tc.want)
 		}
 	}
+}
+
+// The /facts/<name> path route carries the same records /facts does, so it takes
+// the same merge: every node in the estate, each resolved to one backend.
+func TestFactsByNamePathIsMerged(t *testing.T) {
+	resp := get(t, factsPath+"/osfamily", nil)
+	rows := resp.rows(t)
+
+	if got := e2eCertnames(rows); !equalStrings(got, allNodes) {
+		t.Fatalf("merged /facts/osfamily certnames = %v, want %v", got, allNodes)
+	}
+	if len(rows) != len(allNodes) {
+		t.Fatalf("/facts/osfamily returned %d records for %d nodes, so a shared node was not deduped", len(rows), len(allNodes))
+	}
+	if got, _ := factValue(rows, nodeShared, "osfamily"); got != "Debian" {
+		t.Errorf("osfamily of %s = %v, want Debian from the fresher backend", nodeShared, got)
+	}
+	if got := resp.header.Get(backendsHeader); got != "2/2" {
+		t.Errorf("%s = %q, want %q", backendsHeader, got, "2/2")
+	}
+
+	t.Run("the name constraint gates injection", func(t *testing.T) {
+		for _, row := range rows {
+			if row["name"] == defaultSourceFact {
+				t.Fatalf("%s was injected into a /facts/<name> response: %v", defaultSourceFact, row)
+			}
+		}
+	})
+
+	t.Run("the value sub-route merges too", func(t *testing.T) {
+		rows := get(t, factsPath+"/osfamily/Debian", nil).rows(t)
+		want := []string{nodeBeta, nodeGamma, nodeShared}
+		if got := e2eCertnames(rows); !equalStrings(got, want) {
+			t.Errorf("/facts/osfamily/Debian certnames = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("a fact only one backend holds survives", func(t *testing.T) {
+		rows := get(t, factsPath+"/only_b", nil).rows(t)
+		if got, ok := factValue(rows, nodeBeta, "only_b"); !ok || got != "yes" {
+			t.Errorf("/facts/only_b for %s = %v (present %v), want yes", nodeBeta, got, ok)
+		}
+	})
+}
+
+// /fact-names is a flat array of strings, so it needs its own union: the merged
+// list is every backend's names, deduped and sorted.
+func TestFactNamesAreMerged(t *testing.T) {
+	resp := get(t, factNamesPath, nil)
+	var got []string
+	if err := json.Unmarshal(resp.body, &got); err != nil {
+		t.Fatalf("/fact-names is not a flat string array: %v: %s", err, resp.body)
+	}
+
+	for _, name := range []string{"osfamily", "kernel", "role", "owner", "only_a", "only_b", "extra_b"} {
+		if !containsString(got, name) {
+			t.Errorf("merged /fact-names is missing %s: %v", name, got)
+		}
+	}
+	if !sort.StringsAreSorted(got) {
+		t.Errorf("merged /fact-names is not sorted ascending: %v", got)
+	}
+	seen := map[string]bool{}
+	for _, name := range got {
+		if seen[name] {
+			t.Errorf("merged /fact-names lists %s twice: %v", name, got)
+		}
+		seen[name] = true
+	}
+	// The merged /facts response carries a record of the name pdbmux owns, so a
+	// client discovering names here has to see it.
+	if !seen[defaultSourceFact] {
+		t.Errorf("merged /fact-names omits %s, which every merged /facts response carries: %v", defaultSourceFact, got)
+	}
+	if got := resp.header.Get(backendsHeader); got != "2/2" {
+		t.Errorf("%s = %q, want %q", backendsHeader, got, "2/2")
+	}
+
+	t.Run("paging and ordering are redone across the union", func(t *testing.T) {
+		params := url.Values{
+			"order_by":      {`[{"field":"name","order":"desc"}]`},
+			"limit":         {"3"},
+			"include_total": {"true"},
+		}
+		resp := get(t, factNamesPath, params)
+		var page []string
+		if err := json.Unmarshal(resp.body, &page); err != nil {
+			t.Fatalf("decoding the paged /fact-names response: %v: %s", err, resp.body)
+		}
+		want := append([]string{}, got...)
+		sort.Sort(sort.Reverse(sort.StringSlice(want)))
+		if len(want) > 3 {
+			want = want[:3]
+		}
+		if !equalStrings(page, want) {
+			t.Errorf("descending /fact-names page = %v, want %v", page, want)
+		}
+		if n := resp.header.Get(recordsHeader); n != fmt.Sprint(len(got)) {
+			t.Errorf("%s = %q, want the merged count %d", recordsHeader, n, len(got))
+		}
+	})
+
+	// name is the only column the entity projects, so pdbmux rejects any other
+	// order_by field the way the backends do.
+	t.Run("an order_by on another field is rejected", func(t *testing.T) {
+		params := url.Values{"order_by": {`[{"field":"bogus","order":"desc"}]`}}
+		if r := rawGet(t, factNamesPath, params); r.status != http.StatusBadRequest {
+			t.Errorf("merged /fact-names order_by bogus = HTTP %d, want 400: %s", r.status, r.body)
+		}
+		if r := h.a.queryStatus(context.Background(), t, factNamesPath, params); r != http.StatusBadRequest {
+			t.Errorf("backend %s answered HTTP %d for the same order_by, so 400 is not what it does", h.a.name, r)
+		}
+	})
+}
+
+// A fact aggregate row carries no certname, so the per-certname merge would keep
+// one backend's row and drop the other's; only adding the numbers is right.
+func TestFactsByNamePathAggregatesAreSummed(t *testing.T) {
+	ctx := context.Background()
+	const q = `["extract",[["function","count"]]]`
+
+	for _, path := range []string{factsPath + "/kernel", factsPath + "/kernel/Linux"} {
+		t.Run(path, func(t *testing.T) {
+			wantA := backendCount(ctx, t, h.a, path, q)
+			wantB := backendCount(ctx, t, h.b, path, q)
+			if wantA == wantB {
+				t.Fatalf("the fixture gives both backends %d records on %s, so a sum is indistinguishable from one backend's number", wantA, path)
+			}
+
+			resp := get(t, path, query(q))
+			if got := countOf(t, resp.rows(t)); got != wantA+wantB {
+				t.Fatalf("%s count = %d, want %d (%s=%d + %s=%d)", path, got, wantA+wantB, h.a.name, wantA, h.b.name, wantB)
+			}
+			if got := resp.header.Get(backendsHeader); got != "2/2" {
+				t.Errorf("%s = %q, want %q", backendsHeader, got, "2/2")
+			}
+		})
+	}
+
+	t.Run("grouped counts are summed per key", func(t *testing.T) {
+		const grouped = `["extract",[["function","count"],"value"],["group_by","value"]]`
+		path := factsPath + "/osfamily"
+		want := map[string]int{}
+		for _, b := range []*backend{h.a, h.b} {
+			for value, n := range countsByValue(t, b.query(ctx, t, path, query(grouped))) {
+				want[value] += n
+			}
+		}
+		got := countsByValue(t, get(t, path, query(grouped)).rows(t))
+		if !equalCounts(got, want) {
+			t.Errorf("grouped %s counts = %v, want %v", path, got, want)
+		}
+	})
+
+	t.Run("a query with no function column still merges by certname", func(t *testing.T) {
+		rows := get(t, factsPath+"/kernel", nil).rows(t)
+		if got := e2eCertnames(rows); !equalStrings(got, allNodes) {
+			t.Errorf("/facts/kernel certnames = %v, want %v", got, allNodes)
+		}
+		if len(rows) != len(allNodes) {
+			t.Errorf("/facts/kernel returned %d records for %d nodes, so a shared node was not deduped", len(rows), len(allNodes))
+		}
+	})
+}
+
+// countsByValue reads a ["function","count"] + group_by "value" result set.
+func countsByValue(t *testing.T, rows []map[string]any) map[string]int {
+	t.Helper()
+	out := map[string]int{}
+	for _, row := range rows {
+		value, ok := row["value"].(string)
+		if !ok {
+			t.Fatalf("grouped aggregate row has no value: %v", row)
+		}
+		n, ok := row["count"].(float64)
+		if !ok {
+			t.Fatalf("grouped aggregate row has no numeric count: %v", row)
+		}
+		out[value] = int(n)
+	}
+	return out
+}
+
+func equalCounts(a, b map[string]int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if b[k] != v {
+			return false
+		}
+	}
+	return true
+}
+
+func containsString(s []string, v string) bool {
+	for _, x := range s {
+		if x == v {
+			return true
+		}
+	}
+	return false
 }
 
 // The shared node's two copies disagree on every fact value; the backend holding
@@ -280,6 +484,83 @@ func TestSourceFactInjectionAndGating(t *testing.T) {
 		rows := get(t, factsPath, query(`["=","certname","`+nodeAlpha+`"]`)).rows(t)
 		if _, ok := factValue(rows, nodeAlpha, defaultSourceFact); !ok {
 			t.Fatalf("%s is missing from a certname-filtered query, which is not a gated shape", defaultSourceFact)
+		}
+	})
+}
+
+// /fact-names advertises the fact, so its drilldown has to answer with the same
+// records /facts carries rather than the empty set the backends hold.
+func TestSourceFactDrilldown(t *testing.T) {
+	want := map[string]string{
+		nodeAlpha:  backendAName,
+		nodeBeta:   backendBName,
+		nodeGamma:  backendBName,
+		nodeShared: backendBName, // won on freshness, not on configured order
+	}
+	path := factsPath + "/" + defaultSourceFact
+
+	t.Run("one record per node, attributed as /facts attributes it", func(t *testing.T) {
+		resp := get(t, path, nil)
+		rows := resp.rows(t)
+		if got := e2eCertnames(rows); !equalStrings(got, allNodes) {
+			t.Fatalf("%s certnames = %v, want %v", path, got, allNodes)
+		}
+		if len(rows) != len(allNodes) {
+			t.Fatalf("%s returned %d records for %d nodes", path, len(rows), len(allNodes))
+		}
+		unfiltered := get(t, factsPath, nil).rows(t)
+		for _, row := range rows {
+			cn, _ := row["certname"].(string)
+			if row["name"] != defaultSourceFact {
+				t.Errorf("%s returned a record named %v", path, row["name"])
+			}
+			if row["value"] != want[cn] {
+				t.Errorf("%s for %s = %v, want %q", path, cn, row["value"], want[cn])
+			}
+			// The drilldown must not disagree with the response it stands for.
+			if got, ok := factValue(unfiltered, cn, defaultSourceFact); !ok || got != row["value"] {
+				t.Errorf("%s for %s = %v, want the %s value %v", path, cn, row["value"], factsPath, got)
+			}
+			if _, ok := row["environment"]; !ok {
+				t.Errorf("%s record for %s has no environment key", path, cn)
+			}
+		}
+		if got := resp.header.Get(backendsHeader); got != "2/2" {
+			t.Errorf("%s = %q, want %q", backendsHeader, got, "2/2")
+		}
+	})
+
+	t.Run("the value sub-route filters by owning backend", func(t *testing.T) {
+		for _, tc := range []struct {
+			value string
+			want  []string
+		}{
+			{backendAName, []string{nodeAlpha}},
+			{backendBName, []string{nodeBeta, nodeGamma, nodeShared}},
+			{"nosuchbackend", nil},
+		} {
+			rows := get(t, path+"/"+tc.value, nil).rows(t)
+			if got := e2eCertnames(rows); !equalStrings(got, tc.want) {
+				t.Errorf("%s/%s certnames = %v, want %v", path, tc.value, got, tc.want)
+			}
+		}
+	})
+
+	t.Run("a certname query narrows the drilldown", func(t *testing.T) {
+		rows := get(t, path, query(`["=","certname","`+nodeAlpha+`"]`)).rows(t)
+		if got := e2eCertnames(rows); !equalStrings(got, []string{nodeAlpha}) {
+			t.Errorf("certname-filtered %s = %v, want only %s", path, got, nodeAlpha)
+		}
+	})
+
+	// An aggregate carries no certname to attribute, so it stays summed.
+	t.Run("an aggregate is still summed", func(t *testing.T) {
+		ctx := context.Background()
+		const q = `["extract",[["function","count"]]]`
+		wantA := backendCount(ctx, t, h.a, path, q)
+		wantB := backendCount(ctx, t, h.b, path, q)
+		if got := countOf(t, get(t, path, query(q)).rows(t)); got != wantA+wantB {
+			t.Errorf("%s count = %d, want %d (%s=%d + %s=%d)", path, got, wantA+wantB, h.a.name, wantA, h.b.name, wantB)
 		}
 	})
 }

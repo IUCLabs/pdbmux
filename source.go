@@ -39,6 +39,14 @@ func (si *sourceInjector) injects() bool {
 	return si != nil && si.inject
 }
 
+// disableInject rules the synthetic record out for a request shape the query
+// gate cannot see, leaving suppression on.
+func (si *sourceInjector) disableInject() {
+	if si != nil {
+		si.inject = false
+	}
+}
+
 // logSuppressed reports, once per request, that upstream records were dropped.
 func (si *sourceInjector) logSuppressed(l *log.Logger) {
 	if si == nil || si.suppressed == 0 || l == nil {

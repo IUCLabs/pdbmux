@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"sort"
 	"time"
 )
 
@@ -168,6 +169,86 @@ func mergeFacts(results []backendResult, owner func(certname string) string, inj
 		}
 	}
 	return out
+}
+
+// sourceFactRecords keeps the merged /facts records naming the fact pdbmux
+// owns, and, when the path pins a value, only those naming that backend. The
+// merge drops every upstream record of that name, so what survives is exactly
+// the synthetic set — one record per certname the merge attributed.
+func sourceFactRecords(merged []json.RawMessage, name, value string, valued bool) []json.RawMessage {
+	out := []json.RawMessage{}
+	for _, raw := range merged {
+		var m struct {
+			Name  string `json:"name"`
+			Value string `json:"value"`
+		}
+		if json.Unmarshal(raw, &m) != nil || m.Name != name {
+			continue
+		}
+		if valued && m.Value != value {
+			continue
+		}
+		out = append(out, raw)
+	}
+	return out
+}
+
+// mergeFactNames unions the backends' /fact-names arrays, dedupes by the name
+// itself and re-sorts, since each backend only ordered its own slice. owned is
+// the fact name pdbmux injects, or "" while injection is off: it is listed
+// whether or not a backend reports it, because the merged /facts response
+// carries records of that name.
+func mergeFactNames(results []backendResult, owned string, desc bool) []json.RawMessage {
+	seen := map[string]bool{}
+	raws := []json.RawMessage{}
+	values := []any{}
+	add := func(raw json.RawMessage) {
+		key := factNameKey(raw)
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+		var v any
+		_ = json.Unmarshal(raw, &v) // an undecodable element sorts as null
+		raws = append(raws, raw)
+		values = append(values, v)
+	}
+	for _, res := range results {
+		for _, rec := range res.records {
+			add(rec.Raw)
+		}
+	}
+	if owned != "" {
+		if raw, err := json.Marshal(owned); err == nil {
+			add(raw)
+		}
+	}
+	idx := make([]int, len(raws))
+	for i := range idx {
+		idx[i] = i
+	}
+	sort.SliceStable(idx, func(a, b int) bool {
+		c := compareValues(values[idx[a]], values[idx[b]])
+		if desc {
+			return c > 0
+		}
+		return c < 0
+	})
+	out := make([]json.RawMessage, 0, len(raws))
+	for _, i := range idx {
+		out = append(out, raws[i])
+	}
+	return out
+}
+
+// Two encoders can spell one name differently — Go escapes <, > and & — so a
+// name is deduped on its decoded value, not on its bytes.
+func factNameKey(raw json.RawMessage) string {
+	var name string
+	if json.Unmarshal(raw, &name) == nil {
+		return "s\x00" + name
+	}
+	return "r\x00" + string(raw)
 }
 
 func environmentOf(recs []record) string {
