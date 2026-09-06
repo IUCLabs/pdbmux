@@ -400,6 +400,49 @@ func TestParseAggregate_FieldClashingWithAFunctionIsRefused(t *testing.T) {
 	}
 }
 
+// The ordering the sibling case does not cover: the function column comes first
+// and a later plain field takes the response key it already named.
+func TestParseAggregate_FunctionClashingWithALaterFieldIsRefused(t *testing.T) {
+	const q = `["extract",[["function","count","certname"],"count"],["=","certname","h1"]]`
+	spec, err := parseAggregate(q)
+	if err == nil {
+		t.Fatalf("parseAggregate(%s) = %+v, want a refusal", q, spec)
+	}
+	if !strings.Contains(err.Error(), "count") {
+		t.Errorf("error %q does not name the clashing column", err)
+	}
+}
+
+// A group_by naming a folded column would make it a grouping key and an
+// aggregate at once, so it is refused rather than sent upstream to fail.
+func TestParseAggregate_GroupByOnAnAggregateColumnIsRefused(t *testing.T) {
+	for _, fn := range []string{"count", "sum", "min", "max", "avg"} {
+		q := `["extract",[["function","` + fn + `","line"]],["group_by","` + fn + `"]]`
+		spec, err := parseAggregate(q)
+		if err == nil {
+			t.Errorf("parseAggregate(%s) = %+v, want a refusal", q, spec)
+			continue
+		}
+		if !strings.Contains(err.Error(), fn) {
+			t.Errorf("error %q does not name the clashing column %q", err, fn)
+		}
+	}
+}
+
+// The refusal is limited to the folded columns: grouping on a plain field or on
+// a row function's own column stays legitimate.
+func TestParseAggregate_GroupByOnANonAggregateColumnIsKept(t *testing.T) {
+	for _, q := range []string{
+		`["extract",[["function","count","certname"],"status"],["group_by","status"]]`,
+		`["extract",[["function","to_string","producer_timestamp","FMDD"],["function","count"]],["group_by",["function","to_string","producer_timestamp","FMDD"]]]`,
+		`["extract",[["function","avg","line"],"type"],["group_by","type"]]`,
+	} {
+		if spec, err := parseAggregate(q); err != nil || spec == nil {
+			t.Errorf("parseAggregate(%s) = %+v, %v, want an accepted spec", q, spec, err)
+		}
+	}
+}
+
 // A repeated plain field projects the same value twice, so it is no clash: the
 // duplicate carries nothing the grouping key has not already got.
 func TestParseAggregate_RepeatedPlainFieldIsKept(t *testing.T) {

@@ -138,6 +138,9 @@ func parseAggregate(query string) (*aggregateSpec, error) {
 	}
 	for _, node := range ast[2:] {
 		for _, f := range groupByFields(node) {
+			if hasAgg(spec.aggs, f) || (spec.avg && f == avgColumn) {
+				return nil, groupByClash(f)
+			}
 			spec.keys = appendUnique(spec.keys, f)
 		}
 	}
@@ -155,6 +158,13 @@ func parseAggregate(query string) (*aggregateSpec, error) {
 // aggregate, leaving the first backend's value frozen in the merged row.
 func columnClash(name string) error {
 	return fmt.Errorf("extract projects the column %q more than once: openvoxdb returns the repeat as %q, which pdbmux can neither key on nor fold", name, name+"_2")
+}
+
+// groupByClash refuses a group_by naming an aggregate column: the same key
+// cannot both identify a row and be folded across backends. openvoxdb rejects
+// the shape too, so refusing here is a 400 instead of a failed upstream query.
+func groupByClash(name string) error {
+	return fmt.Errorf("group_by names the aggregate column %q: pdbmux folds that column across backends, so it cannot also be a grouping key", name)
 }
 
 // rewriteAvg replaces the client's avg column with the sum and count of the same
