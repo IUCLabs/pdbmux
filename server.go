@@ -26,6 +26,9 @@ const (
 	aggregateEventCountsPath = "/pdb/query/v4/aggregate-event-counts"
 	queryV4                  = "/pdb/query/v4/"
 
+	// The only column /fact-names projects, so the only one it can be ordered on.
+	factNamesColumn = "name"
+
 	// PuppetDB only sends this when the request carries include_total=true.
 	recordsHeader = "X-Records"
 
@@ -143,7 +146,7 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		s.serveSummed(w, r, r.URL.Path, inferredColumns)
 	default:
 		if name, valued := factsSubPath(r.URL.Path); name != "" {
-			s.serveMerged(w, r, r.URL.Path, s.mergeFactsByNameResponse(r, name, valued))
+			s.serveFactsByName(w, r, name, valued)
 			return
 		}
 		if isReportSubResource(r.URL.Path) {
@@ -185,8 +188,9 @@ func isFactsSubPath(path string) bool {
 // because each backend only ordered its own slice. openvoxdb projects a single
 // DISTINCT `name` column and defaults to name-ascending
 // (src/puppetlabs/puppetdb/query_eng/engine.clj:488-498,
-// src/puppetlabs/puppetdb/http/handlers.clj:349-362), so an order_by can only be
-// on that column and its direction is all this route reads.
+// src/puppetlabs/puppetdb/http/handlers.clj:349-362), so an order_by on any
+// other field is rejected as openvoxdb rejects it, and the direction is all this
+// route reads.
 func (s *Server) serveFactNames(w http.ResponseWriter, r *http.Request) {
 	in := r.URL.Query()
 	page, err := parsePaging(in)
@@ -194,12 +198,20 @@ func (s *Server) serveFactNames(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	for _, f := range page.order {
+		if f.Field != factNamesColumn {
+			http.Error(w, fmt.Sprintf("order_by field must be %q, got %q", factNamesColumn, f.Field), http.StatusBadRequest)
+			return
+		}
+	}
 	desc := len(page.order) > 0 && page.order[0].Desc
 
-	// Built only for the name pdbmux owns: a string list has no query shape for
-	// the injection gate to read, and nothing is ever injected here.
-	suppress := s.newSourceInjector("", true)
-	suppress.disableInject()
+	// The merged /facts response carries the injected fact, so the list of names
+	// has to carry its name; nothing produces it while injection is off.
+	owned := ""
+	if s.cfg.SourceFactEnabled {
+		owned = s.cfg.SourceFact
+	}
 
 	upstream := page.upstreamParams(in)
 	if page.wantTotal {
@@ -213,8 +225,7 @@ func (s *Server) serveFactNames(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			return cachedResponse{}, err
 		}
-		merged := mergeFactNames(alive, suppress, desc)
-		suppress.logSuppressed(s.log)
+		merged := mergeFactNames(alive, owned, desc)
 		resp := cachedResponse{Body: encodeRecords(page.apply(merged)), Records: -1}
 		s.countBackends(&resp, alive)
 		if page.wantTotal {
@@ -287,6 +298,17 @@ func (s *Server) serveUnion(w http.ResponseWriter, r *http.Request, path string,
 		}
 		return resp, nil
 	})
+}
+
+// Both path forms are the facts entity with a name (and value) constraint ANDed
+// on, so an aggregate over them carries no certname for the per-certname merge
+// to key on, and is summed instead — the same split /nodes makes.
+func (s *Server) serveFactsByName(w http.ResponseWriter, r *http.Request, name string, valued bool) {
+	if spec := parseAggregate(r.URL.Query().Get("query")); spec != nil {
+		s.serveSummed(w, r, r.URL.Path, spec.columns)
+		return
+	}
+	s.serveMerged(w, r, r.URL.Path, s.mergeFactsByNameResponse(r, name, valued))
 }
 
 // A count row carries no certname, so the certname-keyed merge would collapse every backend's count into one backend's; aggregates take the summing path instead.

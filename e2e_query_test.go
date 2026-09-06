@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"net/url"
 	"sort"
 	"testing"
@@ -126,10 +127,10 @@ func TestFactNamesAreMerged(t *testing.T) {
 		}
 		seen[name] = true
 	}
-	// No merged /facts response can serve the name pdbmux owns, so the list must
-	// not advertise it.
-	if seen[defaultSourceFact] {
-		t.Errorf("merged /fact-names advertises %s, which no /facts response carries upstream", defaultSourceFact)
+	// The merged /facts response carries a record of the name pdbmux owns, so a
+	// client discovering names here has to see it.
+	if !seen[defaultSourceFact] {
+		t.Errorf("merged /fact-names omits %s, which every merged /facts response carries: %v", defaultSourceFact, got)
 	}
 	if got := resp.header.Get(backendsHeader); got != "2/2" {
 		t.Errorf("%s = %q, want %q", backendsHeader, got, "2/2")
@@ -158,6 +159,98 @@ func TestFactNamesAreMerged(t *testing.T) {
 			t.Errorf("%s = %q, want the merged count %d", recordsHeader, n, len(got))
 		}
 	})
+
+	// name is the only column the entity projects, so pdbmux rejects any other
+	// order_by field the way the backends do.
+	t.Run("an order_by on another field is rejected", func(t *testing.T) {
+		params := url.Values{"order_by": {`[{"field":"bogus","order":"desc"}]`}}
+		if r := rawGet(t, factNamesPath, params); r.status != http.StatusBadRequest {
+			t.Errorf("merged /fact-names order_by bogus = HTTP %d, want 400: %s", r.status, r.body)
+		}
+		if r := h.a.queryStatus(context.Background(), t, factNamesPath, params); r != http.StatusBadRequest {
+			t.Errorf("backend %s answered HTTP %d for the same order_by, so 400 is not what it does", h.a.name, r)
+		}
+	})
+}
+
+// A fact aggregate row carries no certname, so the per-certname merge would keep
+// one backend's row and drop the other's; only adding the numbers is right.
+func TestFactsByNamePathAggregatesAreSummed(t *testing.T) {
+	ctx := context.Background()
+	const q = `["extract",[["function","count"]]]`
+
+	for _, path := range []string{factsPath + "/kernel", factsPath + "/kernel/Linux"} {
+		t.Run(path, func(t *testing.T) {
+			wantA := backendCount(ctx, t, h.a, path, q)
+			wantB := backendCount(ctx, t, h.b, path, q)
+			if wantA == wantB {
+				t.Fatalf("the fixture gives both backends %d records on %s, so a sum is indistinguishable from one backend's number", wantA, path)
+			}
+
+			resp := get(t, path, query(q))
+			if got := countOf(t, resp.rows(t)); got != wantA+wantB {
+				t.Fatalf("%s count = %d, want %d (%s=%d + %s=%d)", path, got, wantA+wantB, h.a.name, wantA, h.b.name, wantB)
+			}
+			if got := resp.header.Get(backendsHeader); got != "2/2" {
+				t.Errorf("%s = %q, want %q", backendsHeader, got, "2/2")
+			}
+		})
+	}
+
+	t.Run("grouped counts are summed per key", func(t *testing.T) {
+		const grouped = `["extract",[["function","count"],"value"],["group_by","value"]]`
+		path := factsPath + "/osfamily"
+		want := map[string]int{}
+		for _, b := range []*backend{h.a, h.b} {
+			for value, n := range countsByValue(t, b.query(ctx, t, path, query(grouped))) {
+				want[value] += n
+			}
+		}
+		got := countsByValue(t, get(t, path, query(grouped)).rows(t))
+		if !equalCounts(got, want) {
+			t.Errorf("grouped %s counts = %v, want %v", path, got, want)
+		}
+	})
+
+	t.Run("a query with no function column still merges by certname", func(t *testing.T) {
+		rows := get(t, factsPath+"/kernel", nil).rows(t)
+		if got := e2eCertnames(rows); !equalStrings(got, allNodes) {
+			t.Errorf("/facts/kernel certnames = %v, want %v", got, allNodes)
+		}
+		if len(rows) != len(allNodes) {
+			t.Errorf("/facts/kernel returned %d records for %d nodes, so a shared node was not deduped", len(rows), len(allNodes))
+		}
+	})
+}
+
+// countsByValue reads a ["function","count"] + group_by "value" result set.
+func countsByValue(t *testing.T, rows []map[string]any) map[string]int {
+	t.Helper()
+	out := map[string]int{}
+	for _, row := range rows {
+		value, ok := row["value"].(string)
+		if !ok {
+			t.Fatalf("grouped aggregate row has no value: %v", row)
+		}
+		n, ok := row["count"].(float64)
+		if !ok {
+			t.Fatalf("grouped aggregate row has no numeric count: %v", row)
+		}
+		out[value] = int(n)
+	}
+	return out
+}
+
+func equalCounts(a, b map[string]int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if b[k] != v {
+			return false
+		}
+	}
+	return true
 }
 
 func containsString(s []string, v string) bool {

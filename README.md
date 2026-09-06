@@ -26,8 +26,8 @@ not PQL) is forwarded verbatim.
 |---|---|
 | `GET /pdb/query/v4/nodes` | Fan out to all backends, dedupe by `certname`, keep the record with the newer `report_timestamp`, stamped with the winning backend's name (see provenance). An `extract`/`count` query is **summed** instead. |
 | `GET /pdb/query/v4/facts` | Fan out to all, and per `certname` keep **all** facts from the backend that owns that node (see merge semantics), plus a synthetic `pdbmux_source` fact naming it. |
-| `GET /pdb/query/v4/facts/<name>[/<value>]` | Same fan-out and merge as `/facts`. The path segment is a `name` constraint, so no synthetic `pdbmux_source` record is added unless the path names it. |
-| `GET /pdb/query/v4/fact-names` | Fan out to all and serve the **union** of the flat name arrays, deduped and re-sorted, re-paged across backends. |
+| `GET /pdb/query/v4/facts/<name>[/<value>]` | Same fan-out and merge as `/facts`, and an `extract`/`count` query is **summed** the same way. The path segment is a `name` constraint, so no synthetic `pdbmux_source` record is added unless the path names it. |
+| `GET /pdb/query/v4/fact-names` | Fan out to all and serve the **union** of the flat name arrays, deduped and re-sorted, re-paged across backends, plus the `pdbmux_source` name while injection is on. `order_by` is only valid on `name`. |
 | `GET /pdb/query/v4/resources` | An `extract`/`count` query is fanned out and **summed**; any other query is an unmerged pass-through. |
 | `GET /pdb/query/v4/reports` | Fan out to all and serve the **union**, deduped by report `hash`, re-ordered and re-paged across backends. |
 | `GET /pdb/query/v4/events` | Fan out to all and serve the **union**, deduped by record identity, re-ordered and re-paged. |
@@ -70,9 +70,13 @@ paths add two more headers `pdbmux` sets itself, `X-Cache` and `Age` — see
   - A node present in only one backend always appears (falls back to whichever
     backend actually returned facts for it).
   - `/facts/<name>` and `/facts/<name>/<value>` are the same records with one
-    more constraint applied upstream, so they take the same rule.
+    more constraint applied upstream, so they take the same rule — and the same
+    aggregate branch, since a count row has no `certname` there either.
 - **`/fact-names`** — a flat array of strings, not records: **union**, deduped by
-  the name and re-sorted, ascending unless `order_by` says otherwise.
+  the name and re-sorted, ascending unless `order_by` says otherwise. `name` is
+  the only column the entity projects, so an `order_by` on any other field is
+  rejected with `400`, as the backends reject it. While injection is on the
+  `pdbmux_source` name is listed too, exactly once (see provenance).
   `include_total=true` reports the deduped union's size, so the `limit` is applied
   to the merged list rather than pushed upstream.
 - **`/reports`, `/events`** — **union**, not a per-node winner. Reports are
@@ -83,17 +87,18 @@ paths add two more headers `pdbmux` sets itself, `X-Cache` and `Age` — see
 - **Aggregates** — `extract`/`group_by` rows are counts, not records, so each
   backend returns a partial answer that has to be **added**, not deduped. This
   covers `/event-counts`, `/aggregate-event-counts`, and any `/reports`,
-  `/nodes` or `/resources` query whose `extract` carries a `["function", ...]`
-  column.
+  `/nodes`, `/resources` or `/facts/<name>[/<value>]` query whose `extract`
+  carries a `["function", ...]` column.
   - The grouping key is the row's non-aggregate fields: for `/reports`,
-    `/nodes` and `/resources` they come from the query — the plain `extract`
-    fields plus any `group_by` clause — and for the event-count endpoints from
-    the row itself (`subject_type`/`subject`, or `summarize_by`), whose
-    remaining fields are all counts.
-  - On `/nodes` this takes precedence over the `certname` merge: a count row has
-    no `certname`, so deduping would collapse every backend's count into one
-    backend's number. A `/nodes` query with no `function` column — including a
-    plain `extract` projection — still merges by `certname`.
+    `/nodes`, `/resources` and `/facts/<name>` they come from the query — the
+    plain `extract` fields plus any `group_by` clause — and for the event-count
+    endpoints from the row itself (`subject_type`/`subject`, or
+    `summarize_by`), whose remaining fields are all counts.
+  - On `/nodes` and `/facts/<name>[/<value>]` this takes precedence over the
+    `certname` merge: a count row has no `certname`, so deduping would collapse
+    every backend's count into one backend's number. A query with no `function`
+    column — including a plain `extract` projection — still merges by
+    `certname`.
   - `/resources` has no cross-backend record identity to dedupe on, so only its
     aggregate queries merge; everything else stays an unmerged pass-through.
   - Rows sharing a key collapse into one with their numeric columns summed. A key
@@ -170,9 +175,11 @@ such a query correctly for every operator (`not`, `or`, subqueries) and does not
 pretend to for some. Read the fact from an unfiltered (or `certname`-filtered)
 `/facts` response and filter client-side. `/pdb/query/v4/facts/pdbmux_source` is
 the same story: the route is merged and injection is allowed there, but the
-backends hold no record to attach it to. `/pdb/query/v4/fact-names` therefore
-leaves the name out of its list — advertising a name no `/facts` response serves
-would offer a drilldown with nothing behind it.
+backends hold no record to attach it to, so it answers empty.
+`/pdb/query/v4/fact-names` still lists the name while injection is on, because
+every merged `/facts` response does carry records of it — leaving it out hides a
+fact every node has from any client that discovers names there. Turning injection
+off removes it, since nothing then produces it.
 
 **Not covered:** `/factsets` and `/inventory`. Both carry facts, but `pdbmux`
 does not merge either today — they take the unmerged pass-through path, where

@@ -172,29 +172,33 @@ func mergeFacts(results []backendResult, owner func(certname string) string, inj
 }
 
 // mergeFactNames unions the backends' /fact-names arrays, dedupes by the name
-// itself and re-sorts, since each backend only ordered its own slice. The name
-// pdbmux owns is dropped for the same reason its fact records are: while the
-// feature is on, no merged /facts response can serve it.
-func mergeFactNames(results []backendResult, suppress *sourceInjector, desc bool) []json.RawMessage {
+// itself and re-sorts, since each backend only ordered its own slice. owned is
+// the fact name pdbmux injects, or "" while injection is off: it is listed
+// whether or not a backend reports it, because the merged /facts response
+// carries records of that name.
+func mergeFactNames(results []backendResult, owned string, desc bool) []json.RawMessage {
 	seen := map[string]bool{}
 	raws := []json.RawMessage{}
 	values := []any{}
+	add := func(raw json.RawMessage) {
+		key := factNameKey(raw)
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+		var v any
+		_ = json.Unmarshal(raw, &v) // an undecodable element sorts as null
+		raws = append(raws, raw)
+		values = append(values, v)
+	}
 	for _, res := range results {
 		for _, rec := range res.records {
-			var name string
-			if json.Unmarshal(rec.Raw, &name) == nil && suppress.claims(name) {
-				suppress.suppressed++
-				continue
-			}
-			key := string(rec.Raw)
-			if seen[key] {
-				continue
-			}
-			seen[key] = true
-			var v any
-			_ = json.Unmarshal(rec.Raw, &v) // an undecodable element sorts as null
-			raws = append(raws, rec.Raw)
-			values = append(values, v)
+			add(rec.Raw)
+		}
+	}
+	if owned != "" {
+		if raw, err := json.Marshal(owned); err == nil {
+			add(raw)
 		}
 	}
 	idx := make([]int, len(raws))
@@ -213,6 +217,16 @@ func mergeFactNames(results []backendResult, suppress *sourceInjector, desc bool
 		out = append(out, raws[i])
 	}
 	return out
+}
+
+// Two encoders can spell one name differently — Go escapes <, > and & — so a
+// name is deduped on its decoded value, not on its bytes.
+func factNameKey(raw json.RawMessage) string {
+	var name string
+	if json.Unmarshal(raw, &name) == nil {
+		return "s\x00" + name
+	}
+	return "r\x00" + string(raw)
 }
 
 func environmentOf(recs []record) string {

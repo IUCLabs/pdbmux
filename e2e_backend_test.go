@@ -340,6 +340,26 @@ func (b *backend) query(ctx context.Context, t fatalf, path string, params url.V
 	return rows
 }
 
+// queryStatus is query without the body, for asserting what a backend rejects.
+func (b *backend) queryStatus(ctx context.Context, t fatalf, path string, params url.Values) int {
+	t.Helper()
+	target := b.url + path
+	if len(params) > 0 {
+		target += "?" + params.Encode()
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+	if err != nil {
+		t.Fatalf("building query for %s: %v", b.name, err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("querying %s%s: %v", b.name, path, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	return resp.StatusCode
+}
+
 func newNetwork(ctx context.Context, t fatalf) (string, func()) {
 	t.Helper()
 	nw, err := tcnet.New(ctx)

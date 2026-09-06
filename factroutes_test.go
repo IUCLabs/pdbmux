@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/url"
 	"reflect"
+	"slices"
 	"testing"
 )
 
@@ -109,6 +110,102 @@ func TestHandler_FactsByNameAndValueMerged(t *testing.T) {
 	}
 }
 
+// An aggregate row carries no certname, so the per-certname merge would keep one
+// backend's row and drop the other's without any error or partial-backend signal.
+func TestHandler_FactsByNameAggregateSummed(t *testing.T) {
+	for _, path := range []string{roleFactPath, roleFactPath + "/web"} {
+		t.Run(path, func(t *testing.T) {
+			a := newFakeBackend(t, `[]`, `[]`)
+			a.bodies[path] = `[{"count":7}]`
+			b := newFakeBackend(t, `[]`, `[]`)
+			b.bodies[path] = `[{"count":3}]`
+			srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic))
+
+			rec := doGet(t, srv.Handler(), path, `["extract",[["function","count"]]]`)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+			}
+			if got := counts(t, rec.Body.Bytes(), "count"); !slices.Equal(got, []float64{10}) {
+				t.Errorf("count = %v, want [10]", got)
+			}
+			if h := rec.Header().Get(backendsHeader); h != "2/2" {
+				t.Errorf("%s = %q, want 2/2", backendsHeader, h)
+			}
+		})
+	}
+}
+
+func TestHandler_FactsByNameAggregateGroupedSummed(t *testing.T) {
+	a := newFakeBackend(t, `[]`, `[]`)
+	a.bodies[roleFactPath] = `[{"count":2,"value":"web"},{"count":1,"value":"db"}]`
+	b := newFakeBackend(t, `[]`, `[]`)
+	b.bodies[roleFactPath] = `[{"count":5,"value":"web"}]`
+	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic))
+
+	rec := doGet(t, srv.Handler(), roleFactPath,
+		`["extract",[["function","count"],"value"],["group_by","value"]]`)
+	var rows []map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &rows); err != nil {
+		t.Fatalf("unmarshal %s: %v", rec.Body.String(), err)
+	}
+	got := map[string]float64{}
+	for _, row := range rows {
+		v, _ := row["value"].(string)
+		n, _ := row["count"].(float64)
+		got[v] = n
+	}
+	want := map[string]float64{"web": 7, "db": 1}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("grouped counts = %v, want %v", got, want)
+	}
+}
+
+// The summing branch must not divert a plain query, including an extract
+// projection that carries no function column.
+func TestHandler_FactsByNameNonAggregateStillMergedByCertname(t *testing.T) {
+	for _, q := range []string{"", `["extract",["certname","value"],["~","certname",".*"]]`} {
+		a := newFakeBackend(t, `[]`, `[]`)
+		a.bodies[roleFactPath] = `[` + fact("h1", "role", "web-a", "") + `,` + fact("h2", "role", "db-a", "") + `]`
+		b := newFakeBackend(t, `[]`, `[]`)
+		b.bodies[roleFactPath] = `[` + fact("h1", "role", "web-b", "") + `,` + fact("h3", "role", "db-b", "") + `]`
+		srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic))
+
+		rec := doGet(t, srv.Handler(), roleFactPath, q)
+		var rows []recordMeta
+		if err := json.Unmarshal(rec.Body.Bytes(), &rows); err != nil {
+			t.Fatalf("query %q: unmarshal %s: %v", q, rec.Body.String(), err)
+		}
+		got := map[string]bool{}
+		for _, row := range rows {
+			got[row.Certname] = true
+		}
+		if len(rows) != 3 || !got["h1"] || !got["h2"] || !got["h3"] {
+			t.Errorf("query %q: merged %s = %s, want one record per certname", q, roleFactPath, rec.Body.String())
+		}
+	}
+}
+
+// A summed row is not the merged record set the cache stores, so it stays live.
+func TestHandler_FactsByNameAggregateNotCached(t *testing.T) {
+	for _, path := range []string{roleFactPath, roleFactPath + "/web"} {
+		t.Run(path, func(t *testing.T) {
+			a := newCountingBackend(t, map[string]string{path: `[{"count":7}]`})
+			b := newCountingBackend(t, map[string]string{path: `[{"count":3}]`})
+			srv, _ := newCachedServer(t, cacheTestConfig(a.srv.URL, b.srv.URL))
+
+			const q = `["extract",[["function","count"]]]`
+			doGet(t, srv.Handler(), path, q)
+			second := doGet(t, srv.Handler(), path, q)
+			if got := a.hitCount(path); got != 2 {
+				t.Errorf("%s aggregates are uncached: %d requests, want 2", path, got)
+			}
+			if got := counts(t, second.Body.Bytes(), "count"); !slices.Equal(got, []float64{10}) {
+				t.Errorf("count = %v, want [10]", got)
+			}
+		})
+	}
+}
+
 func TestHandler_FactsByNameForwardsPathAndQuery(t *testing.T) {
 	a := newFakeBackend(t, `[]`, `[]`)
 	a.bodies[roleFactPath] = `[]`
@@ -200,7 +297,7 @@ func TestHandler_FactNamesUnionDedupedAndSorted(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
 	}
-	want := []string{"extra_b", "kernel", "only_a", "only_b", "osfamily"}
+	want := []string{"extra_b", "kernel", "only_a", "only_b", "osfamily", defaultSourceFact}
 	if got := names(t, rec.Body.Bytes()); !reflect.DeepEqual(got, want) {
 		t.Errorf("merged %s = %v, want %v", factNamesPath, got, want)
 	}
@@ -219,7 +316,7 @@ func TestHandler_FactNamesOrderByDescending(t *testing.T) {
 	rec := doGetParams(t, srv.Handler(), factNamesPath, url.Values{
 		"order_by": {`[{"field":"name","order":"desc"}]`},
 	})
-	want := []string{"zone", "osfamily", "kernel"}
+	want := []string{"zone", defaultSourceFact, "osfamily", "kernel"}
 	if got := names(t, rec.Body.Bytes()); !reflect.DeepEqual(got, want) {
 		t.Errorf("descending %s = %v, want %v", factNamesPath, got, want)
 	}
@@ -263,8 +360,8 @@ func TestHandler_FactNamesTotalCountsTheWholeUnion(t *testing.T) {
 	if got := names(t, rec.Body.Bytes()); !reflect.DeepEqual(got, []string{"a1", "a2"}) {
 		t.Errorf("paged %s = %v, want [a1 a2]", factNamesPath, got)
 	}
-	if got := rec.Header().Get(recordsHeader); got != "4" {
-		t.Errorf("%s = %q, want the deduped union size 4", recordsHeader, got)
+	if got := rec.Header().Get(recordsHeader); got != "5" {
+		t.Errorf("%s = %q, want the deduped union size 5", recordsHeader, got)
 	}
 	if got, _ := a.params(factNamesPath); got.Get("limit") != "" {
 		t.Errorf("backend a got limit=%q, want none: a total cannot be counted from a window", got.Get("limit"))
@@ -276,27 +373,36 @@ func TestHandler_FactNamesRejectsBadPaging(t *testing.T) {
 	b := newFakeBackend(t, `[]`, `[]`)
 	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic))
 
-	rec := doGetParams(t, srv.Handler(), factNamesPath, url.Values{"limit": {"-1"}})
-	if rec.Code != http.StatusBadRequest {
-		t.Errorf("status %d, want 400: %s", rec.Code, rec.Body.String())
+	for _, params := range []url.Values{
+		{"limit": {"-1"}},
+		// name is the only column the entity projects, so anything else is a 400
+		// upstream and must be one here.
+		{"order_by": {`[{"field":"bogus","order":"desc"}]`}},
+	} {
+		rec := doGetParams(t, srv.Handler(), factNamesPath, params)
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("%v: status %d, want 400: %s", params, rec.Code, rec.Body.String())
+		}
 	}
 }
 
-// No merged /facts response can serve the name pdbmux owns, so the overview must
-// not advertise it — and must keep it once the feature is off.
-func TestHandler_FactNamesDropsTheOwnedName(t *testing.T) {
-	body := factNamesBody(defaultSourceFact, "osfamily")
+// The merged /facts response carries records of the name pdbmux owns, so the
+// overview has to list it — and must not once nothing produces it.
+func TestHandler_FactNamesListsTheOwnedName(t *testing.T) {
 	for _, tc := range []struct {
-		name    string
-		enabled bool
-		want    []string
+		name     string
+		enabled  bool
+		upstream string
+		want     []string
 	}{
-		{"enabled", true, []string{"osfamily"}},
-		{"disabled", false, []string{"osfamily", defaultSourceFact}},
+		{"enabled", true, factNamesBody("osfamily"), []string{"osfamily", defaultSourceFact}},
+		{"disabled", false, factNamesBody("osfamily"), []string{"osfamily"}},
+		{"listed once when a backend reports it too", true, factNamesBody(defaultSourceFact, "osfamily"), []string{"osfamily", defaultSourceFact}},
+		{"kept when a backend reports it and the feature is off", false, factNamesBody(defaultSourceFact, "osfamily"), []string{"osfamily", defaultSourceFact}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			a := newFakeBackend(t, `[]`, `[]`)
-			a.bodies[factNamesPath] = body
+			a.bodies[factNamesPath] = tc.upstream
 			b := newFakeBackend(t, `[]`, `[]`)
 			b.bodies[factNamesPath] = `[]`
 			cfg := testConfig(a.srv.URL, b.srv.URL, mergeStatic)
@@ -311,12 +417,35 @@ func TestHandler_FactNamesDropsTheOwnedName(t *testing.T) {
 	}
 }
 
+// The owned name is part of the union, so it is counted and ordered with it.
+func TestHandler_FactNamesOwnedNameIsCountedAndOrdered(t *testing.T) {
+	a := newFakeBackend(t, `[]`, `[]`)
+	a.bodies[factNamesPath] = factNamesBody("osfamily", "zone")
+	b := newFakeBackend(t, `[]`, `[]`)
+	b.bodies[factNamesPath] = `[]`
+	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic))
+
+	rec := doGetParams(t, srv.Handler(), factNamesPath, url.Values{
+		"order_by":      {`[{"field":"name","order":"desc"}]`},
+		"include_total": {"true"},
+	})
+	want := []string{"zone", defaultSourceFact, "osfamily"}
+	if got := names(t, rec.Body.Bytes()); !reflect.DeepEqual(got, want) {
+		t.Errorf("descending %s = %v, want %v", factNamesPath, got, want)
+	}
+	if got := rec.Header().Get(recordsHeader); got != "3" {
+		t.Errorf("%s = %q, want 3", recordsHeader, got)
+	}
+}
+
 func TestHandler_FactNamesServesEmptyArray(t *testing.T) {
 	a := newFakeBackend(t, `[]`, `[]`)
 	a.bodies[factNamesPath] = `[]`
 	b := newFakeBackend(t, `[]`, `[]`)
 	b.bodies[factNamesPath] = `[]`
-	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic))
+	cfg := testConfig(a.srv.URL, b.srv.URL, mergeStatic)
+	cfg.SourceFactEnabled = false
+	srv := newTestServer(cfg)
 
 	rec := doGet(t, srv.Handler(), factNamesPath, "")
 	if got := rec.Body.String(); got != "[]\n" {
@@ -333,7 +462,7 @@ func TestHandler_FactNamesSurvivesOneBackend(t *testing.T) {
 	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic))
 
 	rec := doGet(t, srv.Handler(), factNamesPath, "")
-	if got := names(t, rec.Body.Bytes()); !reflect.DeepEqual(got, []string{"kernel"}) {
+	if got := names(t, rec.Body.Bytes()); !reflect.DeepEqual(got, []string{"kernel", defaultSourceFact}) {
 		t.Errorf("%s = %v, want the surviving backend's names", factNamesPath, got)
 	}
 	if h := rec.Header().Get(backendsHeader); h != "1/2" {
