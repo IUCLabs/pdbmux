@@ -352,6 +352,43 @@ func TestHandler_ServesStaleOnlyWhenBackendsFail(t *testing.T) {
 	}
 }
 
+// The stored entry is the whole estate's record set and the pinned value narrows
+// it per request, so the fallback has to keep narrowing: a client asking for one
+// backend's records must not be handed every backend's because the entry expired.
+func TestHandler_StaleSourceFactDrilldownStaysFilteredByOwner(t *testing.T) {
+	a := newCountingBackend(t, map[string]string{factsPath: `[` + fact("h1", "osfamily", "RedHat", "") + `]`})
+	b := newCountingBackend(t, map[string]string{factsPath: `[` + fact("h2", "osfamily", "Debian", "") + `]`})
+	srv, clk := newCachedServer(t, cacheTestConfig(a.srv.URL, b.srv.URL))
+
+	drilldown := sourceFactURL + "/a"
+	want := map[string]string{"h1": "a"}
+
+	warm := doGet(t, srv.Handler(), drilldown, "")
+	if warm.Code != http.StatusOK {
+		t.Fatalf("warm-up status %d: %s", warm.Code, warm.Body.String())
+	}
+	if got, n := sourceValues(t, warm.Body.Bytes(), defaultSourceFact); n != len(want) || !reflect.DeepEqual(got, want) {
+		t.Fatalf("warm-up %s = %v (%d records), want %v", drilldown, got, n, want)
+	}
+
+	// Every backend down and the entry expired: the stale copy is served.
+	clk.advance(31 * time.Second)
+	a.setFail(true)
+	b.setFail(true)
+
+	rec := doGet(t, srv.Handler(), drilldown, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("stale fallback status %d: %s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get(cacheStatusHeader); got != "stale" {
+		t.Fatalf("%s = %q, want stale: the request did not take the fallback path", cacheStatusHeader, got)
+	}
+	got, n := sourceValues(t, rec.Body.Bytes(), defaultSourceFact)
+	if n != len(want) || !reflect.DeepEqual(got, want) {
+		t.Errorf("stale %s = %v (%d records), want only backend a's %v", drilldown, got, n, want)
+	}
+}
+
 func TestHandler_NoCacheEntryMeansBackendFailureIs502(t *testing.T) {
 	a := newCountingBackend(t, map[string]string{factsPath: `[]`})
 	b := newCountingBackend(t, map[string]string{factsPath: `[]`})
