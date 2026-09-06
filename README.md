@@ -25,7 +25,7 @@ not PQL) is forwarded verbatim.
 | Path | Behaviour |
 |---|---|
 | `GET /pdb/query/v4/nodes` | Fan out to all backends, dedupe by `certname`, keep the record with the newer `report_timestamp`, stamped with the winning backend's name (see provenance). An `extract`/`count` query is **summed** instead. |
-| `GET /pdb/query/v4/facts` | Fan out to all, and per `certname` keep **all** facts from the backend that owns that node (see merge semantics), plus a synthetic `pdbmux_source` fact naming it. |
+| `GET /pdb/query/v4/facts` | Fan out to all, and per `certname` keep **all** facts from the backend that owns that node (see merge semantics), plus a synthetic `pdbmux_source` fact naming it. An `extract`/`count` query is **summed** instead. |
 | `GET /pdb/query/v4/resources` | An `extract`/`count` query is fanned out and **summed**; any other query is an unmerged pass-through. |
 | `GET /pdb/query/v4/reports` | Fan out to all and serve the **union**, deduped by report `hash`, re-ordered and re-paged across backends. |
 | `GET /pdb/query/v4/events` | Fan out to all and serve the **union**, deduped by record identity, re-ordered and re-paged. |
@@ -75,17 +75,22 @@ paths add two more headers `pdbmux` sets itself, `X-Cache` and `Age` — see
 - **Aggregates** — `extract`/`group_by` rows are counts, not records, so each
   backend returns a partial answer that has to be **added**, not deduped. This
   covers `/event-counts`, `/aggregate-event-counts`, and any `/reports`,
-  `/nodes` or `/resources` query whose `extract` carries a `["function", ...]`
-  column.
+  `/nodes`, `/facts` or `/resources` query whose `extract` carries a
+  `["function", ...]` column.
   - The grouping key is the row's non-aggregate fields: for `/reports`,
-    `/nodes` and `/resources` they come from the query — the plain `extract`
-    fields plus any `group_by` clause — and for the event-count endpoints from
-    the row itself (`subject_type`/`subject`, or `summarize_by`), whose
-    remaining fields are all counts.
-  - On `/nodes` this takes precedence over the `certname` merge: a count row has
-    no `certname`, so deduping would collapse every backend's count into one
-    backend's number. A `/nodes` query with no `function` column — including a
-    plain `extract` projection — still merges by `certname`.
+    `/nodes`, `/facts` and `/resources` they come from the query — the plain
+    `extract` fields plus any `group_by` clause — and for the event-count
+    endpoints from the row itself (`subject_type`/`subject`, or
+    `summarize_by`), whose remaining fields are all counts.
+  - On `/nodes` and `/facts` this takes precedence over the `certname` merge: an
+    aggregate row has no `certname`, so deduping would collapse every backend's
+    rows into one backend's numbers. A query with no `function` column —
+    including a plain `extract` projection — still merges by `certname`.
+  - PuppetDB accepts `count`, `sum`, `avg`, `min`, `max`, `to_string` and
+    `jsonb_typeof` as `extract` functions. Only `count` and `sum` are additive,
+    so only those two merge correctly. `avg`, `min` and `max` are folded like any
+    other numeric column and their merged value is **wrong**; query a single
+    backend directly for those.
   - `/resources` has no cross-backend record identity to dedupe on, so only its
     aggregate queries merge; everything else stays an unmerged pass-through.
   - Rows sharing a key collapse into one with their numeric columns summed. A key
@@ -474,11 +479,11 @@ have drained.
 | `PDBMUX_E2E_TUNNEL_IMAGE` | `docker.io/library/alpine:3` |
 | `PDBMUX_E2E_NODE_LOOKUP` | path to a `node-lookup` binary (else `PATH`, else skipped) |
 
-Three tests skip rather than assert, each naming a known gap and failing if that
-gap closes: `/facts` aggregates are not summed, `/pdb/query/v4/facts/<name>` is
-served unmerged (so Puppetboard's single-fact drilldown silently loses the other
-backend's nodes), and `/fact-names` is likewise unmerged (so the facts overview
-lists only the first backend's fact names).
+Two tests skip rather than assert, each naming a known gap and failing if that
+gap closes: `/pdb/query/v4/facts/<name>` is served unmerged (so Puppetboard's
+single-fact drilldown silently loses the other backend's nodes), and
+`/fact-names` is likewise unmerged (so the facts overview lists only the first
+backend's fact names).
 
 ## Deployment
 

@@ -945,6 +945,85 @@ func TestHandler_NodesNonAggregateStillMergedByCertname(t *testing.T) {
 	}
 }
 
+func TestHandler_FactsAggregateSummed(t *testing.T) {
+	// A count row carries no certname, so the per-certname fact merge would have
+	// kept whichever backend owned the empty-certname bucket.
+	a := newFakeBackend(t, `[]`, `[{"count":7}]`)
+	b := newFakeBackend(t, `[]`, `[{"count":10}]`)
+	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic))
+
+	rec := doGet(t, srv.Handler(), factsPath, `["extract",[["function","count"]]]`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+	}
+	if got := counts(t, rec.Body.Bytes(), "count"); !slices.Equal(got, []float64{17}) {
+		t.Errorf("count = %v, want [17]", got)
+	}
+	if got := rec.Header().Get(backendsHeader); got != "2/2" {
+		t.Errorf("%s = %q, want 2/2", backendsHeader, got)
+	}
+	if _, ok := b.params(factsPath); !ok {
+		t.Error("second backend was never asked for the fact count")
+	}
+}
+
+func TestHandler_FactsAggregateGroupedSummed(t *testing.T) {
+	a := newFakeBackend(t, `[]`, `[{"count":4,"name":"osfamily"},{"count":1,"name":"only_a"}]`)
+	b := newFakeBackend(t, `[]`, `[{"count":3,"name":"osfamily"}]`)
+	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic))
+
+	rec := doGet(t, srv.Handler(), factsPath,
+		`["extract",[["function","count"],"name"],["~","certname",".*"],["group_by","name"]]`)
+	var got []map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	byName := map[string]float64{}
+	for _, row := range got {
+		n, _ := row["name"].(string)
+		byName[n], _ = row["count"].(float64)
+	}
+	want := map[string]float64{"osfamily": 7, "only_a": 1}
+	if !reflect.DeepEqual(byName, want) {
+		t.Errorf("counts = %v, want %v", byName, want)
+	}
+}
+
+// include_total on a summed response reports merged rows, not the backends' own totals.
+func TestHandler_FactsAggregateRecordsIsMergedRowCount(t *testing.T) {
+	a := newFakeBackend(t, `[]`, `[{"count":4,"name":"osfamily"}]`)
+	a.totals[factsPath] = 1
+	b := newFakeBackend(t, `[]`, `[{"count":3,"name":"osfamily"}]`)
+	b.totals[factsPath] = 1
+	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic))
+
+	rec := doGetParams(t, srv.Handler(), factsPath, url.Values{
+		"query":         {`["extract",[["function","count"],"name"],["group_by","name"]]`},
+		"include_total": {"true"},
+	})
+	if got := rec.Header().Get(recordsHeader); got != "1" {
+		t.Errorf("%s = %q, want 1", recordsHeader, got)
+	}
+}
+
+func TestHandler_FactsNonAggregateStillMergedByCertname(t *testing.T) {
+	// Regression: routing aggregates to the summing path must not divert plain
+	// queries, including an extract projection that carries no function column.
+	a := newFakeBackend(t, `[]`, `[`+fact("h1", "role", "web", "")+`]`)
+	b := newFakeBackend(t, `[]`, `[`+fact("h2", "role", "db", "")+`]`)
+	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic))
+
+	for _, q := range []string{
+		`["~","certname",".*"]`,
+		`["extract",["certname","name","value"],["~","certname",".*"]]`,
+	} {
+		rec := doGet(t, srv.Handler(), factsPath, q)
+		if got := rec.Body.String(); !strings.Contains(got, `"h1"`) || !strings.Contains(got, `"h2"`) {
+			t.Errorf("query %s: body = %s, want both backends' facts merged", q, got)
+		}
+	}
+}
+
 func TestHandler_ResourcesAggregateSummed(t *testing.T) {
 	// /resources is otherwise an unmerged pass-through, so before this the
 	// landing page's resource total was whichever backend answered first.

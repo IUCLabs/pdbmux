@@ -1241,6 +1241,25 @@ func TestHandler_NodesAggregateNotCached(t *testing.T) {
 	}
 }
 
+func TestHandler_FactsAggregateNotCached(t *testing.T) {
+	const q = `["extract",[["function","count"]]]`
+	a := newCountingBackend(t, map[string]string{factsPath: `[{"count":7}]`})
+	b := newCountingBackend(t, map[string]string{factsPath: `[{"count":10}]`})
+	srv, _ := newCachedServer(t, cacheTestConfig(a.srv.URL, b.srv.URL))
+
+	first := doGet(t, srv.Handler(), factsPath, q)
+	second := doGet(t, srv.Handler(), factsPath, q)
+	if first.Code != http.StatusOK || second.Code != http.StatusOK {
+		t.Fatalf("statuses %d/%d", first.Code, second.Code)
+	}
+	if got := a.hitCount(factsPath); got != 2 {
+		t.Errorf("/facts aggregates are uncached: %d requests, want 2", got)
+	}
+	if got := counts(t, second.Body.Bytes(), "count"); !slices.Equal(got, []float64{17}) {
+		t.Errorf("count = %v, want [17]", got)
+	}
+}
+
 func TestHandler_ResourcesAggregateNotCached(t *testing.T) {
 	a := newCountingBackend(t, map[string]string{resourcesPath: `[{"count":7}]`})
 	b := newCountingBackend(t, map[string]string{resourcesPath: `[{"count":5}]`})
