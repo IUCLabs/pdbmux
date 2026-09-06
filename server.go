@@ -124,37 +124,99 @@ func (s *Server) Handler() http.Handler {
 	return mux
 }
 
+// route is one query endpoint: how a request selects it, the path its fan-out
+// asks backends for, and how it answers a plain query. handleQuery diverts an
+// extract/function query to serveSummed before serve runs, so aggregate rows —
+// which carry none of the certname, hash or name the merges key on, and would
+// collapse into one backend's numbers — cannot reach an identity-keyed merge.
+// unsummed opts a route out and records why; the zero value is guarded, so a
+// route added without a decision is summed rather than silently merged.
+type route struct {
+	name    string
+	matches func(path string) bool
+	// fanOut is the path backends are queried on when the guard sums; empty
+	// means the request's own path.
+	fanOut   string
+	serve    func(*Server, http.ResponseWriter, *http.Request)
+	unsummed string
+}
+
+func pathIs(p string) func(string) bool {
+	return func(path string) bool { return path == p }
+}
+
+var queryRoutes = []route{
+	{name: nodesPath, matches: pathIs(nodesPath), fanOut: nodesPath, serve: (*Server).serveNodes},
+	{name: factsPath, matches: pathIs(factsPath), fanOut: factsPath, serve: (*Server).serveFacts},
+	// /resources has no cross-backend record identity, so only its aggregates merge.
+	{name: resourcesPath, matches: pathIs(resourcesPath), fanOut: resourcesPath, serve: (*Server).proxyUnmerged},
+	{name: reportsPath, matches: pathIs(reportsPath), fanOut: reportsPath, serve: (*Server).serveReports},
+	{name: factsPath + "/<name>", matches: isFactsSubPath, serve: (*Server).serveFactsByName},
+	{
+		name:     factNamesPath,
+		matches:  pathIs(factNamesPath),
+		serve:    (*Server).serveFactNames,
+		unsummed: "the union dedupes names across backends, so a count of it is not the sum of the backends' counts",
+	},
+	{
+		name:     eventsPath,
+		matches:  pathIs(eventsPath),
+		serve:    (*Server).serveEvents,
+		unsummed: "unioned on the verbatim record; summing aggregates here would change what the route answers, so it is a change of its own",
+	},
+	{
+		name:     eventCountsPath,
+		matches:  pathIs(eventCountsPath),
+		serve:    (*Server).serveEventCounts,
+		unsummed: "already summed, on columns inferred from the row rather than from the query",
+	},
+	{
+		name:     aggregateEventCountsPath,
+		matches:  pathIs(aggregateEventCountsPath),
+		serve:    (*Server).serveEventCounts,
+		unsummed: "already summed, on columns inferred from the row rather than from the query",
+	},
+	{
+		name:     reportsPath + "/<hash>/<sub>",
+		matches:  isReportSubResource,
+		serve:    (*Server).serveFirstHolder,
+		unsummed: "one backend holds the report, so nothing is merged across backends",
+	},
+}
+
+// unmergedRoute answers every path no merged route claims.
+var unmergedRoute = route{
+	name:     "pass-through",
+	serve:    (*Server).proxyUnmerged,
+	unsummed: "one backend's response, verbatim; nothing is merged across backends",
+}
+
+func routeFor(path string) route {
+	for _, rt := range queryRoutes {
+		if rt.matches(path) {
+			return rt
+		}
+	}
+	return unmergedRoute
+}
+
 func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "only GET is supported", http.StatusMethodNotAllowed)
 		return
 	}
-	switch r.URL.Path {
-	case nodesPath:
-		s.serveNodes(w, r)
-	case resourcesPath:
-		s.serveResources(w, r)
-	case factsPath:
-		s.serveFacts(w, r)
-	case factNamesPath:
-		s.serveFactNames(w, r)
-	case reportsPath:
-		s.serveReports(w, r)
-	case eventsPath:
-		s.serveUnion(w, r, eventsPath, rawKey)
-	case eventCountsPath, aggregateEventCountsPath:
-		s.serveSummed(w, r, r.URL.Path, inferredColumns)
-	default:
-		if name, value, valued := factsSubPath(r.URL.Path); name != "" {
-			s.serveFactsByName(w, r, name, value, valued)
+	rt := routeFor(r.URL.Path)
+	if rt.unsummed == "" {
+		if spec := parseAggregate(r.URL.Query().Get("query")); spec != nil {
+			path := rt.fanOut
+			if path == "" {
+				path = r.URL.Path
+			}
+			s.serveSummed(w, r, path, spec.columns)
 			return
 		}
-		if isReportSubResource(r.URL.Path) {
-			s.serveFirstHolder(w, r)
-			return
-		}
-		s.proxyUnmerged(w, r)
 	}
+	rt.serve(s, w, r)
 }
 
 // factsSubPath matches /pdb/query/v4/facts/<name> and /pdb/query/v4/facts/<name>/<value>,
@@ -304,25 +366,16 @@ func (s *Server) serveUnion(w http.ResponseWriter, r *http.Request, path string,
 	})
 }
 
-// Aggregate rows carry no certname, so the per-certname fact merge would keep only one backend's; they take the summing path instead.
 func (s *Server) serveFacts(w http.ResponseWriter, r *http.Request) {
-	if spec := parseAggregate(r.URL.Query().Get("query")); spec != nil {
-		s.serveSummed(w, r, factsPath, spec.columns)
-		return
-	}
 	s.serveMerged(w, r, factsPath, s.mergeFactsResponse(r))
 }
 
 // Both path forms are the facts entity with a name (and value) constraint ANDed
-// on, so an aggregate over them carries no certname for the per-certname merge
-// to key on, and is summed instead — the same split /nodes makes. A plain query
-// on the source fact's own path is the one name no backend can answer for, so it
-// is synthesised instead of fanned out as-is.
-func (s *Server) serveFactsByName(w http.ResponseWriter, r *http.Request, name, value string, valued bool) {
-	if spec := parseAggregate(r.URL.Query().Get("query")); spec != nil {
-		s.serveSummed(w, r, r.URL.Path, spec.columns)
-		return
-	}
+// on, so they take the same per-certname merge as /facts. A plain query on the
+// source fact's own path is the one name no backend can answer for, so it is
+// synthesised instead of fanned out as-is.
+func (s *Server) serveFactsByName(w http.ResponseWriter, r *http.Request) {
+	name, value, valued := factsSubPath(r.URL.Path)
 	if inject := s.newSourceInjector(r.URL.Query().Get("query"), true); inject.claims(name) && inject.injects() {
 		s.serveSourceFact(w, r, inject, value, valued)
 		return
@@ -384,31 +437,20 @@ func (s *Server) hasBackend(name string) bool {
 	return false
 }
 
-// A count row carries no certname, so the certname-keyed merge would collapse every backend's count into one backend's; aggregates take the summing path instead.
 func (s *Server) serveNodes(w http.ResponseWriter, r *http.Request) {
-	if spec := parseAggregate(r.URL.Query().Get("query")); spec != nil {
-		s.serveSummed(w, r, nodesPath, spec.columns)
-		return
-	}
 	s.serveMerged(w, r, nodesPath, s.mergeNodesResponse(r))
 }
 
-// Only aggregates merge: a resource record has no cross-backend identity to dedupe on, so a plain query stays on the pass-through path.
-func (s *Server) serveResources(w http.ResponseWriter, r *http.Request) {
-	if spec := parseAggregate(r.URL.Query().Get("query")); spec != nil {
-		s.serveSummed(w, r, resourcesPath, spec.columns)
-		return
-	}
-	s.proxyUnmerged(w, r)
+func (s *Server) serveReports(w http.ResponseWriter, r *http.Request) {
+	s.serveUnion(w, r, reportsPath, reportKey)
 }
 
-// An `extract` query with a `function` column returns synthetic aggregate rows that carry no identity, so they are summed rather than unioned.
-func (s *Server) serveReports(w http.ResponseWriter, r *http.Request) {
-	if spec := parseAggregate(r.URL.Query().Get("query")); spec != nil {
-		s.serveSummed(w, r, reportsPath, spec.columns)
-		return
-	}
-	s.serveUnion(w, r, reportsPath, reportKey)
+func (s *Server) serveEvents(w http.ResponseWriter, r *http.Request) {
+	s.serveUnion(w, r, eventsPath, rawKey)
+}
+
+func (s *Server) serveEventCounts(w http.ResponseWriter, r *http.Request) {
+	s.serveSummed(w, r, r.URL.Path, inferredColumns)
 }
 
 // Merged rows are fewer than the backends' combined records, so include_total reports the merged count rather than a sum of X-Records.
