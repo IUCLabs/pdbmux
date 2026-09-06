@@ -93,9 +93,18 @@ func parseAggregate(query string) (*aggregateSpec, error) {
 	spec := &aggregateSpec{}
 	var avgArgs []json.RawMessage
 	sawFunction := false
+	projected := map[string]bool{}
+	fnColumns := map[string]bool{}
 	for _, col := range cols {
 		var name string
 		if json.Unmarshal(col, &name) == nil {
+			// A field repeating another field is harmless — the copy holds the same
+			// value as the key it duplicates — but one taking a function's name is
+			// the same clash the other way round.
+			if fnColumns[name] {
+				return nil, columnClash(name)
+			}
+			projected[name] = true
 			spec.keys = appendUnique(spec.keys, name)
 			continue
 		}
@@ -104,13 +113,14 @@ func parseAggregate(query string) (*aggregateSpec, error) {
 			continue
 		}
 		sawFunction = true
+		if projected[fn] {
+			return nil, columnClash(fn)
+		}
+		projected[fn], fnColumns[fn] = true, true
 		switch {
 		case rowFns[fn]:
 			spec.keys = appendUnique(spec.keys, fn)
 		case fn == avgColumn:
-			if spec.avg {
-				return nil, fmt.Errorf("extract projects %q more than once, which openvoxdb answers with order-dependent columns", avgColumn)
-			}
 			if len(args) == 0 {
 				return nil, fmt.Errorf("extract function avg needs a column to average")
 			}
@@ -120,7 +130,7 @@ func parseAggregate(query string) (*aggregateSpec, error) {
 			if !known {
 				return nil, fmt.Errorf("extract function %q cannot be merged across backends", fn)
 			}
-			spec.aggs = appendUniqueAgg(spec.aggs, aggColumn{name: fn, op: combine})
+			spec.aggs = append(spec.aggs, aggColumn{name: fn, op: combine})
 		}
 	}
 	if !sawFunction {
@@ -137,6 +147,14 @@ func parseAggregate(query string) (*aggregateSpec, error) {
 		}
 	}
 	return spec, nil
+}
+
+// columnClash refuses a projection naming one response column twice. openvoxdb
+// aliases every extract column after its function, so a repeat comes back as an
+// order-dependent "<name>_2" that is neither a grouping key nor a folded
+// aggregate, leaving the first backend's value frozen in the merged row.
+func columnClash(name string) error {
+	return fmt.Errorf("extract projects the column %q more than once: openvoxdb returns the repeat as %q, which pdbmux can neither key on nor fold", name, name+"_2")
 }
 
 // rewriteAvg replaces the client's avg column with the sum and count of the same
@@ -237,13 +255,6 @@ func groupByFields(node json.RawMessage) []string {
 
 func appendUnique(s []string, v string) []string {
 	if contains(s, v) {
-		return s
-	}
-	return append(s, v)
-}
-
-func appendUniqueAgg(s []aggColumn, v aggColumn) []aggColumn {
-	if hasAgg(s, v.name) {
 		return s
 	}
 	return append(s, v)

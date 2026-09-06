@@ -532,6 +532,31 @@ func TestUnmergeableAggregateIsRefused(t *testing.T) {
 	}
 }
 
+// openvoxdb names every extract column after its function and aliases a repeat
+// as "<name>_2", which pdbmux's spec never learns about: it would be neither a
+// grouping key nor a folded aggregate, so the first backend's value would
+// freeze into the merged row. The backend answers such a query, which is
+// exactly why pdbmux has to refuse it.
+func TestRepeatedFunctionColumnIsRefused(t *testing.T) {
+	const q = `["extract",[["function","count","certname"],["function","count","catalog_environment"]]]`
+
+	resp := rawGet(t, nodesPath, query(q))
+	if resp.status != http.StatusBadRequest {
+		t.Fatalf("status %d, want 400: %s", resp.status, resp.body)
+	}
+	if !strings.Contains(string(resp.body), "count") {
+		t.Errorf("refusal %q does not name the clashing column", resp.body)
+	}
+
+	rows := h.a.query(context.Background(), t, nodesPath, query(q))
+	if len(rows) != 1 {
+		t.Fatalf("backend %s returned %d rows for the repeated projection, want 1", h.a.name, len(rows))
+	}
+	if _, ok := rows[0]["count_2"]; !ok {
+		t.Errorf("backend %s row = %v, want the aliased count_2 column the refusal exists for", h.a.name, rows[0])
+	}
+}
+
 // to_string is a scalar expression, so it yields one row per record: alone it
 // must not collapse the estate into a single row, and with a companion count it
 // groups.

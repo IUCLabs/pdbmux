@@ -219,13 +219,29 @@ func parsePaging(v url.Values) (paging, error) {
 
 // Backends are asked for the first offset+limit records with no offset; the offset is applied to the union instead.
 func (p paging) upstreamParams(in url.Values) url.Values {
-	out := url.Values{}
-	for k, vs := range in {
-		out[k] = append([]string(nil), vs...)
-	}
+	out := copyParams(in)
 	out.Del("offset")
 	if p.limit >= 0 {
 		out.Set("limit", strconv.Itoa(p.limit+p.offset))
+	}
+	return out
+}
+
+// unpagedParams is upstreamParams for a response whose rows are folded together:
+// a backend's own first N groups are not the merged result's first N, and a
+// group truncated away on one backend folds to a wrong value, so every group is
+// fetched and the window is cut after the fold.
+func unpagedParams(in url.Values) url.Values {
+	out := copyParams(in)
+	out.Del("offset")
+	out.Del("limit")
+	return out
+}
+
+func copyParams(in url.Values) url.Values {
+	out := url.Values{}
+	for k, vs := range in {
+		out[k] = append([]string(nil), vs...)
 	}
 	return out
 }

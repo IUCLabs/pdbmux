@@ -471,6 +471,11 @@ func (s *Server) serveCombined(w http.ResponseWriter, r *http.Request, path stri
 		return
 	}
 	upstream := page.upstreamParams(in)
+	if spec != nil && len(spec.aggs) > 0 {
+		// An aggregate returns one row per distinct group, so the whole result is
+		// fetched and paged locally rather than truncated per backend.
+		upstream = unpagedParams(in)
+	}
 	if spec != nil && spec.query != "" {
 		// The backends answer the rewritten query, so they no longer carry the
 		// column the client's order_by may name; the merged rows are sorted here.

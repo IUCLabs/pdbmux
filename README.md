@@ -117,12 +117,24 @@ paths add two more headers `pdbmux` sets itself, `X-Cache` and `Age` — see
     | `to_string` | nothing — it is a row function, so it groups like a plain projected column |
     | `jsonb_typeof` | likewise |
 
+  - Because each column is named after its function, an `extract` that projects
+    the **same function twice** — any of them — names one response column twice.
+    openvoxdb aliases the repeat as `<name>_2` (then `_3`, and so on), which is
+    neither a grouping key nor an aggregate `pdbmux` knows to fold, so the first
+    backend's value would freeze into the merged row. Such a query is refused
+    with **400** naming the clashing column, as is one whose plain `extract`
+    field takes the name a projected function would use. Repeating a plain field
+    is not a clash: the copy holds the same value as the key it duplicates.
   - The `avg` rewrite is invisible to the client: the request still answers under
     the `avg` key. It needs the `sum` and `count` response columns for itself, so
-    an `extract` that also projects a `sum` or a `count`, or that projects `avg`
-    more than once, is refused with **400** naming the clash rather than answered
-    with a wrong number. An `avg` over no rows stays `null`, as upstream. An
-    `order_by` on `avg` is applied to the merged rows here, not upstream.
+    an `extract` that also projects a `sum` or a `count` is refused with **400**
+    naming the clash rather than answered with a wrong number. An `avg` over no
+    rows stays `null`, as upstream. An `order_by` on `avg` is applied to the
+    merged rows here, not upstream.
+  - `avg` is folded as `sum / count` in float64, while a single openvoxdb divides
+    in Postgres `numeric`, which is arbitrary-precision. Whole-number averages
+    round-trip exactly; a fractional one can differ from a single backend's
+    answer in the low-order digits, as can a `sum` beyond 2^53.
   - An `extract` function `pdbmux` has no combiner for is refused with **400**
     rather than folded on a guess.
   - `/resources` has no cross-backend record identity to dedupe on, so only its
@@ -137,7 +149,14 @@ paths add two more headers `pdbmux` sets itself, `X-Cache` and `Age` — see
     the grouping key alongside the plain `extract` fields and the `group_by`
     clause — including a `group_by` that names the function itself. An `extract`
     of nothing but row functions has no aggregate to fold, so every backend's
-    rows are kept as they came.
+    rows are kept as they came — and, having one row per record rather than per
+    group, they keep the upstream `limit` that bounds them.
+  - `limit` and `offset` are **not** forwarded for an `extract` that folds: a
+    backend's own first N groups are not the merged result's first N, and a group
+    truncated away on one backend would fold to a wrong value. Every group is
+    fetched and the window cut after the fold, which an aggregate's row count —
+    one per distinct group value — keeps affordable. `include_total` still
+    reports the merged group count.
   - A `/reports` query with no `function` column is a projection of real reports,
     not an aggregate, and stays on the union path.
   - `include_total=true` on a combined endpoint reports the **merged** row count,
@@ -275,6 +294,8 @@ Each backend applies `order_by`/`limit`/`offset` to its own slice only, so
   the merged set's existing order). A record missing an ordered field sorts first.
 - Backends are asked for the first `offset + limit` records — never an `offset`
   — and the requested window is then cut from the merged, re-sorted set.
+- A folded `extract` aggregate is the exception: neither `limit` nor `offset` is
+  forwarded, since a group truncated on one backend cannot be folded correctly.
 - `include_total=true` on a union endpoint makes `pdbmux` sum each backend's
   `X-Records` header into one merged header. Deduped records are counted once per
   backend, so the total is an upper bound. Combined endpoints report the merged row

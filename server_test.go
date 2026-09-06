@@ -1114,6 +1114,100 @@ func TestHandler_FactsAggregateRecordsIsMergedRowCount(t *testing.T) {
 	}
 }
 
+// aggregatePagingBackends hold group counts a per-backend limit would truncate
+// to the wrong answer: backend a's own first row is Exec, so a limit pushed
+// upstream drops the File rows that together make File the real top group.
+func aggregatePagingBackends(t *testing.T) (*fakeBackend, *fakeBackend) {
+	t.Helper()
+	a := newFakeBackend(t, `[]`, `[]`)
+	a.bodies[resourcesPath] = `[{"count":6,"type":"Exec"},{"count":5,"type":"File"}]`
+	b := newFakeBackend(t, `[]`, `[]`)
+	b.bodies[resourcesPath] = `[{"count":4,"type":"File"}]`
+	return a, b
+}
+
+const aggregateCountByType = `["extract",[["function","count","certname"],"type"],["group_by","type"]]`
+
+// A group truncated away on one backend would fold to a wrong total, so the
+// whole aggregate is fetched and the window cut after the fold.
+func TestHandler_ResourcesAggregateLimitIsAppliedAfterTheFold(t *testing.T) {
+	a, b := aggregatePagingBackends(t)
+	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic))
+
+	rec := doGetParams(t, srv.Handler(), resourcesPath, url.Values{
+		"query":    {aggregateCountByType},
+		"order_by": {`[{"field":"count","order":"desc"}]`},
+		"limit":    {"1"},
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+	}
+	var got []map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	want := []map[string]any{{"count": float64(9), "type": "File"}}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("top group = %v, want %v", got, want)
+	}
+	for name, fb := range map[string]*fakeBackend{"a": a, "b": b} {
+		p, ok := fb.params(resourcesPath)
+		if !ok {
+			t.Fatalf("%s backend was not queried", name)
+		}
+		if p.Has("limit") || p.Has("offset") {
+			t.Errorf("%s backend got limit=%q offset=%q, want both applied locally", name, p.Get("limit"), p.Get("offset"))
+		}
+	}
+}
+
+// The merged row count is the whole aggregate's, not the paged window's.
+func TestHandler_ResourcesAggregateIncludeTotalWithLocalPaging(t *testing.T) {
+	a, b := aggregatePagingBackends(t)
+	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic))
+
+	rec := doGetParams(t, srv.Handler(), resourcesPath, url.Values{
+		"query":         {aggregateCountByType},
+		"order_by":      {`[{"field":"count","order":"desc"}]`},
+		"limit":         {"1"},
+		"offset":        {"1"},
+		"include_total": {"true"},
+	})
+	if got := rec.Header().Get(recordsHeader); got != "2" {
+		t.Errorf("%s = %q, want 2 merged groups", recordsHeader, got)
+	}
+	var got []map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	want := []map[string]any{{"count": float64(6), "type": "Exec"}}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("offset window = %v, want %v", got, want)
+	}
+}
+
+// Row functions return one row per record rather than per group, so nothing is
+// folded and the upstream limit that bounds them still applies.
+func TestHandler_ResourcesRowFunctionKeepsUpstreamLimit(t *testing.T) {
+	a, b := aggregatePagingBackends(t)
+	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic))
+
+	rec := doGetParams(t, srv.Handler(), resourcesPath, url.Values{
+		"query": {`["extract",[["function","to_string","line"],"type"]]`},
+		"limit": {"1"},
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+	}
+	p, ok := a.params(resourcesPath)
+	if !ok {
+		t.Fatal("backend a was not queried")
+	}
+	if p.Get("limit") != "1" {
+		t.Errorf("backend got limit=%q, want it forwarded", p.Get("limit"))
+	}
+}
+
 func TestHandler_FactsNonAggregateStillMergedByCertname(t *testing.T) {
 	// Regression: routing aggregates to the summing path must not divert plain
 	// queries, including an extract projection that carries no function column.

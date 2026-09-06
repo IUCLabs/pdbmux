@@ -371,6 +371,44 @@ func TestParseAggregate_TwoAvgColumnsAreRefused(t *testing.T) {
 	}
 }
 
+// Every extract function names its column after itself, so a second one of the
+// same name clashes whatever the function is — not only for avg.
+func TestParseAggregate_RepeatedFunctionNameIsRefused(t *testing.T) {
+	for _, fn := range []string{"count", "sum", "min", "max", "to_string", "jsonb_typeof", "avg"} {
+		q := `["extract",[["function","` + fn + `","line"],["function","` + fn + `","type"]],["group_by","line","type"]]`
+		spec, err := parseAggregate(q)
+		if err == nil {
+			t.Errorf("parseAggregate(%s) = %+v, want a refusal", q, spec)
+			continue
+		}
+		if !strings.Contains(err.Error(), fn) {
+			t.Errorf("error %q does not name the clashing column %q", err, fn)
+		}
+	}
+}
+
+// The same clash the other way round: a plain field takes the response key a
+// later function column would name.
+func TestParseAggregate_FieldClashingWithAFunctionIsRefused(t *testing.T) {
+	const q = `["extract",["count",["function","count","certname"]],["group_by","count"]]`
+	spec, err := parseAggregate(q)
+	if err == nil {
+		t.Fatalf("parseAggregate(%s) = %+v, want a refusal", q, spec)
+	}
+	if !strings.Contains(err.Error(), "count") {
+		t.Errorf("error %q does not name the clashing column", err)
+	}
+}
+
+// A repeated plain field projects the same value twice, so it is no clash: the
+// duplicate carries nothing the grouping key has not already got.
+func TestParseAggregate_RepeatedPlainFieldIsKept(t *testing.T) {
+	spec := mustAggregate(t, `["extract",["type","type",["function","count","certname"]],["group_by","type"]]`)
+	if !slices.Equal(spec.keys, []string{"type"}) {
+		t.Errorf("keys = %v, want [type]", spec.keys)
+	}
+}
+
 func TestCombineRows_DisjointKeysAreKept(t *testing.T) {
 	spec := mustAggregate(t, `["extract",[["function","count"],"status"],["=","certname","h1"],["group_by","status"]]`)
 	merged := combineRows([]backendResult{
