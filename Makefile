@@ -5,7 +5,7 @@ GOFLAGS := -ldflags="-s -w -X main.version=$(VERSION)"
 OS      ?= $(shell go env GOOS)
 ARCH    ?= $(shell go env GOARCH)
 
-.PHONY: all build test lint fmt clean install patch minor major _tag
+.PHONY: all build test e2e lint fmt clean install patch minor major _tag
 
 all: build
 
@@ -14,6 +14,10 @@ build:
 
 test:
 	go test -v -race ./...
+
+# Needs a container runtime: two PostgreSQL, two openvoxdb and one Puppetboard.
+e2e:
+	TESTCONTAINERS_RYUK_DISABLED=true go test -tags e2e -race -count=1 -timeout=30m -v .
 
 lint:
 	golangci-lint run ./...

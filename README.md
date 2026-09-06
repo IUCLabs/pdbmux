@@ -451,6 +451,35 @@ curl -s --get http://localhost:8080/pdb/query/v4/nodes \
 
 `make build` (static binary into `dist/`), `make test`, `make lint`. Requires Go 1.25+.
 
+## End-to-end tests
+
+`make e2e` runs the suite against **real** PuppetDB backends: two openvoxdb
+containers, each on its own PostgreSQL, loaded over the command API
+(`replace facts` v5, `store report` v8, `replace catalog` v9, `deactivate node`
+v3) and queried through `pdbmux`. Two real clients — Puppetboard and, when a
+binary is available, `node-lookup` — are pointed at `pdbmux` and asserted on. It
+needs a container runtime and takes a couple of minutes, so it sits behind the
+`e2e` build tag and never runs as part of `make test` or `go test ./...`.
+
+Commands are submitted with `secondsToWaitForCompletion`, so the harness waits
+on PuppetDB actually processing each one rather than sleeping, and the fixture
+load ends by polling `queue_depth` on `/status/v1/services` until both backends
+have drained.
+
+| Env var | Overrides |
+|---|---|
+| `PDBMUX_E2E_OPENVOXDB_IMAGE` | `ghcr.io/openvoxproject/openvoxdb:8.15.0` |
+| `PDBMUX_E2E_POSTGRES_IMAGE` | `docker.io/library/postgres:17-alpine` |
+| `PDBMUX_E2E_PUPPETBOARD_IMAGE` | `ghcr.io/voxpupuli/puppetboard:latest` |
+| `PDBMUX_E2E_TUNNEL_IMAGE` | `docker.io/library/alpine:3` |
+| `PDBMUX_E2E_NODE_LOOKUP` | path to a `node-lookup` binary (else `PATH`, else skipped) |
+
+Three tests skip rather than assert, each naming a known gap and failing if that
+gap closes: `/facts` aggregates are not summed, `/pdb/query/v4/facts/<name>` is
+served unmerged (so Puppetboard's single-fact drilldown silently loses the other
+backend's nodes), and `/fact-names` is likewise unmerged (so the facts overview
+lists only the first backend's fact names).
+
 ## Deployment
 
 Container image only — no OS package. Every `v*` tag builds and pushes the image
