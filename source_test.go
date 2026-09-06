@@ -328,10 +328,8 @@ func TestHandler_ProjectionWithoutNameColumnCarriesUpstreamValue(t *testing.T) {
 	}
 }
 
-// Covers only that an aggregate /facts response gains no synthetic record and no
-// rewritten row. It does not cover whether the aggregate rows are correct:
-// /facts has no parseAggregate branch, so its rows take the certname merge
-// instead of serveSummed and are not summed across backends.
+// A /facts aggregate is summed, and the summed row must gain no synthetic record
+// and no stamp.
 func TestHandler_SourceNotInjectedOnFactsAggregate(t *testing.T) {
 	a := newFakeBackend(t, `[`+node("h1", "2026-07-20T00:00:00Z")+`]`, `[]`)
 	b := newFakeBackend(t, `[]`, `[]`)
@@ -343,17 +341,11 @@ func TestHandler_SourceNotInjectedOnFactsAggregate(t *testing.T) {
 	if _, n := sourceValues(t, rec.Body.Bytes(), defaultSourceFact); n != 0 {
 		t.Errorf("aggregate response gained %d synthetic records: %s", n, rec.Body.String())
 	}
-	// Every row must be one an upstream actually returned: an aggregate row pdbmux
-	// invented or rewrote would change the count the client sees.
-	var raws []json.RawMessage
-	if err := json.Unmarshal(rec.Body.Bytes(), &raws); err != nil {
-		t.Fatal(err)
+	if strings.Contains(rec.Body.String(), defaultSourceFact) {
+		t.Errorf("aggregate rows were stamped: %s", rec.Body.String())
 	}
-	upstream := []string{`{"count":3}`, `{"count":2}`}
-	for _, raw := range raws {
-		if !slices.Contains(upstream, string(raw)) {
-			t.Errorf("aggregate row %s is not an upstream row", raw)
-		}
+	if got := counts(t, rec.Body.Bytes(), "count"); !slices.Equal(got, []float64{5}) {
+		t.Errorf("count = %v, want [5]", got)
 	}
 }
 

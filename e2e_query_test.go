@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"reflect"
 	"sort"
 	"testing"
 )
@@ -360,28 +361,59 @@ func TestResourcesAggregatesAreSummed(t *testing.T) {
 	}
 }
 
-// Known gap: handleQuery's `case factsPath:` goes straight to serveMerged, with
-// none of the parseAggregate branch /nodes, /resources and /reports have, so a
-// /facts aggregate is fed to the certname-keyed merge. Count rows carry an empty
-// certname, collapse into one bucket, and the response is whichever backend owns
-// that bucket rather than the sum. Tracked separately; this test records the gap
-// and fails once it closes so it can be turned into a real assertion.
-func TestFactsAggregatesAreNotSummed(t *testing.T) {
+// A fact count row carries no certname, so the per-certname fact merge would
+// keep one backend's rows and drop the other's; only adding the numbers is right.
+func TestFactsAggregatesAreSummed(t *testing.T) {
 	ctx := context.Background()
 	const q = `["extract",[["function","count"]]]`
 
 	wantA := backendCount(ctx, t, h.a, factsPath, q)
 	wantB := backendCount(ctx, t, h.b, factsPath, q)
 	if wantA == wantB {
-		t.Fatalf("the fixture gives both backends %d facts, so this test cannot tell a sum from one backend's number", wantA)
+		t.Fatalf("the fixture gives both backends %d facts, so a sum is indistinguishable from one backend's number", wantA)
 	}
 
-	got := countOf(t, get(t, factsPath, query(q)).rows(t))
-	if got == wantA+wantB {
-		t.Fatalf("/facts count = %d, which is the correct sum: the aggregate gap has closed, so assert this properly and drop the skip", got)
+	resp := get(t, factsPath, query(q))
+	if got := countOf(t, resp.rows(t)); got != wantA+wantB {
+		t.Fatalf("/facts count = %d, want %d (%s=%d + %s=%d)", got, wantA+wantB, h.a.name, wantA, h.b.name, wantB)
 	}
-	t.Skipf("known gap: /facts aggregates do not route to serveSummed, so the count is %d (backend %s alone) instead of %d",
-		got, h.a.name, wantA+wantB)
+	if got := resp.header.Get(backendsHeader); got != "2/2" {
+		t.Errorf("%s = %q, want %q", backendsHeader, got, "2/2")
+	}
+
+	const grouped = `["extract",[["function","count"],"name"],["group_by","name"]]`
+	want := map[string]int{}
+	for _, b := range []*backend{h.a, h.b} {
+		for name, n := range countsByName(t, b.query(ctx, t, factsPath, query(grouped))) {
+			want[name] += n
+		}
+	}
+	got := countsByName(t, get(t, factsPath, query(grouped)).rows(t))
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("grouped /facts counts = %v, want %v", got, want)
+	}
+	// The aggregate path must not inject provenance, which a group_by on name would expose.
+	if n, ok := got[defaultSourceFact]; ok {
+		t.Errorf("grouped /facts counts include %d synthetic %s rows", n, defaultSourceFact)
+	}
+}
+
+// countsByName reads a ["function","count"] + group_by "name" result set.
+func countsByName(t *testing.T, rows []map[string]any) map[string]int {
+	t.Helper()
+	out := map[string]int{}
+	for _, row := range rows {
+		name, ok := row["name"].(string)
+		if !ok {
+			t.Fatalf("grouped aggregate row has no name: %v", row)
+		}
+		n, ok := row["count"].(float64)
+		if !ok {
+			t.Fatalf("grouped aggregate row has no numeric count: %v", row)
+		}
+		out[name] = int(n)
+	}
+	return out
 }
 
 // The provenance fact must name the backend whose data won, and must be absent

@@ -25,7 +25,7 @@ not PQL) is forwarded verbatim.
 | Path | Behaviour |
 |---|---|
 | `GET /pdb/query/v4/nodes` | Fan out to all backends, dedupe by `certname`, keep the record with the newer `report_timestamp`, stamped with the winning backend's name (see provenance). An `extract`/`count` query is **summed** instead. |
-| `GET /pdb/query/v4/facts` | Fan out to all, and per `certname` keep **all** facts from the backend that owns that node (see merge semantics), plus a synthetic `pdbmux_source` fact naming it. |
+| `GET /pdb/query/v4/facts` | Fan out to all, and per `certname` keep **all** facts from the backend that owns that node (see merge semantics), plus a synthetic `pdbmux_source` fact naming it. An `extract`/`count` query is **summed** instead. |
 | `GET /pdb/query/v4/facts/<name>[/<value>]` | Same fan-out and merge as `/facts`, and an `extract`/`count` query is **summed** the same way. The path segment is a `name` constraint, so no synthetic `pdbmux_source` record is added — except on the fact's own path, which is **synthesised** from the `/facts` merge (see provenance). |
 | `GET /pdb/query/v4/fact-names` | Fan out to all and serve the **union** of the flat name arrays, deduped and re-sorted, re-paged across backends, plus the `pdbmux_source` name while injection is on. `order_by` is only valid on `name`. |
 | `GET /pdb/query/v4/resources` | An `extract`/`count` query is fanned out and **summed**; any other query is an unmerged pass-through. |
@@ -89,18 +89,25 @@ paths add two more headers `pdbmux` sets itself, `X-Cache` and `Age` — see
 - **Aggregates** — `extract`/`group_by` rows are counts, not records, so each
   backend returns a partial answer that has to be **added**, not deduped. This
   covers `/event-counts`, `/aggregate-event-counts`, and any `/reports`,
-  `/nodes`, `/resources` or `/facts/<name>[/<value>]` query whose `extract`
-  carries a `["function", ...]` column.
+  `/nodes`, `/resources`, `/facts` or `/facts/<name>[/<value>]` query whose
+  `extract` carries a `["function", ...]` column.
   - The grouping key is the row's non-aggregate fields: for `/reports`,
-    `/nodes`, `/resources` and `/facts/<name>` they come from the query — the
-    plain `extract` fields plus any `group_by` clause — and for the event-count
-    endpoints from the row itself (`subject_type`/`subject`, or
+    `/nodes`, `/resources`, `/facts` and `/facts/<name>` they come from the
+    query — the plain `extract` fields plus any `group_by` clause — and for the
+    event-count endpoints from the row itself (`subject_type`/`subject`, or
     `summarize_by`), whose remaining fields are all counts.
-  - On `/nodes` and `/facts/<name>[/<value>]` this takes precedence over the
-    `certname` merge: a count row has no `certname`, so deduping would collapse
-    every backend's count into one backend's number. A query with no `function`
-    column — including a plain `extract` projection — still merges by
-    `certname`.
+  - On `/nodes`, `/facts` and `/facts/<name>[/<value>]` this takes precedence
+    over the `certname` merge: an aggregate row has no `certname`, so deduping
+    would collapse every backend's rows into one backend's numbers. A query with
+    no `function` column — including a plain `extract` projection — still merges
+    by `certname`.
+  - PuppetDB accepts `count`, `sum`, `avg`, `min`, `max`, `to_string` and
+    `jsonb_typeof` as `extract` functions. Only `count` and `sum` are additive,
+    so only those two merge correctly. `avg`, `min` and `max` are folded like any
+    other numeric column and their merged value is **wrong**; `to_string` and
+    `jsonb_typeof` are row functions whose non-numeric column is carried through
+    from the first backend to report the key. Query a single backend directly
+    for any of those five.
   - `/resources` has no cross-backend record identity to dedupe on, so only its
     aggregate queries merge; everything else stays an unmerged pass-through.
   - Rows sharing a key collapse into one with their numeric columns summed. A key
@@ -507,8 +514,7 @@ have drained.
 | `PDBMUX_E2E_TUNNEL_IMAGE` | `docker.io/library/alpine:3` |
 | `PDBMUX_E2E_NODE_LOOKUP` | path to a `node-lookup` binary (else `PATH`, else skipped) |
 
-One test skips rather than asserts, naming a known gap and failing if that gap
-closes: `/facts` aggregates are not summed.
+Every test asserts; the suite records no known gaps.
 
 ## Deployment
 
