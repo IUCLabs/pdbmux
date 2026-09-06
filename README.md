@@ -89,8 +89,10 @@ paths add two more headers `pdbmux` sets itself, `X-Cache` and `Age` — see
   - PuppetDB accepts `count`, `sum`, `avg`, `min`, `max`, `to_string` and
     `jsonb_typeof` as `extract` functions. Only `count` and `sum` are additive,
     so only those two merge correctly. `avg`, `min` and `max` are folded like any
-    other numeric column and their merged value is **wrong**; query a single
-    backend directly for those.
+    other numeric column and their merged value is **wrong**; `to_string` and
+    `jsonb_typeof` are row functions whose non-numeric column is carried through
+    from the first backend to report the key. Query a single backend directly
+    for any of those five.
   - `/resources` has no cross-backend record identity to dedupe on, so only its
     aggregate queries merge; everything else stays an unmerged pass-through.
   - Rows sharing a key collapse into one with their numeric columns summed. A key
