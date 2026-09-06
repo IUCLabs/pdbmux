@@ -364,6 +364,10 @@ func TestHandler_FactsBySourceNameUnknownValueSkipsFanOut(t *testing.T) {
 			t.Errorf("unknown value reached a backend %d times, want 0", got)
 		}
 	}
+	// No fan-out happened, so none was heard from partially either.
+	if got := health(t, srv).Query.PartialRounds; got != 0 {
+		t.Errorf("partial_rounds = %d, want 0", got)
+	}
 }
 
 // The record set is the estate's, not the pinned value's, so every value shares
