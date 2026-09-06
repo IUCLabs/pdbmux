@@ -337,6 +337,66 @@ func TestHandler_FactsBySourceNameAndValueFiltersByOwner(t *testing.T) {
 	}
 }
 
+// The pinned value is client-supplied and the drilldown's fetch is the widest
+// query pdbmux makes, so a value naming no backend is answered from the
+// configured names alone: no fan-out, and so no per-value cache key either.
+func TestHandler_FactsBySourceNameUnknownValueSkipsFanOut(t *testing.T) {
+	facts := map[string]string{factsPath: `[` + fact("h1", "osfamily", "RedHat", "") + `]`}
+	a := newCountingBackend(t, facts)
+	b := newCountingBackend(t, facts)
+	srv, _ := newCachedServer(t, cacheTestConfig(a.srv.URL, b.srv.URL))
+
+	for _, value := range []string{"nosuchbackend", "nonce-1", "nonce-2"} {
+		rec := doGet(t, srv.Handler(), sourceFactURL+"/"+value, "")
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+		}
+		if got := rec.Body.String(); got != "[]\n" {
+			t.Errorf("%s/%s = %q, want %q", sourceFactURL, value, got, "[]\n")
+		}
+		// The answer is complete, not built from a subset of backends.
+		if h := rec.Header().Get(backendsHeader); h != "2/2" {
+			t.Errorf("%s/%s %s = %q, want 2/2", sourceFactURL, value, backendsHeader, h)
+		}
+	}
+	for _, cb := range []*countingBackend{a, b} {
+		if got := cb.totalHits(); got != 0 {
+			t.Errorf("unknown value reached a backend %d times, want 0", got)
+		}
+	}
+}
+
+// The record set is the estate's, not the pinned value's, so every value shares
+// one entry: two valid values must not cost two whole-estate fan-outs.
+func TestHandler_FactsBySourceNameValuesShareOneFetch(t *testing.T) {
+	a := newCountingBackend(t, map[string]string{factsPath: `[` + fact("h1", "osfamily", "RedHat", "") + `]`})
+	b := newCountingBackend(t, map[string]string{factsPath: `[` + fact("h2", "osfamily", "Debian", "") + `]`})
+	srv, _ := newCachedServer(t, cacheTestConfig(a.srv.URL, b.srv.URL))
+
+	for _, tc := range []struct {
+		path string
+		want map[string]string
+	}{
+		{sourceFactURL + "/a", map[string]string{"h1": "a"}},
+		{sourceFactURL + "/b", map[string]string{"h2": "b"}},
+		{sourceFactURL, map[string]string{"h1": "a", "h2": "b"}},
+	} {
+		rec := doGet(t, srv.Handler(), tc.path, "")
+		got, n := sourceValues(t, rec.Body.Bytes(), defaultSourceFact)
+		if n != len(tc.want) || !reflect.DeepEqual(got, tc.want) {
+			t.Fatalf("%s = %v (%d records), want %v", tc.path, got, n, tc.want)
+		}
+	}
+	for _, cb := range []*countingBackend{a, b} {
+		if got := cb.hitCount(factsPath); got != 1 {
+			t.Errorf("%s fetched %d times, want 1 shared fetch", factsPath, got)
+		}
+		if got := cb.hitCount(sourceFactURL); got != 0 {
+			t.Errorf("%s was fanned out %d times, want 0", sourceFactURL, got)
+		}
+	}
+}
+
 // Nothing produces the fact while injection is off, so the drilldown is empty
 // and the name is not advertised for a client to click through to.
 func TestHandler_FactsBySourceNamePathEmptyWhenDisabled(t *testing.T) {

@@ -335,20 +335,53 @@ func (s *Server) serveFactsByName(w http.ResponseWriter, r *http.Request, name, 
 // records are taken from the /facts merge that produces them instead, which
 // makes the certname set, the owner and the environment identical to the ones an
 // unfiltered /facts response reports, and lets the request's query narrow the
-// result upstream. That costs one extra fan-out on a rare, user-initiated path.
+// result upstream.
+//
+// That merge is the widest query pdbmux makes and the pinned value is
+// client-supplied, so the value never reaches it: a value naming no configured
+// backend is answered empty without any fan-out, and a value naming one filters
+// a record set fetched under a value-independent key. Otherwise each distinct
+// value would be a fresh cache key, a fresh flight and a fresh whole-estate
+// fan-out.
 func (s *Server) serveSourceFact(w http.ResponseWriter, r *http.Request, inject *sourceInjector, value string, valued bool) {
+	// The synthetic record's value is always a backend name, so any other value
+	// matches zero records. The response is complete rather than degraded, so it
+	// reports every configured backend.
+	if valued && !s.hasBackend(value) {
+		n := len(s.cfg.Backends)
+		writeCached(w, cachedResponse{Records: -1, Backends: n, Configured: n})
+		return
+	}
+
 	params := queryParams(r.URL.Query().Get("query"))
 	merge := s.mergeFactsWith(inject)
-	s.serveCached(w, r, r.URL.Path, params, func(ctx context.Context) (cachedResponse, error) {
+	var filter recordFilter
+	if valued {
+		filter = func(recs []json.RawMessage) []json.RawMessage {
+			return sourceFactRecords(recs, inject.name, value, true)
+		}
+	}
+	// The stored set is the whole owned-fact record set, so every value of it
+	// keys, and waits on, the same fetch.
+	s.serveFiltered(w, r, factsPath+"/"+inject.name, params, filter, func(ctx context.Context) (cachedResponse, error) {
 		alive, err := s.aliveResults(ctx, factsPath, params)
 		if err != nil {
 			return cachedResponse{}, err
 		}
-		recs := sourceFactRecords(merge(alive), inject.name, value, valued)
+		recs := sourceFactRecords(merge(alive), inject.name, "", false)
 		resp := cachedResponse{Body: encodeRecords(recs), Records: -1}
 		s.countBackends(&resp, alive)
 		return resp, nil
 	})
+}
+
+func (s *Server) hasBackend(name string) bool {
+	for _, b := range s.cfg.Backends {
+		if b.Name == name {
+			return true
+		}
+	}
+	return false
 }
 
 // A count row carries no certname, so the certname-keyed merge would collapse every backend's count into one backend's; aggregates take the summing path instead.
@@ -457,12 +490,36 @@ type cachedResponse struct {
 	Configured int             `json:"configured"` // backends configured at build time
 }
 
+// recordFilter narrows a response's records after it has been built or read back
+// from the cache, so requests differing only in the filter share one stored entry
+// and one fan-out. It leaves Records alone, so it only suits responses that set
+// no X-Records.
+type recordFilter func([]json.RawMessage) []json.RawMessage
+
+func (f recordFilter) apply(resp cachedResponse) cachedResponse {
+	if f == nil {
+		return resp
+	}
+	var recs []json.RawMessage
+	if json.Unmarshal(resp.Body, &recs) != nil {
+		return resp
+	}
+	resp.Body = encodeRecords(f(recs))
+	return resp
+}
+
 // serveCached answers from the cache when the entry is fresh, otherwise runs
 // build — single-flighted, so N concurrent identical requests cause one upstream
 // fan-out — and stores the result. A build failure falls back to a stale entry
 // when one exists; that is the only path on which stale data is served. Paths
 // with no cache configured run build directly, unchanged.
 func (s *Server) serveCached(w http.ResponseWriter, r *http.Request, path string, params url.Values, build func(context.Context) (cachedResponse, error)) {
+	s.serveFiltered(w, r, path, params, nil, build)
+}
+
+// serveFiltered is serveCached with a per-request narrowing applied to whatever
+// the shared entry holds.
+func (s *Server) serveFiltered(w http.ResponseWriter, r *http.Request, path string, params url.Values, filter recordFilter, build func(context.Context) (cachedResponse, error)) {
 	cache, enabled := s.cacheFor(path, params)
 	if !enabled {
 		resp, err := build(r.Context())
@@ -470,7 +527,7 @@ func (s *Server) serveCached(w http.ResponseWriter, r *http.Request, path string
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
 		}
-		writeCached(w, resp)
+		writeCached(w, filter.apply(resp))
 		return
 	}
 
@@ -482,7 +539,7 @@ func (s *Server) serveCached(w http.ResponseWriter, r *http.Request, path string
 		s.log.Printf("warning: cache lookup for %s failed: %v", key, err)
 	case status == CacheFresh:
 		s.stale.markFresh()
-		s.writeStored(w, ent, CacheFresh)
+		s.writeStored(w, ent, CacheFresh, filter)
 		return
 	case status == CacheStale:
 		stale = &ent
@@ -523,7 +580,7 @@ func (s *Server) serveCached(w http.ResponseWriter, r *http.Request, path string
 			s.stale.markStale(s.now())
 			s.log.Printf("warning: serving stale %s from cache (stored %s): %v",
 				path, stale.StoredAt.UTC().Format(time.RFC3339), err)
-			s.writeStored(w, *stale, CacheStale)
+			s.writeStored(w, *stale, CacheStale, filter)
 			return
 		}
 		http.Error(w, err.Error(), http.StatusBadGateway)
@@ -531,7 +588,7 @@ func (s *Server) serveCached(w http.ResponseWriter, r *http.Request, path string
 	}
 	s.stale.markFresh()
 	s.setCacheHeaders(w, CacheMiss, time.Time{})
-	writeCached(w, resp)
+	writeCached(w, filter.apply(resp))
 }
 
 // http.Client reads a zero Timeout as "no deadline", but it would expire a
@@ -543,7 +600,7 @@ func (s *Server) flightTimeout() time.Duration {
 	return defaultTimeout
 }
 
-func (s *Server) writeStored(w http.ResponseWriter, ent CacheEntry, status CacheStatus) {
+func (s *Server) writeStored(w http.ResponseWriter, ent CacheEntry, status CacheStatus, filter recordFilter) {
 	var resp cachedResponse
 	if err := json.Unmarshal(ent.Body, &resp); err != nil {
 		s.log.Printf("warning: unreadable cache entry: %v", err)
@@ -551,7 +608,7 @@ func (s *Server) writeStored(w http.ResponseWriter, ent CacheEntry, status Cache
 		return
 	}
 	s.setCacheHeaders(w, status, ent.StoredAt)
-	writeCached(w, resp)
+	writeCached(w, filter.apply(resp))
 }
 
 // setCacheHeaders labels a response from a cache-backed path: X-Cache is

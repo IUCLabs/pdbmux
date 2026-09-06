@@ -182,12 +182,18 @@ records from the `/facts` merge that produces them, which makes the `certname`
 set, the owner and the `environment` identical to the ones an unfiltered `/facts`
 response reports, and lets the request's own `query` narrow the result upstream.
 That costs one `/facts` fan-out per cache miss — the widest fan-out `pdbmux`
-makes — on a rare, user-initiated path. `/facts/pdbmux_source/<value>` pins the
-backend name, so it answers with the nodes that backend owns, and with `[]` for a
-value naming no backend. An `extract`/`count` query still takes the summing
-branch, and the gated query shapes above still answer `[]`, as does every form
-while injection is off — with the name kept out of `/fact-names`, since nothing
-then produces it.
+makes — on a rare, user-initiated path.
+
+`/facts/pdbmux_source/<value>` pins the backend name, so it answers with the
+nodes that backend owns. The `<value>` segment never reaches that fan-out: the
+synthetic record's value is always a backend name, so a value naming none is
+answered `[]` from the configured names alone, with no fan-out at all, and a
+value naming one filters a record set fetched under a key the value is not part
+of. The record set is a property of the estate rather than of the filter, so
+every value of it — and the unfiltered path — share one entry and one fetch.
+An `extract`/`count` query still takes the summing branch, and the gated query
+shapes above still answer `[]`, as does every form while injection is off — with
+the name kept out of `/fact-names`, since nothing then produces it.
 
 **Not supported in v1: server-side filtering on the fact.** A query that selects
 it — `["=","name","pdbmux_source"]`, or an `extract` naming it — is forwarded to
@@ -407,7 +413,9 @@ backend later without further handler changes.
   requests can only share an entry when they share a key, and the key is path
   plus query, which is exactly what decides whether injection applies; a
   name-filtered `/facts` query and a plain one therefore cache separately and
-  neither is ever served the other's shape. `source_fact` and
+  neither is ever served the other's shape. The one path that keys on less than
+  it is asked is the `pdbmux_source` drilldown, whose `<value>` is dropped from
+  the key and applied to the shared entry instead. `source_fact` and
   `source_fact_enabled` are read once at startup, and the cache lives for the
   same process, so changing either cannot leave differently-shaped entries
   behind.

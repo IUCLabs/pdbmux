@@ -96,6 +96,18 @@ func (cb *countingBackend) hitCount(path string) int {
 	return cb.hits[path]
 }
 
+// totalHits counts requests across every path, so a test can assert a route
+// reached no backend at all.
+func (cb *countingBackend) totalHits() int {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	n := 0
+	for _, c := range cb.hits {
+		n += c
+	}
+	return n
+}
+
 func (cb *countingBackend) setFail(v bool) {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
