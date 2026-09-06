@@ -171,6 +171,28 @@ func mergeFacts(results []backendResult, owner func(certname string) string, inj
 	return out
 }
 
+// sourceFactRecords keeps the merged /facts records naming the fact pdbmux
+// owns, and, when the path pins a value, only those naming that backend. The
+// merge drops every upstream record of that name, so what survives is exactly
+// the synthetic set — one record per certname the merge attributed.
+func sourceFactRecords(merged []json.RawMessage, name, value string, valued bool) []json.RawMessage {
+	out := []json.RawMessage{}
+	for _, raw := range merged {
+		var m struct {
+			Name  string `json:"name"`
+			Value string `json:"value"`
+		}
+		if json.Unmarshal(raw, &m) != nil || m.Name != name {
+			continue
+		}
+		if valued && m.Value != value {
+			continue
+		}
+		out = append(out, raw)
+	}
+	return out
+}
+
 // mergeFactNames unions the backends' /fact-names arrays, dedupes by the name
 // itself and re-sorts, since each backend only ordered its own slice. owned is
 // the fact name pdbmux injects, or "" while injection is off: it is listed

@@ -26,7 +26,7 @@ not PQL) is forwarded verbatim.
 |---|---|
 | `GET /pdb/query/v4/nodes` | Fan out to all backends, dedupe by `certname`, keep the record with the newer `report_timestamp`, stamped with the winning backend's name (see provenance). An `extract`/`count` query is **summed** instead. |
 | `GET /pdb/query/v4/facts` | Fan out to all, and per `certname` keep **all** facts from the backend that owns that node (see merge semantics), plus a synthetic `pdbmux_source` fact naming it. |
-| `GET /pdb/query/v4/facts/<name>[/<value>]` | Same fan-out and merge as `/facts`, and an `extract`/`count` query is **summed** the same way. The path segment is a `name` constraint, so no synthetic `pdbmux_source` record is added unless the path names it. |
+| `GET /pdb/query/v4/facts/<name>[/<value>]` | Same fan-out and merge as `/facts`, and an `extract`/`count` query is **summed** the same way. The path segment is a `name` constraint, so no synthetic `pdbmux_source` record is added — except on the fact's own path, which is **synthesised** from the `/facts` merge (see provenance). |
 | `GET /pdb/query/v4/fact-names` | Fan out to all and serve the **union** of the flat name arrays, deduped and re-sorted, re-paged across backends, plus the `pdbmux_source` name while injection is on. `order_by` is only valid on `name`. |
 | `GET /pdb/query/v4/resources` | An `extract`/`count` query is fanned out and **summed**; any other query is an unmerged pass-through. |
 | `GET /pdb/query/v4/reports` | Fan out to all and serve the **union**, deduped by report `hash`, re-ordered and re-paged across backends. |
@@ -71,7 +71,9 @@ paths add two more headers `pdbmux` sets itself, `X-Cache` and `Age` — see
     backend actually returned facts for it).
   - `/facts/<name>` and `/facts/<name>/<value>` are the same records with one
     more constraint applied upstream, so they take the same rule — and the same
-    aggregate branch, since a count row has no `certname` there either.
+    aggregate branch, since a count row has no `certname` there either. The
+    `pdbmux_source` path is the exception: no backend holds that name, so it is
+    synthesised from the `/facts` merge (see provenance).
 - **`/fact-names`** — a flat array of strings, not records: **union**, deduped by
   the name and re-sorted, ascending unless `order_by` says otherwise. `name` is
   the only column the entity projects, so an `order_by` on any other field is
@@ -162,10 +164,23 @@ matters more.
   subquery narrows which *nodes* match, not which facts come back, so injection
   still happens;
 - the path is `/facts/<name>` for any other fact. The path segment is the same
-  outer `name` constraint, so only `/facts/pdbmux_source` may carry the record;
-  `/facts/<name>/<value>` never does, since the pinned value need not equal the
-  backend name the record holds;
+  outer `name` constraint, so only the fact's own path carries the record;
 - injection is turned off (see `source_fact_enabled`).
+
+**The fact's own path is synthesised.** `/pdb/query/v4/fact-names` lists the name
+while injection is on, so a client that discovers names there can click through
+to it, and `/pdb/query/v4/facts/pdbmux_source` has to answer. No backend holds a
+record of that name, so the route does not serve its own fan-out: it takes the
+records from the `/facts` merge that produces them, which makes the `certname`
+set, the owner and the `environment` identical to the ones an unfiltered `/facts`
+response reports, and lets the request's own `query` narrow the result upstream.
+That costs one `/facts` fan-out per cache miss — the widest fan-out `pdbmux`
+makes — on a rare, user-initiated path. `/facts/pdbmux_source/<value>` pins the
+backend name, so it answers with the nodes that backend owns, and with `[]` for a
+value naming no backend. An `extract`/`count` query still takes the summing
+branch, and the gated query shapes above still answer `[]`, as does every form
+while injection is off — with the name kept out of `/fact-names`, since nothing
+then produces it.
 
 **Not supported in v1: server-side filtering on the fact.** A query that selects
 it — `["=","name","pdbmux_source"]`, or an `extract` naming it — is forwarded to
@@ -173,13 +188,7 @@ the backends like any other, and they return nothing, because the fact does not
 exist upstream. `pdbmux` does not evaluate the AST itself, so it cannot answer
 such a query correctly for every operator (`not`, `or`, subqueries) and does not
 pretend to for some. Read the fact from an unfiltered (or `certname`-filtered)
-`/facts` response and filter client-side. `/pdb/query/v4/facts/pdbmux_source` is
-the same story: the route is merged and injection is allowed there, but the
-backends hold no record to attach it to, so it answers empty.
-`/pdb/query/v4/fact-names` still lists the name while injection is on, because
-every merged `/facts` response does carry records of it — leaving it out hides a
-fact every node has from any client that discovers names there. Turning injection
-off removes it, since nothing then produces it.
+`/facts` response, from the path route above, and filter client-side.
 
 **Not covered:** `/factsets` and `/inventory`. Both carry facts, but `pdbmux`
 does not merge either today — they take the unmerged pass-through path, where

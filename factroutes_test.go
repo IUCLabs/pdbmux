@@ -34,22 +34,24 @@ func factNamesBody(names ...string) string {
 
 func TestFactsSubPath(t *testing.T) {
 	for _, tc := range []struct {
-		path      string
-		wantName  string
-		wantValue bool
+		path       string
+		wantName   string
+		wantValue  string
+		wantValued bool
 	}{
-		{factsPath, "", false},
-		{factsPath + "/", "", false},
-		{roleFactPath, "role", false},
-		{roleFactPath + "/web", "role", true},
-		{roleFactPath + "/", "", false},
-		{roleFactPath + "/web/extra", "", false},
-		{nodesPath + "/h1/facts/role", "", false},
-		{factNamesPath, "", false},
+		{factsPath, "", "", false},
+		{factsPath + "/", "", "", false},
+		{roleFactPath, "role", "", false},
+		{roleFactPath + "/web", "role", "web", true},
+		{roleFactPath + "/", "", "", false},
+		{roleFactPath + "/web/extra", "", "", false},
+		{nodesPath + "/h1/facts/role", "", "", false},
+		{factNamesPath, "", "", false},
 	} {
-		name, valued := factsSubPath(tc.path)
-		if name != tc.wantName || valued != tc.wantValue {
-			t.Errorf("factsSubPath(%q) = (%q, %v), want (%q, %v)", tc.path, name, valued, tc.wantName, tc.wantValue)
+		name, value, valued := factsSubPath(tc.path)
+		if name != tc.wantName || value != tc.wantValue || valued != tc.wantValued {
+			t.Errorf("factsSubPath(%q) = (%q, %q, %v), want (%q, %q, %v)",
+				tc.path, name, value, valued, tc.wantName, tc.wantValue, tc.wantValued)
 		}
 	}
 }
@@ -187,7 +189,7 @@ func TestHandler_FactsByNameNonAggregateStillMergedByCertname(t *testing.T) {
 
 // A summed row is not the merged record set the cache stores, so it stays live.
 func TestHandler_FactsByNameAggregateNotCached(t *testing.T) {
-	for _, path := range []string{roleFactPath, roleFactPath + "/web"} {
+	for _, path := range []string{roleFactPath, roleFactPath + "/web", sourceFactURL} {
 		t.Run(path, func(t *testing.T) {
 			a := newCountingBackend(t, map[string]string{path: `[{"count":7}]`})
 			b := newCountingBackend(t, map[string]string{path: `[{"count":3}]`})
@@ -236,53 +238,195 @@ func TestHandler_FactsByNameNotInjected(t *testing.T) {
 	}
 }
 
-// Only the source fact's own path may carry it; the upstream record of that name
-// is still dropped, as it is on every other query shape.
-func TestHandler_FactsBySourceNamePathInjectsAndSuppresses(t *testing.T) {
-	a := newFakeBackend(t, `[]`, `[]`)
-	a.bodies[sourceFactURL] = `[` + fact("h1", defaultSourceFact, "stale", "") + `]`
-	b := newFakeBackend(t, `[]`, `[]`)
-	b.bodies[sourceFactURL] = `[]`
-	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic))
+// sourceFactBackends is a pair of fake backends whose /facts bodies give h1 to a
+// and h2/h3 to b, the shape every drilldown assertion below rests on.
+func sourceFactBackends(t *testing.T) (*fakeBackend, *fakeBackend) {
+	t.Helper()
+	a := newFakeBackend(t,
+		`[`+node("h1", "2026-01-01T00:00:00Z")+`,`+node("h3", "2026-01-01T00:00:00Z")+`]`,
+		`[`+factEnv("h1", "osfamily", "RedHat", "prod")+`,`+factEnv("h3", "osfamily", "RedHat", "prod")+`]`)
+	b := newFakeBackend(t,
+		`[`+node("h2", "2026-01-01T00:00:00Z")+`,`+node("h3", "2026-06-01T00:00:00Z")+`]`,
+		`[`+factEnv("h2", "osfamily", "Debian", "dev")+`,`+factEnv("h3", "osfamily", "Debian", "dev")+`]`)
+	return a, b
+}
 
-	rec := doGet(t, srv.Handler(), sourceFactURL, "")
-	got, n := sourceValues(t, rec.Body.Bytes(), defaultSourceFact)
-	if n != 1 {
-		t.Fatalf("%s carried %d %s records, want exactly the synthetic one: %s", sourceFactURL, n, defaultSourceFact, rec.Body.String())
-	}
-	if got["h1"] != "a" {
-		t.Errorf("%s for h1 = %q, want the owning backend %q", defaultSourceFact, got["h1"], "a")
+// The drilldown has to answer with the records /facts carries, which no backend
+// holds: the certname set and the per-node owner come from the same merge.
+func TestHandler_FactsBySourceNamePathSynthesisesOneRecordPerNode(t *testing.T) {
+	for _, merge := range []string{mergeStatic, mergeFreshness} {
+		t.Run(merge, func(t *testing.T) {
+			a, b := sourceFactBackends(t)
+			srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, merge))
+
+			// h3 lives in both: static keeps the first configured backend, freshness
+			// the one holding its newer report.
+			wantH3 := "a"
+			if merge == mergeFreshness {
+				wantH3 = "b"
+			}
+			want := map[string]string{"h1": "a", "h2": "b", "h3": wantH3}
+
+			rec := doGet(t, srv.Handler(), sourceFactURL, "")
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+			}
+			got, n := sourceValues(t, rec.Body.Bytes(), defaultSourceFact)
+			if n != len(want) || !reflect.DeepEqual(got, want) {
+				t.Fatalf("%s = %v (%d records), want %v", sourceFactURL, got, n, want)
+			}
+
+			// The drilldown must agree with the records the unfiltered route reports.
+			unfiltered, _ := sourceValues(t, doGet(t, srv.Handler(), factsPath, "").Body.Bytes(), defaultSourceFact)
+			if !reflect.DeepEqual(got, unfiltered) {
+				t.Errorf("%s = %v, want the same attribution %s reports: %v", sourceFactURL, got, factsPath, unfiltered)
+			}
+			if h := rec.Header().Get(backendsHeader); h != "2/2" {
+				t.Errorf("%s = %q, want 2/2", backendsHeader, h)
+			}
+		})
 	}
 }
 
-// The /<name>/<value> form also pins a value the synthetic record's own value
-// need not equal, so it never carries one.
-func TestHandler_FactsBySourceNameAndValueNotInjected(t *testing.T) {
-	path := sourceFactURL + "/a"
-	a := newFakeBackend(t, `[]`, `[]`)
-	a.bodies[path] = `[` + fact("h1", defaultSourceFact, "a", "") + `]`
-	b := newFakeBackend(t, `[]`, `[]`)
-	b.bodies[path] = `[]`
-	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic))
+// A fact record's four keys are always present, and environment is the owning
+// backend's, since that is the record the merge attributed the node to.
+func TestHandler_FactsBySourceNamePathCarriesTheOwnersEnvironment(t *testing.T) {
+	a, b := sourceFactBackends(t)
+	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeFreshness))
 
-	rec := doGet(t, srv.Handler(), path, "")
-	if _, n := sourceValues(t, rec.Body.Bytes(), defaultSourceFact); n != 0 {
-		t.Errorf("%s appeared on %s: %s", defaultSourceFact, path, rec.Body.String())
+	rec := doGet(t, srv.Handler(), sourceFactURL, "")
+	var rows []map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &rows); err != nil {
+		t.Fatalf("unmarshal %s: %v", rec.Body.String(), err)
+	}
+	want := map[string]string{"h1": "prod", "h2": "dev", "h3": "dev"}
+	for _, row := range rows {
+		for _, key := range []string{"certname", "name", "value", "environment"} {
+			if _, ok := row[key]; !ok {
+				t.Fatalf("synthetic record %v is missing %s", row, key)
+			}
+		}
+		cn, _ := row["certname"].(string)
+		if got := row["environment"]; got != want[cn] {
+			t.Errorf("environment of %s = %v, want the owner's %q", cn, got, want[cn])
+		}
+	}
+}
+
+// The pinned value names a backend, so the sub-route is the drilldown filtered
+// by owner; a value naming no backend matches nothing.
+func TestHandler_FactsBySourceNameAndValueFiltersByOwner(t *testing.T) {
+	for _, tc := range []struct {
+		value string
+		want  map[string]string
+	}{
+		{"a", map[string]string{"h1": "a"}},
+		{"b", map[string]string{"h2": "b", "h3": "b"}},
+		{"nosuchbackend", map[string]string{}},
+	} {
+		t.Run(tc.value, func(t *testing.T) {
+			a, b := sourceFactBackends(t)
+			srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeFreshness))
+
+			rec := doGet(t, srv.Handler(), sourceFactURL+"/"+tc.value, "")
+			got, n := sourceValues(t, rec.Body.Bytes(), defaultSourceFact)
+			if n != len(tc.want) || !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("%s/%s = %v (%d records), want %v", sourceFactURL, tc.value, got, n, tc.want)
+			}
+		})
+	}
+}
+
+// Nothing produces the fact while injection is off, so the drilldown is empty
+// and the name is not advertised for a client to click through to.
+func TestHandler_FactsBySourceNamePathEmptyWhenDisabled(t *testing.T) {
+	a, b := sourceFactBackends(t)
+	a.bodies[factNamesPath] = factNamesBody("osfamily")
+	b.bodies[factNamesPath] = `[]`
+	cfg := testConfig(a.srv.URL, b.srv.URL, mergeFreshness)
+	cfg.SourceFactEnabled = false
+	srv := newTestServer(cfg)
+
+	// No backend holds the fact, so the route falls through to the plain merge.
+	for _, fb := range []*fakeBackend{a, b} {
+		fb.bodies[sourceFactURL] = `[]`
+		fb.bodies[sourceFactURL+"/a"] = `[]`
+	}
+	for _, path := range []string{sourceFactURL, sourceFactURL + "/a"} {
+		if got := doGet(t, srv.Handler(), path, "").Body.String(); got != "[]\n" {
+			t.Errorf("disabled %s = %q, want %q", path, got, "[]\n")
+		}
+	}
+	if got := names(t, doGet(t, srv.Handler(), factNamesPath, "").Body.Bytes()); !reflect.DeepEqual(got, []string{"osfamily"}) {
+		t.Errorf("disabled %s = %v, want no %s entry", factNamesPath, got, defaultSourceFact)
+	}
+}
+
+// The query narrows the certnames upstream, so the drilldown only covers what it
+// selects.
+func TestHandler_FactsBySourceNamePathRespectsQuery(t *testing.T) {
+	a, b := sourceFactBackends(t)
+	a.bodies[factsPath] = `[` + factEnv("h1", "osfamily", "RedHat", "prod") + `]`
+	b.bodies[factsPath] = `[]`
+	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeFreshness))
+
+	const q = `["=","certname","h1"]`
+	rec := doGet(t, srv.Handler(), sourceFactURL, q)
+	got, n := sourceValues(t, rec.Body.Bytes(), defaultSourceFact)
+	if n != 1 || got["h1"] != "a" {
+		t.Fatalf("%s?query=%s = %v (%d records), want only h1: %s", sourceFactURL, q, got, n, rec.Body.String())
+	}
+	// The query has to reach the backends for them to narrow anything.
+	for _, fb := range []*fakeBackend{a, b} {
+		if seen := fb.gotQuery(factsPath); seen != q {
+			t.Errorf("backend got query %q on %s, want %q", seen, factsPath, q)
+		}
+	}
+}
+
+// pdbmux owns the name, so an upstream record of it is dropped rather than
+// listed beside the synthetic one.
+func TestHandler_FactsBySourceNamePathSuppressesUpstream(t *testing.T) {
+	a, b := sourceFactBackends(t)
+	a.bodies[factsPath] = `[` + factEnv("h1", "osfamily", "RedHat", "prod") + `,` +
+		fact("h1", defaultSourceFact, "stale", "") + `]`
+	b.bodies[factsPath] = `[]`
+	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeFreshness))
+
+	rec := doGet(t, srv.Handler(), sourceFactURL, "")
+	got, n := sourceValues(t, rec.Body.Bytes(), defaultSourceFact)
+	if n != 1 || got["h1"] != "a" {
+		t.Fatalf("%s = %v (%d records), want exactly the synthetic one: %s", sourceFactURL, got, n, rec.Body.String())
 	}
 }
 
 // A name-constrained query on the source fact's own path is still gated by the
 // query, not just the path.
 func TestHandler_FactsBySourceNamePathRespectsQueryGate(t *testing.T) {
-	a := newFakeBackend(t, `[]`, `[]`)
-	a.bodies[sourceFactURL] = `[` + fact("h1", defaultSourceFact, "stale", "") + `]`
-	b := newFakeBackend(t, `[]`, `[]`)
-	b.bodies[sourceFactURL] = `[]`
+	a, b := sourceFactBackends(t)
 	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic))
 
 	rec := doGet(t, srv.Handler(), sourceFactURL, `["extract",["certname","value"]]`)
 	if _, n := sourceValues(t, rec.Body.Bytes(), defaultSourceFact); n != 0 {
 		t.Errorf("%s survived an extract projection: %s", defaultSourceFact, rec.Body.String())
+	}
+}
+
+// An aggregate carries no certname to attribute, so the route stays on the
+// summing path rather than synthesising records.
+func TestHandler_FactsBySourceNameAggregateStillSummed(t *testing.T) {
+	for _, path := range []string{sourceFactURL, sourceFactURL + "/a"} {
+		t.Run(path, func(t *testing.T) {
+			a, b := sourceFactBackends(t)
+			a.bodies[path] = `[{"count":7}]`
+			b.bodies[path] = `[{"count":3}]`
+			srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeFreshness))
+
+			rec := doGet(t, srv.Handler(), path, `["extract",[["function","count"]]]`)
+			if got := counts(t, rec.Body.Bytes(), "count"); !slices.Equal(got, []float64{10}) {
+				t.Errorf("count = %v, want [10]", got)
+			}
+		})
 	}
 }
 
@@ -472,7 +616,7 @@ func TestHandler_FactNamesSurvivesOneBackend(t *testing.T) {
 
 // Both routes are merged record sets, so they use the same cache /facts does.
 func TestHandler_FactRoutesAreCached(t *testing.T) {
-	for _, path := range []string{roleFactPath, roleFactPath + "/web", factNamesPath} {
+	for _, path := range []string{roleFactPath, roleFactPath + "/web", sourceFactURL, factNamesPath} {
 		t.Run(path, func(t *testing.T) {
 			a := newFakeBackend(t, `[]`, `[]`)
 			a.bodies[path] = `[]`

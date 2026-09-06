@@ -153,6 +153,42 @@ func TestPuppetboardFactsOverview(t *testing.T) {
 			t.Errorf("Puppetboard facts overview does not list %s", name)
 		}
 	}
+
+	// A name the overview lists is a link a user can click, so the one pdbmux
+	// owns has to lead to a page with every node on it rather than an empty one.
+	t.Run("the owned fact is listed and its link resolves", func(t *testing.T) {
+		if !strings.Contains(body, defaultSourceFact) {
+			t.Fatalf("Puppetboard facts overview does not list %s", defaultSourceFact)
+		}
+		listed := pbFactRows(t, defaultSourceFact)
+		for _, cn := range allNodes {
+			if !listed[cn] {
+				t.Errorf("the %s drilldown omits %s, so the overview links to a dead page", defaultSourceFact, cn)
+			}
+		}
+	})
+}
+
+// pbFactRows reads the JSON table a Puppetboard fact page renders from, and
+// returns the certnames it lists.
+func pbFactRows(t *testing.T, name string) map[string]bool {
+	t.Helper()
+	var payload struct {
+		Data [][]string `json:"data"`
+	}
+	body := pbPage(t, pbAllEnvs+"/fact/"+name+"/json")
+	if err := json.Unmarshal([]byte(body), &payload); err != nil {
+		t.Fatalf("decoding the %s drilldown table: %v: %s", name, err, body)
+	}
+	listed := map[string]bool{}
+	for _, row := range payload.Data {
+		for _, cn := range allNodes {
+			if len(row) > 0 && strings.Contains(row[0], cn) {
+				listed[cn] = true
+			}
+		}
+	}
+	return listed
 }
 
 // The single-fact drilldown is the page that exercises the merged /facts/<name>
@@ -162,26 +198,9 @@ func TestPuppetboardFactDrilldown(t *testing.T) {
 		t.Errorf("Puppetboard fact page for osfamily does not name it")
 	}
 
-	// The page's table is filled from this endpoint, so it is what a user sees.
-	var payload struct {
-		Data [][]string `json:"data"`
-	}
-	body := pbPage(t, pbAllEnvs+"/fact/osfamily/json")
-	if err := json.Unmarshal([]byte(body), &payload); err != nil {
-		t.Fatalf("decoding the fact drilldown table: %v: %s", err, body)
-	}
-
-	listed := map[string]bool{}
-	for _, row := range payload.Data {
-		for _, cn := range allNodes {
-			if len(row) > 0 && strings.Contains(row[0], cn) {
-				listed[cn] = true
-			}
-		}
-	}
-
 	// Puppetboard fetches a single fact through GET /pdb/query/v4/facts/<name>,
 	// so the page is only whole if that path route merges every backend.
+	listed := pbFactRows(t, "osfamily")
 	missing := []string{}
 	for _, cn := range allNodes {
 		if !listed[cn] {

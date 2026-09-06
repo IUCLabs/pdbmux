@@ -145,8 +145,8 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	case eventCountsPath, aggregateEventCountsPath:
 		s.serveSummed(w, r, r.URL.Path, inferredColumns)
 	default:
-		if name, valued := factsSubPath(r.URL.Path); name != "" {
-			s.serveFactsByName(w, r, name, valued)
+		if name, value, valued := factsSubPath(r.URL.Path); name != "" {
+			s.serveFactsByName(w, r, name, value, valued)
 			return
 		}
 		if isReportSubResource(r.URL.Path) {
@@ -158,28 +158,32 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 }
 
 // factsSubPath matches /pdb/query/v4/facts/<name> and /pdb/query/v4/facts/<name>/<value>,
-// returning the fact name the path constrains and whether it also pins a value.
-// openvoxdb serves both from the facts entity, ANDing ["=","name",<name>] (and
-// ["=","value",<value>]) onto the request's own query, so the record shape is
-// exactly /facts' — src/puppetlabs/puppetdb/http/handlers.clj:283-302 and
+// returning the fact name the path constrains, the value it pins and whether it
+// pins one at all. openvoxdb serves both from the facts entity, ANDing
+// ["=","name",<name>] (and ["=","value",<value>]) onto the request's own query,
+// so the record shape is exactly /facts' —
+// src/puppetlabs/puppetdb/http/handlers.clj:283-302 and
 // src/puppetlabs/puppetdb/http/query.clj:136-143,193-209.
-func factsSubPath(path string) (name string, valued bool) {
+func factsSubPath(path string) (name, value string, valued bool) {
 	rest, ok := strings.CutPrefix(path, factsPath+"/")
 	if !ok {
-		return "", false
+		return "", "", false
 	}
 	name, value, hasValue := strings.Cut(rest, "/")
 	if name == "" {
-		return "", false
+		return "", "", false
 	}
 	if hasValue && (value == "" || strings.Contains(value, "/")) {
-		return "", false
+		return "", "", false
 	}
-	return name, hasValue
+	if !hasValue {
+		value = ""
+	}
+	return name, value, hasValue
 }
 
 func isFactsSubPath(path string) bool {
-	name, _ := factsSubPath(path)
+	name, _, _ := factsSubPath(path)
 	return name != ""
 }
 
@@ -302,13 +306,40 @@ func (s *Server) serveUnion(w http.ResponseWriter, r *http.Request, path string,
 
 // Both path forms are the facts entity with a name (and value) constraint ANDed
 // on, so an aggregate over them carries no certname for the per-certname merge
-// to key on, and is summed instead — the same split /nodes makes.
-func (s *Server) serveFactsByName(w http.ResponseWriter, r *http.Request, name string, valued bool) {
+// to key on, and is summed instead — the same split /nodes makes. A plain query
+// on the source fact's own path is the one name no backend can answer for, so it
+// is synthesised instead of fanned out as-is.
+func (s *Server) serveFactsByName(w http.ResponseWriter, r *http.Request, name, value string, valued bool) {
 	if spec := parseAggregate(r.URL.Query().Get("query")); spec != nil {
 		s.serveSummed(w, r, r.URL.Path, spec.columns)
 		return
 	}
-	s.serveMerged(w, r, r.URL.Path, s.mergeFactsByNameResponse(r, name, valued))
+	if inject := s.newSourceInjector(r.URL.Query().Get("query"), true); inject.claims(name) && inject.injects() {
+		s.serveSourceFact(w, r, inject, value, valued)
+		return
+	}
+	s.serveMerged(w, r, r.URL.Path, s.mergeFactsByNameResponse(r))
+}
+
+// serveSourceFact answers the drilldown on pdbmux's own fact. No backend holds a
+// record of that name, so the route's own fan-out would return nothing; the
+// records are taken from the /facts merge that produces them instead, which
+// makes the certname set, the owner and the environment identical to the ones an
+// unfiltered /facts response reports, and lets the request's query narrow the
+// result upstream. That costs one extra fan-out on a rare, user-initiated path.
+func (s *Server) serveSourceFact(w http.ResponseWriter, r *http.Request, inject *sourceInjector, value string, valued bool) {
+	params := queryParams(r.URL.Query().Get("query"))
+	merge := s.mergeFactsWith(inject)
+	s.serveCached(w, r, r.URL.Path, params, func(ctx context.Context) (cachedResponse, error) {
+		alive, err := s.aliveResults(ctx, factsPath, params)
+		if err != nil {
+			return cachedResponse{}, err
+		}
+		recs := sourceFactRecords(merge(alive), inject.name, value, valued)
+		resp := cachedResponse{Body: encodeRecords(recs), Records: -1}
+		s.countBackends(&resp, alive)
+		return resp, nil
+	})
 }
 
 // A count row carries no certname, so the certname-keyed merge would collapse every backend's count into one backend's; aggregates take the summing path instead.
@@ -592,14 +623,12 @@ func (s *Server) mergeFactsResponse(r *http.Request) func([]backendResult) []jso
 }
 
 // The path segment of /facts/<name> is the same outer `name` constraint the
-// query gate already rules injection out on, so the synthetic record survives
-// only on the source fact's own path — and not on the /<name>/<value> form,
-// whose pinned value the record's own value need not equal.
-func (s *Server) mergeFactsByNameResponse(r *http.Request, name string, valued bool) func([]backendResult) []json.RawMessage {
+// query gate already rules injection out on, so nothing is synthesised here:
+// the source fact's own path is diverted to serveSourceFact before this.
+// Suppression of an upstream record of the owned name stays on.
+func (s *Server) mergeFactsByNameResponse(r *http.Request) func([]backendResult) []json.RawMessage {
 	inject := s.newSourceInjector(r.URL.Query().Get("query"), true)
-	if valued || !inject.claims(name) {
-		inject.disableInject()
-	}
+	inject.disableInject()
 	return s.mergeFactsWith(inject)
 }
 

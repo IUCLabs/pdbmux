@@ -456,6 +456,83 @@ func TestSourceFactInjectionAndGating(t *testing.T) {
 	})
 }
 
+// /fact-names advertises the fact, so its drilldown has to answer with the same
+// records /facts carries rather than the empty set the backends hold.
+func TestSourceFactDrilldown(t *testing.T) {
+	want := map[string]string{
+		nodeAlpha:  backendAName,
+		nodeBeta:   backendBName,
+		nodeGamma:  backendBName,
+		nodeShared: backendBName, // won on freshness, not on configured order
+	}
+	path := factsPath + "/" + defaultSourceFact
+
+	t.Run("one record per node, attributed as /facts attributes it", func(t *testing.T) {
+		resp := get(t, path, nil)
+		rows := resp.rows(t)
+		if got := e2eCertnames(rows); !equalStrings(got, allNodes) {
+			t.Fatalf("%s certnames = %v, want %v", path, got, allNodes)
+		}
+		if len(rows) != len(allNodes) {
+			t.Fatalf("%s returned %d records for %d nodes", path, len(rows), len(allNodes))
+		}
+		unfiltered := get(t, factsPath, nil).rows(t)
+		for _, row := range rows {
+			cn, _ := row["certname"].(string)
+			if row["name"] != defaultSourceFact {
+				t.Errorf("%s returned a record named %v", path, row["name"])
+			}
+			if row["value"] != want[cn] {
+				t.Errorf("%s for %s = %v, want %q", path, cn, row["value"], want[cn])
+			}
+			// The drilldown must not disagree with the response it stands for.
+			if got, ok := factValue(unfiltered, cn, defaultSourceFact); !ok || got != row["value"] {
+				t.Errorf("%s for %s = %v, want the %s value %v", path, cn, row["value"], factsPath, got)
+			}
+			if _, ok := row["environment"]; !ok {
+				t.Errorf("%s record for %s has no environment key", path, cn)
+			}
+		}
+		if got := resp.header.Get(backendsHeader); got != "2/2" {
+			t.Errorf("%s = %q, want %q", backendsHeader, got, "2/2")
+		}
+	})
+
+	t.Run("the value sub-route filters by owning backend", func(t *testing.T) {
+		for _, tc := range []struct {
+			value string
+			want  []string
+		}{
+			{backendAName, []string{nodeAlpha}},
+			{backendBName, []string{nodeBeta, nodeGamma, nodeShared}},
+			{"nosuchbackend", nil},
+		} {
+			rows := get(t, path+"/"+tc.value, nil).rows(t)
+			if got := e2eCertnames(rows); !equalStrings(got, tc.want) {
+				t.Errorf("%s/%s certnames = %v, want %v", path, tc.value, got, tc.want)
+			}
+		}
+	})
+
+	t.Run("a certname query narrows the drilldown", func(t *testing.T) {
+		rows := get(t, path, query(`["=","certname","`+nodeAlpha+`"]`)).rows(t)
+		if got := e2eCertnames(rows); !equalStrings(got, []string{nodeAlpha}) {
+			t.Errorf("certname-filtered %s = %v, want only %s", path, got, nodeAlpha)
+		}
+	})
+
+	// An aggregate carries no certname to attribute, so it stays summed.
+	t.Run("an aggregate is still summed", func(t *testing.T) {
+		ctx := context.Background()
+		const q = `["extract",[["function","count"]]]`
+		wantA := backendCount(ctx, t, h.a, path, q)
+		wantB := backendCount(ctx, t, h.b, path, q)
+		if got := countOf(t, get(t, path, query(q)).rows(t)); got != wantA+wantB {
+			t.Errorf("%s count = %d, want %d (%s=%d + %s=%d)", path, got, wantA+wantB, h.a.name, wantA, h.b.name, wantB)
+		}
+	})
+}
+
 // X-Backends has to report what the response was actually built from, not what
 // is configured.
 func TestBackendsHeaderReportsContributors(t *testing.T) {
