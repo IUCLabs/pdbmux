@@ -131,7 +131,7 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	case resourcesPath:
 		s.serveResources(w, r)
 	case factsPath:
-		s.serveMerged(w, r, factsPath, s.mergeFactsResponse(r))
+		s.serveFacts(w, r)
 	case reportsPath:
 		s.serveReports(w, r)
 	case eventsPath:
@@ -210,6 +210,15 @@ func (s *Server) serveUnion(w http.ResponseWriter, r *http.Request, path string,
 		}
 		return resp, nil
 	})
+}
+
+// Aggregate rows carry no certname, so the per-certname fact merge would keep only one backend's; they take the summing path instead.
+func (s *Server) serveFacts(w http.ResponseWriter, r *http.Request) {
+	if spec := parseAggregate(r.URL.Query().Get("query")); spec != nil {
+		s.serveSummed(w, r, factsPath, spec.columns)
+		return
+	}
+	s.serveMerged(w, r, factsPath, s.mergeFactsResponse(r))
 }
 
 // A count row carries no certname, so the certname-keyed merge would collapse every backend's count into one backend's; aggregates take the summing path instead.
