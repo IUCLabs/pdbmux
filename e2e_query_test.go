@@ -6,10 +6,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"net/url"
 	"reflect"
 	"sort"
+	"strings"
 	"testing"
 )
 
@@ -358,6 +360,212 @@ func TestResourcesAggregatesAreSummed(t *testing.T) {
 	got := countOf(t, get(t, resourcesPath, query(q)).rows(t))
 	if got != wantA+wantB {
 		t.Fatalf("/resources count = %d, want %d (%s=%d + %s=%d)", got, wantA+wantB, h.a.name, wantA, h.b.name, wantB)
+	}
+}
+
+// oneAggregateRow reads the single row a whole-estate aggregate returns.
+func oneAggregateRow(t *testing.T, rows []map[string]any) map[string]any {
+	t.Helper()
+	if len(rows) != 1 {
+		t.Fatalf("want exactly one aggregate row, got %d: %v", len(rows), rows)
+	}
+	return rows[0]
+}
+
+// aggregateNumber reads one numeric aggregate column, which openvoxdb nulls when
+// the backend matched nothing.
+func aggregateNumber(t *testing.T, row map[string]any, column string) float64 {
+	t.Helper()
+	n, ok := row[column].(float64)
+	if !ok {
+		t.Fatalf("aggregate row has no numeric %s: %v", column, row)
+	}
+	return n
+}
+
+// backendAggregate runs a whole-estate aggregate against one backend directly.
+func backendAggregate(ctx context.Context, t *testing.T, b *backend, path, q string) map[string]any {
+	t.Helper()
+	return oneAggregateRow(t, b.query(ctx, t, path, query(q)))
+}
+
+// min and max are extremes, not sums: the merged answer has to be the smallest
+// and largest the backends reported, both of which the fixture makes distinct.
+func TestResourcesMinMaxAreExtremes(t *testing.T) {
+	ctx := context.Background()
+	const q = `["extract",[["function","min","line"],["function","max","line"]]]`
+
+	a := backendAggregate(ctx, t, h.a, resourcesPath, q)
+	b := backendAggregate(ctx, t, h.b, resourcesPath, q)
+	minA, maxA := aggregateNumber(t, a, "min"), aggregateNumber(t, a, "max")
+	minB, maxB := aggregateNumber(t, b, "min"), aggregateNumber(t, b, "max")
+	if minA == minB || maxA == maxB {
+		t.Fatalf("the fixture gives both backends the same extremes (min %v/%v, max %v/%v)", minA, minB, maxA, maxB)
+	}
+
+	got := oneAggregateRow(t, get(t, resourcesPath, query(q)).rows(t))
+	if wantMin := math.Min(minA, minB); aggregateNumber(t, got, "min") != wantMin {
+		t.Errorf("/resources min = %v, want %v (%s=%v, %s=%v)", got["min"], wantMin, h.a.name, minA, h.b.name, minB)
+	}
+	wantMax := math.Max(maxA, maxB)
+	if gotMax := aggregateNumber(t, got, "max"); gotMax != wantMax {
+		t.Errorf("/resources max = %v, want %v (%s=%v, %s=%v)", gotMax, wantMax, h.a.name, maxA, h.b.name, maxB)
+	} else if gotMax == maxA+maxB {
+		t.Errorf("/resources max = %v, which is the sum of the backends' maxima", gotMax)
+	}
+}
+
+// openvoxdb allows min/max on text columns, where the merged answer used to be
+// whichever backend happened to answer first. The fixture puts the estate's
+// smallest resource title in one backend and its largest in the other, so a
+// first-wins merge gets one of the two wrong whichever way round it reads them.
+func TestResourcesMinMaxOnATextColumn(t *testing.T) {
+	ctx := context.Background()
+	const q = `["extract",[["function","min","title"],["function","max","title"]],["=","type","File"]]`
+
+	a := backendAggregate(ctx, t, h.a, resourcesPath, q)
+	b := backendAggregate(ctx, t, h.b, resourcesPath, q)
+	minA, minB := aggregateString(t, a, "min"), aggregateString(t, b, "min")
+	maxA, maxB := aggregateString(t, a, "max"), aggregateString(t, b, "max")
+	if minA == minB || maxA == maxB {
+		t.Fatalf("the fixture gives both backends the same extremes (min %q/%q, max %q/%q)", minA, minB, maxA, maxB)
+	}
+
+	got := oneAggregateRow(t, get(t, resourcesPath, query(q)).rows(t))
+	if want := min(minA, minB); got["min"] != want {
+		t.Errorf("/resources min(title) = %v, want %q (%s=%q, %s=%q)", got["min"], want, h.a.name, minA, h.b.name, minB)
+	}
+	if want := max(maxA, maxB); got["max"] != want {
+		t.Errorf("/resources max(title) = %v, want %q (%s=%q, %s=%q)", got["max"], want, h.a.name, maxA, h.b.name, maxB)
+	}
+}
+
+func aggregateString(t *testing.T, row map[string]any, column string) string {
+	t.Helper()
+	s, ok := row[column].(string)
+	if !ok {
+		t.Fatalf("aggregate row has no string %s: %v", column, row)
+	}
+	return s
+}
+
+// avg is decomposed into an upstream sum and count, so the merged answer is the
+// true weighted average of the estate rather than an average of averages.
+func TestResourcesAvgIsWeighted(t *testing.T) {
+	ctx := context.Background()
+	const parts = `["extract",[["function","sum","line"],["function","count","line"]]]`
+
+	a := backendAggregate(ctx, t, h.a, resourcesPath, parts)
+	b := backendAggregate(ctx, t, h.b, resourcesPath, parts)
+	sumA, countA := aggregateNumber(t, a, "sum"), aggregateNumber(t, a, "count")
+	sumB, countB := aggregateNumber(t, b, "sum"), aggregateNumber(t, b, "count")
+	if countA == countB {
+		t.Fatalf("the fixture gives both backends %v rows, so a weighted average is indistinguishable from a plain one", countA)
+	}
+	want := (sumA + sumB) / (countA + countB)
+
+	const q = `["extract",[["function","avg","line"]]]`
+	got := aggregateNumber(t, oneAggregateRow(t, get(t, resourcesPath, query(q)).rows(t)), "avg")
+	if math.Abs(got-want) > 1e-9 {
+		t.Fatalf("/resources avg(line) = %v, want %v ((%v+%v)/(%v+%v))", got, want, sumA, sumB, countA, countB)
+	}
+
+	avgA := aggregateNumber(t, backendAggregate(ctx, t, h.a, resourcesPath, q), "avg")
+	avgB := aggregateNumber(t, backendAggregate(ctx, t, h.b, resourcesPath, q), "avg")
+	if math.Abs(got-(avgA+avgB)) < 1e-9 {
+		t.Errorf("/resources avg(line) = %v, which is the sum of the backends' averages", got)
+	}
+	if math.Abs(got-(avgA+avgB)/2) < 1e-9 {
+		t.Errorf("/resources avg(line) = %v, which is an unweighted average of averages", got)
+	}
+}
+
+func TestResourcesAvgWithGroupBy(t *testing.T) {
+	ctx := context.Background()
+	const parts = `["extract",[["function","sum","line"],["function","count","line"],"type"],["group_by","type"]]`
+	const q = `["extract",[["function","avg","line"],"type"],["group_by","type"]]`
+
+	sums, counts := map[string]float64{}, map[string]float64{}
+	for _, b := range []*backend{h.a, h.b} {
+		for _, row := range b.query(ctx, t, resourcesPath, query(parts)) {
+			typ, ok := row["type"].(string)
+			if !ok {
+				t.Fatalf("grouped row has no type: %v", row)
+			}
+			if n, ok := row["sum"].(float64); ok {
+				sums[typ] += n
+				counts[typ] += aggregateNumber(t, row, "count")
+			}
+		}
+	}
+	if len(sums) == 0 {
+		t.Fatal("no grouped rows carried a sum, so the weighted average is untested")
+	}
+
+	for _, row := range get(t, resourcesPath, query(q)).rows(t) {
+		typ, ok := row["type"].(string)
+		if !ok {
+			t.Fatalf("grouped row has no type: %v", row)
+		}
+		if counts[typ] == 0 {
+			if row["avg"] != nil {
+				t.Errorf("avg(line) for %s = %v, want null over no rows", typ, row["avg"])
+			}
+			continue
+		}
+		want := sums[typ] / counts[typ]
+		if got := aggregateNumber(t, row, "avg"); math.Abs(got-want) > 1e-9 {
+			t.Errorf("avg(line) for %s = %v, want %v", typ, got, want)
+		}
+	}
+}
+
+// A query pdbmux cannot merge is refused outright rather than answered with a
+// plausible wrong number.
+func TestUnmergeableAggregateIsRefused(t *testing.T) {
+	resp := rawGet(t, resourcesPath, query(`["extract",[["function","avg","line"],["function","count"]]]`))
+	if resp.status != http.StatusBadRequest {
+		t.Fatalf("status %d, want 400: %s", resp.status, resp.body)
+	}
+	if !strings.Contains(string(resp.body), "avg") {
+		t.Errorf("refusal %q does not name the limitation", resp.body)
+	}
+}
+
+// to_string is a scalar expression, so it yields one row per record: alone it
+// must not collapse the estate into a single row, and with a companion count it
+// groups.
+func TestReportsToString(t *testing.T) {
+	ctx := context.Background()
+	const bare = `["extract",[["function","to_string","producer_timestamp","FMDAY"]]]`
+
+	wantRows := len(h.a.query(ctx, t, reportsPath, query(bare))) + len(h.b.query(ctx, t, reportsPath, query(bare)))
+	if wantRows < 2 {
+		t.Fatalf("the fixture yields %d to_string rows, so a collapse would be invisible", wantRows)
+	}
+	rows := get(t, reportsPath, query(bare)).rows(t)
+	if len(rows) != wantRows {
+		t.Errorf("/reports to_string returned %d rows, want %d (every backend's rows)", len(rows), wantRows)
+	}
+	for _, row := range rows {
+		if _, ok := row["to_string"].(string); !ok {
+			t.Fatalf("to_string row has no string column: %v", row)
+		}
+	}
+
+	const grouped = `["extract",[["function","to_string","producer_timestamp","FMDAY"],["function","count"]],["group_by",["function","to_string","producer_timestamp","FMDAY"]]]`
+	want := map[string]float64{}
+	for _, b := range []*backend{h.a, h.b} {
+		for _, row := range b.query(ctx, t, reportsPath, query(grouped)) {
+			want[row["to_string"].(string)] += aggregateNumber(t, row, "count")
+		}
+	}
+	got := map[string]float64{}
+	for _, row := range get(t, reportsPath, query(grouped)).rows(t) {
+		got[row["to_string"].(string)] += aggregateNumber(t, row, "count")
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("grouped /reports to_string counts = %v, want %v", got, want)
 	}
 }
 

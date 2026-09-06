@@ -150,6 +150,41 @@ func valueRank(v any) int {
 	}
 }
 
+// dropOrderBy removes one field from an upstream order_by, for a column the
+// rewritten query no longer projects. An unparseable or emptied order_by is
+// dropped entirely; pdbmux re-sorts the merged rows on the client's own order.
+func dropOrderBy(params url.Values, field string) {
+	raw := params.Get("order_by")
+	if strings.TrimSpace(raw) == "" {
+		return
+	}
+	var entries []map[string]any
+	if json.Unmarshal([]byte(raw), &entries) != nil {
+		params.Del("order_by")
+		return
+	}
+	kept := make([]map[string]any, 0, len(entries))
+	for _, e := range entries {
+		if f, ok := e["field"].(string); ok && f == field {
+			continue
+		}
+		kept = append(kept, e)
+	}
+	if len(kept) == len(entries) {
+		return
+	}
+	if len(kept) == 0 {
+		params.Del("order_by")
+		return
+	}
+	encoded, err := json.Marshal(kept)
+	if err != nil {
+		params.Del("order_by")
+		return
+	}
+	params.Set("order_by", string(encoded))
+}
+
 type paging struct {
 	limit     int // -1 when unset
 	offset    int

@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"time"
 )
 
@@ -48,28 +49,32 @@ type nodeFixture struct {
 	facts    map[string]any
 	// reportEnd is the report's end_time, and so the node's report_timestamp.
 	reportEnd string
+	// lines are the catalog File resources' line numbers, one resource each. They
+	// give /resources a numeric column whose per-backend minimum, maximum, sum and
+	// row count all differ, so no combiner can be mistaken for another.
+	lines []int
 }
 
 // Backend A: 2 nodes, 7 facts. Backend B: 3 nodes, 10 facts. The counts are
 // deliberately unequal so a summed aggregate cannot be mistaken for either
 // backend's own number.
 var fixtureA = []nodeFixture{
-	{certname: nodeAlpha, reportEnd: tsAlpha, facts: map[string]any{
+	{certname: nodeAlpha, reportEnd: tsAlpha, lines: []int{10, 12, 14}, facts: map[string]any{
 		"osfamily": "RedHat", "kernel": "Linux", "role": "web", "only_a": "yes",
 	}},
-	{certname: nodeShared, reportEnd: tsSharedOnA, facts: map[string]any{
+	{certname: nodeShared, reportEnd: tsSharedOnA, lines: []int{20}, facts: map[string]any{
 		"osfamily": "RedHat", "kernel": "Linux", "owner": backendAName,
 	}},
 }
 
 var fixtureB = []nodeFixture{
-	{certname: nodeBeta, reportEnd: tsBeta, facts: map[string]any{
+	{certname: nodeBeta, reportEnd: tsBeta, lines: []int{30}, facts: map[string]any{
 		"osfamily": "Debian", "kernel": "Linux", "role": "db", "only_b": "yes", "extra_b": "1",
 	}},
-	{certname: nodeGamma, reportEnd: tsGamma, facts: map[string]any{
+	{certname: nodeGamma, reportEnd: tsGamma, lines: []int{40}, facts: map[string]any{
 		"osfamily": "Debian", "kernel": "Linux",
 	}},
-	{certname: nodeShared, reportEnd: tsSharedOnB, facts: map[string]any{
+	{certname: nodeShared, reportEnd: tsSharedOnB, lines: []int{50}, facts: map[string]any{
 		"osfamily": "Debian", "kernel": "Linux", "owner": backendBName,
 	}},
 }
@@ -84,7 +89,7 @@ func loadFixtures(ctx context.Context, t fatalf, a, b *backend) {
 	}
 	// A deactivated node proves the merged view reflects each backend's own
 	// filtering rather than a raw union of everything ever stored.
-	loadNode(ctx, t, a, nodeFixture{certname: nodeGone, reportEnd: tsGone, facts: map[string]any{"osfamily": "RedHat"}})
+	loadNode(ctx, t, a, nodeFixture{certname: nodeGone, reportEnd: tsGone, lines: []int{100}, facts: map[string]any{"osfamily": "RedHat"}})
 	a.submit(ctx, t, cmdDeactivateNode, verDeactivateNode, nodeGone, tsDeactivation, map[string]any{
 		"certname":           nodeGone,
 		"producer_timestamp": tsDeactivation,
@@ -105,7 +110,26 @@ func loadNode(ctx context.Context, t fatalf, b *backend, n nodeFixture) {
 // a catalog_environment and populate /resources, which the aggregate assertions
 // and Puppetboard's index both read.
 func catalogPayload(n nodeFixture) map[string]any {
-	title := "/tmp/" + n.certname
+	resources := []any{
+		map[string]any{
+			"type": "Stage", "title": "main", "aliases": []string{}, "exported": false,
+			"file": nil, "line": nil, "tags": []string{"stage"}, "parameters": map[string]any{},
+		},
+	}
+	edges := []any{}
+	for i, line := range n.lines {
+		title := fileTitle(n.certname, i)
+		resources = append(resources, map[string]any{
+			"type": "File", "title": title, "aliases": []string{}, "exported": false,
+			"file": "/etc/puppetlabs/code/site.pp", "line": line, "tags": []string{"file"},
+			"parameters": map[string]any{"ensure": "present"},
+		})
+		edges = append(edges, map[string]any{
+			"source":       map[string]any{"type": "Stage", "title": "main"},
+			"target":       map[string]any{"type": "File", "title": title},
+			"relationship": "contains",
+		})
+	}
 	return map[string]any{
 		"certname":           n.certname,
 		"version":            "1",
@@ -115,25 +139,19 @@ func catalogPayload(n nodeFixture) map[string]any {
 		"code_id":            nil,
 		"producer_timestamp": n.reportEnd,
 		"producer":           "pdbmux-e2e",
-		"edges": []any{
-			map[string]any{
-				"source":       map[string]any{"type": "Stage", "title": "main"},
-				"target":       map[string]any{"type": "File", "title": title},
-				"relationship": "contains",
-			},
-		},
-		"resources": []any{
-			map[string]any{
-				"type": "Stage", "title": "main", "aliases": []string{}, "exported": false,
-				"file": nil, "line": nil, "tags": []string{"stage"}, "parameters": map[string]any{},
-			},
-			map[string]any{
-				"type": "File", "title": title, "aliases": []string{}, "exported": false,
-				"file": "/etc/puppetlabs/code/site.pp", "line": 1, "tags": []string{"file"},
-				"parameters": map[string]any{"ensure": "present"},
-			},
-		},
+		"edges":              edges,
+		"resources":          resources,
 	}
+}
+
+// The first File resource keeps the plain /tmp/<certname> title the report's
+// event names; the rest sort after every other fixture title, so one backend
+// holds the estate's largest resource title and the other its smallest.
+func fileTitle(certname string, i int) string {
+	if i == 0 {
+		return "/tmp/" + certname
+	}
+	return fmt.Sprintf("/tmp/zz-%s-%d", certname, i)
 }
 
 // factsPayload is the "replace facts" v5 wire format: certname, environment,

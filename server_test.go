@@ -810,6 +810,114 @@ func TestHandler_ReportsAggregateSummed(t *testing.T) {
 	}
 }
 
+// The backends never see the client's avg: they are asked for the sum and count
+// it decomposes into, and the weighted average is computed from those.
+func TestHandler_AvgIsRewrittenUpstreamAndWeighted(t *testing.T) {
+	a := newFakeBackend(t, `[]`, `[]`)
+	a.bodies[resourcesPath] = `[{"sum":10,"count":1}]`
+	b := newFakeBackend(t, `[]`, `[]`)
+	b.bodies[resourcesPath] = `[{"sum":60,"count":3}]`
+	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic))
+
+	rec := doGetParams(t, srv.Handler(), resourcesPath, url.Values{
+		"query": {`["extract",[["function","avg","line"]]]`},
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+	}
+	const wantUpstream = `["extract",[["function","sum","line"],["function","count","line"]]]`
+	for _, fb := range []*fakeBackend{a, b} {
+		if got := fb.gotQuery(resourcesPath); got != wantUpstream {
+			t.Errorf("backend query = %s, want %s", got, wantUpstream)
+		}
+	}
+	var got []map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	want := []map[string]any{{"avg": float64(17.5)}}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("body = %v, want %v (70/4, not the 15 an average of averages gives)", got, want)
+	}
+}
+
+// order_by names a column the rewritten query no longer projects, so it is
+// dropped upstream and applied to the merged rows here instead.
+func TestHandler_AvgOrderByIsDroppedUpstream(t *testing.T) {
+	a := newFakeBackend(t, `[]`, `[]`)
+	a.bodies[resourcesPath] = `[{"sum":10,"count":1,"type":"File"},{"sum":8,"count":2,"type":"Stage"}]`
+	b := newFakeBackend(t, `[]`, `[]`)
+	b.bodies[resourcesPath] = `[{"sum":60,"count":3,"type":"File"}]`
+	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic))
+
+	rec := doGetParams(t, srv.Handler(), resourcesPath, url.Values{
+		"query":    {`["extract",[["function","avg","line"],"type"],["group_by","type"]]`},
+		"order_by": {`[{"field":"avg","order":"desc"}]`},
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+	}
+	if params, _ := a.params(resourcesPath); params.Get("order_by") != "" {
+		t.Errorf("backend got order_by %q, want it dropped", params.Get("order_by"))
+	}
+	var got []map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	want := []map[string]any{
+		{"avg": float64(17.5), "type": "File"},
+		{"avg": float64(4), "type": "Stage"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("body = %v, want %v sorted by avg descending", got, want)
+	}
+}
+
+func TestHandler_UnmergeableAggregateIsRefused(t *testing.T) {
+	a := newFakeBackend(t, `[]`, `[]`)
+	b := newFakeBackend(t, `[]`, `[]`)
+	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic))
+
+	for _, path := range []string{nodesPath, factsPath, reportsPath, resourcesPath, factsPath + "/uptime"} {
+		rec := doGetParams(t, srv.Handler(), path, url.Values{
+			"query": {`["extract",[["function","avg","line"],["function","count"]]]`},
+		})
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("%s: status %d, want 400: %s", path, rec.Code, rec.Body.String())
+		}
+		if !strings.Contains(rec.Body.String(), "avg") {
+			t.Errorf("%s: body %q does not name the limitation", path, rec.Body.String())
+		}
+	}
+	if _, asked := a.params(nodesPath); asked {
+		t.Error("a refused query was still fanned out")
+	}
+}
+
+// max used to be folded by addition, returning a number no backend held.
+func TestHandler_MaxIsNotSummed(t *testing.T) {
+	a := newFakeBackend(t, `[]`, `[]`)
+	a.bodies[resourcesPath] = `[{"max":20,"min":10}]`
+	b := newFakeBackend(t, `[]`, `[]`)
+	b.bodies[resourcesPath] = `[{"max":50,"min":30}]`
+	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic))
+
+	rec := doGetParams(t, srv.Handler(), resourcesPath, url.Values{
+		"query": {`["extract",[["function","max","line"],["function","min","line"]]]`},
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+	}
+	var got []map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	want := []map[string]any{{"max": float64(50), "min": float64(10)}}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("body = %v, want %v", got, want)
+	}
+}
+
 func TestHandler_ReportsAggregateRecordsIsMergedRowCount(t *testing.T) {
 	a := newFakeBackend(t, `[]`, `[]`)
 	a.bodies[reportsPath] = `[{"count":4,"status":"changed"}]`
