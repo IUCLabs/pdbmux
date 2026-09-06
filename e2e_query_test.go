@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/url"
 	"sort"
 	"testing"
@@ -56,6 +57,116 @@ func TestFactsUnionAcrossBackends(t *testing.T) {
 			t.Errorf("fact %s of %s = %v, want %q", tc.fact, tc.certname, got, tc.want)
 		}
 	}
+}
+
+// The /facts/<name> path route carries the same records /facts does, so it takes
+// the same merge: every node in the estate, each resolved to one backend.
+func TestFactsByNamePathIsMerged(t *testing.T) {
+	resp := get(t, factsPath+"/osfamily", nil)
+	rows := resp.rows(t)
+
+	if got := e2eCertnames(rows); !equalStrings(got, allNodes) {
+		t.Fatalf("merged /facts/osfamily certnames = %v, want %v", got, allNodes)
+	}
+	if len(rows) != len(allNodes) {
+		t.Fatalf("/facts/osfamily returned %d records for %d nodes, so a shared node was not deduped", len(rows), len(allNodes))
+	}
+	if got, _ := factValue(rows, nodeShared, "osfamily"); got != "Debian" {
+		t.Errorf("osfamily of %s = %v, want Debian from the fresher backend", nodeShared, got)
+	}
+	if got := resp.header.Get(backendsHeader); got != "2/2" {
+		t.Errorf("%s = %q, want %q", backendsHeader, got, "2/2")
+	}
+
+	t.Run("the name constraint gates injection", func(t *testing.T) {
+		for _, row := range rows {
+			if row["name"] == defaultSourceFact {
+				t.Fatalf("%s was injected into a /facts/<name> response: %v", defaultSourceFact, row)
+			}
+		}
+	})
+
+	t.Run("the value sub-route merges too", func(t *testing.T) {
+		rows := get(t, factsPath+"/osfamily/Debian", nil).rows(t)
+		want := []string{nodeBeta, nodeGamma, nodeShared}
+		if got := e2eCertnames(rows); !equalStrings(got, want) {
+			t.Errorf("/facts/osfamily/Debian certnames = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("a fact only one backend holds survives", func(t *testing.T) {
+		rows := get(t, factsPath+"/only_b", nil).rows(t)
+		if got, ok := factValue(rows, nodeBeta, "only_b"); !ok || got != "yes" {
+			t.Errorf("/facts/only_b for %s = %v (present %v), want yes", nodeBeta, got, ok)
+		}
+	})
+}
+
+// /fact-names is a flat array of strings, so it needs its own union: the merged
+// list is every backend's names, deduped and sorted.
+func TestFactNamesAreMerged(t *testing.T) {
+	resp := get(t, factNamesPath, nil)
+	var got []string
+	if err := json.Unmarshal(resp.body, &got); err != nil {
+		t.Fatalf("/fact-names is not a flat string array: %v: %s", err, resp.body)
+	}
+
+	for _, name := range []string{"osfamily", "kernel", "role", "owner", "only_a", "only_b", "extra_b"} {
+		if !containsString(got, name) {
+			t.Errorf("merged /fact-names is missing %s: %v", name, got)
+		}
+	}
+	if !sort.StringsAreSorted(got) {
+		t.Errorf("merged /fact-names is not sorted ascending: %v", got)
+	}
+	seen := map[string]bool{}
+	for _, name := range got {
+		if seen[name] {
+			t.Errorf("merged /fact-names lists %s twice: %v", name, got)
+		}
+		seen[name] = true
+	}
+	// No merged /facts response can serve the name pdbmux owns, so the list must
+	// not advertise it.
+	if seen[defaultSourceFact] {
+		t.Errorf("merged /fact-names advertises %s, which no /facts response carries upstream", defaultSourceFact)
+	}
+	if got := resp.header.Get(backendsHeader); got != "2/2" {
+		t.Errorf("%s = %q, want %q", backendsHeader, got, "2/2")
+	}
+
+	t.Run("paging and ordering are redone across the union", func(t *testing.T) {
+		params := url.Values{
+			"order_by":      {`[{"field":"name","order":"desc"}]`},
+			"limit":         {"3"},
+			"include_total": {"true"},
+		}
+		resp := get(t, factNamesPath, params)
+		var page []string
+		if err := json.Unmarshal(resp.body, &page); err != nil {
+			t.Fatalf("decoding the paged /fact-names response: %v: %s", err, resp.body)
+		}
+		want := append([]string{}, got...)
+		sort.Sort(sort.Reverse(sort.StringSlice(want)))
+		if len(want) > 3 {
+			want = want[:3]
+		}
+		if !equalStrings(page, want) {
+			t.Errorf("descending /fact-names page = %v, want %v", page, want)
+		}
+		if n := resp.header.Get(recordsHeader); n != fmt.Sprint(len(got)) {
+			t.Errorf("%s = %q, want the merged count %d", recordsHeader, n, len(got))
+		}
+	})
+}
+
+func containsString(s []string, v string) bool {
+	for _, x := range s {
+		if x == v {
+			return true
+		}
+	}
+	return false
 }
 
 // The shared node's two copies disagree on every fact value; the backend holding

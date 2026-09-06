@@ -143,29 +143,20 @@ func TestPuppetboardNodeDetail(t *testing.T) {
 	}
 }
 
-// The facts overview lists fact names, which come from the unmerged /fact-names
-// route, so only the first backend's names reach the page today.
+// The facts overview lists fact names, which come from the merged /fact-names
+// route, so both backends' names have to reach the page.
 func TestPuppetboardFactsOverview(t *testing.T) {
 	body := pbPage(t, pbAllEnvs+"/facts")
-	for _, name := range []string{"osfamily", "kernel", "only_a"} {
+	// only_a lives in backend A alone; only_b and extra_b in backend B alone.
+	for _, name := range []string{"osfamily", "kernel", "only_a", "only_b", "extra_b"} {
 		if !strings.Contains(body, name) {
 			t.Errorf("Puppetboard facts overview does not list %s", name)
 		}
 	}
-
-	t.Run("names from the second backend are missing", func(t *testing.T) {
-		// Known gap: /fact-names has no merge rule, so handleQuery falls through to
-		// proxyUnmerged and the first backend to answer supplies the whole list.
-		// Recorded rather than asserted; fails once the gap closes.
-		if strings.Contains(body, "only_b") {
-			t.Fatal("the facts overview now lists a fact name only the second backend holds: /fact-names is merged, so assert this properly and drop the skip")
-		}
-		t.Skip("known gap: /fact-names is an unmerged pass-through, so only_b and extra_b never reach the facts overview")
-	})
 }
 
-// The single-fact drilldown is the page that exercises the /facts/<name> path
-// route.
+// The single-fact drilldown is the page that exercises the merged /facts/<name>
+// path route, so every backend's nodes have to appear on it.
 func TestPuppetboardFactDrilldown(t *testing.T) {
 	if body := pbPage(t, pbAllEnvs+"/fact/osfamily"); !strings.Contains(body, "osfamily") {
 		t.Errorf("Puppetboard fact page for osfamily does not name it")
@@ -189,24 +180,17 @@ func TestPuppetboardFactDrilldown(t *testing.T) {
 		}
 	}
 
-	// Known gap: Puppetboard fetches a single fact through
-	// GET /pdb/query/v4/facts/<name>, a path route with no merge rule, so
-	// proxyUnmerged streams back the first backend's answer alone. The other
-	// backend's nodes go missing with no error. Tracked separately; this test
-	// records the gap and fails once it closes.
+	// Puppetboard fetches a single fact through GET /pdb/query/v4/facts/<name>,
+	// so the page is only whole if that path route merges every backend.
 	missing := []string{}
 	for _, cn := range allNodes {
 		if !listed[cn] {
 			missing = append(missing, cn)
 		}
 	}
-	if len(missing) == 0 {
-		t.Fatal("the fact drilldown now lists every node: the /facts/<name> path route is merged, so assert this properly and drop the skip")
+	if len(missing) > 0 {
+		t.Fatalf("the fact drilldown omits %v; /pdb/query/v4/facts/<name> must serve every backend's nodes", missing)
 	}
-	if !listed[nodeAlpha] {
-		t.Fatalf("the fact drilldown lists neither backend's nodes (%v missing), which is not the pass-through behaviour under test", missing)
-	}
-	t.Skipf("known gap: /pdb/query/v4/facts/<name> is served unmerged, so the drilldown silently omits %v", missing)
 }
 
 // Reports are the least exercised merged path, and Puppetboard reads them

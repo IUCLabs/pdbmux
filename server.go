@@ -17,6 +17,7 @@ import (
 
 const (
 	factsPath                = "/pdb/query/v4/facts"
+	factNamesPath            = "/pdb/query/v4/fact-names"
 	nodesPath                = "/pdb/query/v4/nodes"
 	resourcesPath            = "/pdb/query/v4/resources"
 	reportsPath              = "/pdb/query/v4/reports"
@@ -91,13 +92,13 @@ func (s *Server) StartProbes(ctx context.Context) { s.health.Start(ctx) }
 // StopProbes stops the probing goroutines and waits for them to exit.
 func (s *Server) StopProbes() { s.health.Stop() }
 
-// cacheFor picks the cache backing a request. Merged /facts and /nodes record
-// sets share the in-memory cache; every other path is uncached until the reports
-// cache lands, and a new backend is a case here rather than a change to any
-// handler.
+// cacheFor picks the cache backing a request. The merged /nodes and fact record
+// sets — /facts, /facts/<name>[/<value>] and /fact-names — share the in-memory
+// cache; every other path is uncached until the reports cache lands, and a new
+// backend is a case here rather than a change to any handler.
 func (s *Server) cacheFor(path string, params url.Values) (Cache, bool) {
-	switch path {
-	case factsPath, nodesPath:
+	switch {
+	case path == factsPath, path == nodesPath, path == factNamesPath, isFactsSubPath(path):
 		// An aggregate row is a summed count, not the merged record set the
 		// cache was built for, so it stays on the live path.
 		if parseAggregate(params.Get("query")) != nil {
@@ -132,6 +133,8 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		s.serveResources(w, r)
 	case factsPath:
 		s.serveMerged(w, r, factsPath, s.mergeFactsResponse(r))
+	case factNamesPath:
+		s.serveFactNames(w, r)
 	case reportsPath:
 		s.serveReports(w, r)
 	case eventsPath:
@@ -139,12 +142,86 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	case eventCountsPath, aggregateEventCountsPath:
 		s.serveSummed(w, r, r.URL.Path, inferredColumns)
 	default:
+		if name, valued := factsSubPath(r.URL.Path); name != "" {
+			s.serveMerged(w, r, r.URL.Path, s.mergeFactsByNameResponse(r, name, valued))
+			return
+		}
 		if isReportSubResource(r.URL.Path) {
 			s.serveFirstHolder(w, r)
 			return
 		}
 		s.proxyUnmerged(w, r)
 	}
+}
+
+// factsSubPath matches /pdb/query/v4/facts/<name> and /pdb/query/v4/facts/<name>/<value>,
+// returning the fact name the path constrains and whether it also pins a value.
+// openvoxdb serves both from the facts entity, ANDing ["=","name",<name>] (and
+// ["=","value",<value>]) onto the request's own query, so the record shape is
+// exactly /facts' — src/puppetlabs/puppetdb/http/handlers.clj:283-302 and
+// src/puppetlabs/puppetdb/http/query.clj:136-143,193-209.
+func factsSubPath(path string) (name string, valued bool) {
+	rest, ok := strings.CutPrefix(path, factsPath+"/")
+	if !ok {
+		return "", false
+	}
+	name, value, hasValue := strings.Cut(rest, "/")
+	if name == "" {
+		return "", false
+	}
+	if hasValue && (value == "" || strings.Contains(value, "/")) {
+		return "", false
+	}
+	return name, hasValue
+}
+
+func isFactsSubPath(path string) bool {
+	name, _ := factsSubPath(path)
+	return name != ""
+}
+
+// /fact-names answers with a flat array of fact-name strings rather than
+// certname-keyed records, so it gets its own union: dedupe by name and re-sort,
+// because each backend only ordered its own slice. openvoxdb projects a single
+// DISTINCT `name` column and defaults to name-ascending
+// (src/puppetlabs/puppetdb/query_eng/engine.clj:488-498,
+// src/puppetlabs/puppetdb/http/handlers.clj:349-362), so an order_by can only be
+// on that column and its direction is all this route reads.
+func (s *Server) serveFactNames(w http.ResponseWriter, r *http.Request) {
+	in := r.URL.Query()
+	page, err := parsePaging(in)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	desc := len(page.order) > 0 && page.order[0].Desc
+
+	// Built only for the name pdbmux owns: a string list has no query shape for
+	// the injection gate to read, and nothing is ever injected here.
+	suppress := s.newSourceInjector("", true)
+	suppress.disableInject()
+
+	upstream := page.upstreamParams(in)
+	if page.wantTotal {
+		// A merged total counts the whole union, so the window cannot be pushed
+		// upstream; the full name list is small enough to fetch.
+		upstream.Del("limit")
+	}
+
+	s.serveCached(w, r, factNamesPath, in, func(ctx context.Context) (cachedResponse, error) {
+		alive, err := s.aliveResults(ctx, factNamesPath, upstream)
+		if err != nil {
+			return cachedResponse{}, err
+		}
+		merged := mergeFactNames(alive, suppress, desc)
+		suppress.logSuppressed(s.log)
+		resp := cachedResponse{Body: encodeRecords(page.apply(merged)), Records: -1}
+		s.countBackends(&resp, alive)
+		if page.wantTotal {
+			resp.Records = len(merged)
+		}
+		return resp, nil
+	})
 }
 
 // Matches /pdb/query/v4/reports/<hash>/{events,logs,metrics}, whose data lives in exactly one backend.
@@ -489,7 +566,22 @@ func (s *Server) mergeNodesResponse(r *http.Request) func([]backendResult) []jso
 }
 
 func (s *Server) mergeFactsResponse(r *http.Request) func([]backendResult) []json.RawMessage {
+	return s.mergeFactsWith(s.newSourceInjector(r.URL.Query().Get("query"), true))
+}
+
+// The path segment of /facts/<name> is the same outer `name` constraint the
+// query gate already rules injection out on, so the synthetic record survives
+// only on the source fact's own path — and not on the /<name>/<value> form,
+// whose pinned value the record's own value need not equal.
+func (s *Server) mergeFactsByNameResponse(r *http.Request, name string, valued bool) func([]backendResult) []json.RawMessage {
 	inject := s.newSourceInjector(r.URL.Query().Get("query"), true)
+	if valued || !inject.claims(name) {
+		inject.disableInject()
+	}
+	return s.mergeFactsWith(inject)
+}
+
+func (s *Server) mergeFactsWith(inject *sourceInjector) func([]backendResult) []json.RawMessage {
 	return func(results []backendResult) []json.RawMessage {
 		var merged []json.RawMessage
 		if s.cfg.Merge == mergeStatic {

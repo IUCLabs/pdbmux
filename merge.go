@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"sort"
 	"time"
 )
 
@@ -166,6 +167,50 @@ func mergeFacts(results []backendResult, owner func(certname string) string, inj
 		if synth := inject.factRecord(cn, chosen, environmentOf(recs)); synth != nil {
 			out = append(out, synth)
 		}
+	}
+	return out
+}
+
+// mergeFactNames unions the backends' /fact-names arrays, dedupes by the name
+// itself and re-sorts, since each backend only ordered its own slice. The name
+// pdbmux owns is dropped for the same reason its fact records are: while the
+// feature is on, no merged /facts response can serve it.
+func mergeFactNames(results []backendResult, suppress *sourceInjector, desc bool) []json.RawMessage {
+	seen := map[string]bool{}
+	raws := []json.RawMessage{}
+	values := []any{}
+	for _, res := range results {
+		for _, rec := range res.records {
+			var name string
+			if json.Unmarshal(rec.Raw, &name) == nil && suppress.claims(name) {
+				suppress.suppressed++
+				continue
+			}
+			key := string(rec.Raw)
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			var v any
+			_ = json.Unmarshal(rec.Raw, &v) // an undecodable element sorts as null
+			raws = append(raws, rec.Raw)
+			values = append(values, v)
+		}
+	}
+	idx := make([]int, len(raws))
+	for i := range idx {
+		idx[i] = i
+	}
+	sort.SliceStable(idx, func(a, b int) bool {
+		c := compareValues(values[idx[a]], values[idx[b]])
+		if desc {
+			return c > 0
+		}
+		return c < 0
+	})
+	out := make([]json.RawMessage, 0, len(raws))
+	for _, i := range idx {
+		out = append(out, raws[i])
 	}
 	return out
 }

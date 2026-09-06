@@ -26,6 +26,8 @@ not PQL) is forwarded verbatim.
 |---|---|
 | `GET /pdb/query/v4/nodes` | Fan out to all backends, dedupe by `certname`, keep the record with the newer `report_timestamp`, stamped with the winning backend's name (see provenance). An `extract`/`count` query is **summed** instead. |
 | `GET /pdb/query/v4/facts` | Fan out to all, and per `certname` keep **all** facts from the backend that owns that node (see merge semantics), plus a synthetic `pdbmux_source` fact naming it. |
+| `GET /pdb/query/v4/facts/<name>[/<value>]` | Same fan-out and merge as `/facts`. The path segment is a `name` constraint, so no synthetic `pdbmux_source` record is added unless the path names it. |
+| `GET /pdb/query/v4/fact-names` | Fan out to all and serve the **union** of the flat name arrays, deduped and re-sorted, re-paged across backends. |
 | `GET /pdb/query/v4/resources` | An `extract`/`count` query is fanned out and **summed**; any other query is an unmerged pass-through. |
 | `GET /pdb/query/v4/reports` | Fan out to all and serve the **union**, deduped by report `hash`, re-ordered and re-paged across backends. |
 | `GET /pdb/query/v4/events` | Fan out to all and serve the **union**, deduped by record identity, re-ordered and re-paged. |
@@ -67,6 +69,12 @@ paths add two more headers `pdbmux` sets itself, `X-Cache` and `Age` — see
     facts from the first backend in configured order that holds it.
   - A node present in only one backend always appears (falls back to whichever
     backend actually returned facts for it).
+  - `/facts/<name>` and `/facts/<name>/<value>` are the same records with one
+    more constraint applied upstream, so they take the same rule.
+- **`/fact-names`** — a flat array of strings, not records: **union**, deduped by
+  the name and re-sorted, ascending unless `order_by` says otherwise.
+  `include_total=true` reports the deduped union's size, so the `limit` is applied
+  to the merged list rather than pushed upstream.
 - **`/reports`, `/events`** — **union**, not a per-node winner. Reports are
   immutable history, so a node's reports can legitimately exist in more than one
   backend and all of them belong in the merged view. Reports dedupe on `hash`;
@@ -148,6 +156,10 @@ matters more.
   Only the outer query is inspected: a `name` filter inside an `in`/`select_facts`
   subquery narrows which *nodes* match, not which facts come back, so injection
   still happens;
+- the path is `/facts/<name>` for any other fact. The path segment is the same
+  outer `name` constraint, so only `/facts/pdbmux_source` may carry the record;
+  `/facts/<name>/<value>` never does, since the pinned value need not equal the
+  backend name the record holds;
 - injection is turned off (see `source_fact_enabled`).
 
 **Not supported in v1: server-side filtering on the fact.** A query that selects
@@ -156,8 +168,11 @@ the backends like any other, and they return nothing, because the fact does not
 exist upstream. `pdbmux` does not evaluate the AST itself, so it cannot answer
 such a query correctly for every operator (`not`, `or`, subqueries) and does not
 pretend to for some. Read the fact from an unfiltered (or `certname`-filtered)
-`/facts` response and filter client-side. The same applies to the
-`/pdb/query/v4/facts/<name>` route, which is served unmerged pass-through.
+`/facts` response and filter client-side. `/pdb/query/v4/facts/pdbmux_source` is
+the same story: the route is merged and injection is allowed there, but the
+backends hold no record to attach it to. `/pdb/query/v4/fact-names` therefore
+leaves the name out of its list — advertising a name no `/facts` response serves
+would offer a drilldown with nothing behind it.
 
 **Not covered:** `/factsets` and `/inventory`. Both carry facts, but `pdbmux`
 does not merge either today — they take the unmerged pass-through path, where
@@ -316,9 +331,11 @@ not answering.
 
 ## Caching
 
-`pdbmux` caches merged `/nodes` and `/facts` record sets **in memory** so a busy
-Puppetboard does not re-fan-out the same query every few seconds. Everything else
-runs uncached — including `extract`/`count` aggregates on those two paths, and
+`pdbmux` caches merged `/nodes`, `/facts`, `/facts/<name>[/<value>]` and
+`/fact-names` record sets **in memory** so a busy Puppetboard does not re-fan-out
+the same query every few seconds — its facts overview and fact drilldown are two
+of the pages that hit hardest. Everything else runs uncached — including
+`extract`/`count` aggregates on those paths, and
 the `/pdb/meta/v1/*` and `/metrics/*` endpoints, which are served live on every
 request. The cache is an interface, and `/reports` gets its own (S3-backed)
 backend later without further handler changes.
@@ -474,11 +491,8 @@ have drained.
 | `PDBMUX_E2E_TUNNEL_IMAGE` | `docker.io/library/alpine:3` |
 | `PDBMUX_E2E_NODE_LOOKUP` | path to a `node-lookup` binary (else `PATH`, else skipped) |
 
-Three tests skip rather than assert, each naming a known gap and failing if that
-gap closes: `/facts` aggregates are not summed, `/pdb/query/v4/facts/<name>` is
-served unmerged (so Puppetboard's single-fact drilldown silently loses the other
-backend's nodes), and `/fact-names` is likewise unmerged (so the facts overview
-lists only the first backend's fact names).
+One test skips rather than asserts, naming a known gap and failing if that gap
+closes: `/facts` aggregates are not summed.
 
 ## Deployment
 
