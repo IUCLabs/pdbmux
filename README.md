@@ -48,6 +48,16 @@ times out, `pdbmux` serves the surviving backends' results and logs a warning; a
 merged endpoint only returns `502` when **every** backend fails. Response records
 are passed through as raw JSON so unknown fields survive untouched.
 
+Every backend is asked the same question, so a query all of them *refuse* with
+the same client-shaped status — a `400` naming an unknown field, say — is the
+query's fault rather than an outage: that status and openvoxdb's own explanation
+are replayed to the client instead of a `502`, with any backend address stripped
+out of the body first. Backends disagreeing on the status, a `403` (`pdbmux`'s
+own credentials, not the client's), a `404` (which records a backend holds is
+exactly what backends disagree about), `408`, `429` and every `5xx` still return
+`502`. A refused query is not counted as a partial round on `/healthz`, and
+nothing about it is cached.
+
 Responses carry PuppetDB's `X-Records` when the query asked for a total, and on
 the merged paths `X-Backends` (see [Backend health](#backend-health)). Cached
 paths add two more headers `pdbmux` sets itself, `X-Cache` and `Age` — see
@@ -435,7 +445,8 @@ backend later without further handler changes.
 - **Stale on failure only** — an expired entry is kept, not dropped. When the TTL
   has passed `pdbmux` always re-queries the backends; the expired copy is served
   **only** if every backend fails, which turns a `502` into slightly-old data. A
-  healthy backend is never shadowed by a stale entry.
+  healthy backend is never shadowed by a stale entry, and a query every backend
+  refuses is answered with the refusal rather than the stale copy.
 - **Bounded** — `facts_cache_bytes` (default 64 MiB) is a byte budget, evicted
   least-recently-used; reads count as use, so a stale entry that is still being
   asked for survives. A single response larger than the whole budget is not

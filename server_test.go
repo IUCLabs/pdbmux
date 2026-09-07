@@ -31,6 +31,10 @@ type fakeBackend struct {
 	totals map[string]int
 	fail   bool          // return 500 for everything
 	delay  time.Duration // artificial latency
+	// reject answers every request with this status and rejectBody, standing in
+	// for a PuppetDB refusing a query it cannot answer.
+	reject     int
+	rejectBody string
 
 	mu        sync.Mutex
 	gotParams map[string]url.Values
@@ -58,6 +62,10 @@ func newFakeBackend(t *testing.T, nodesBody, factsBody string) *fakeBackend {
 		fb.mu.Unlock()
 		if fb.fail {
 			http.Error(w, "boom", http.StatusInternalServerError)
+			return
+		}
+		if fb.reject != 0 {
+			http.Error(w, fb.rejectBody, fb.reject)
 			return
 		}
 		if body, ok := fb.bodies[r.URL.Path]; ok {

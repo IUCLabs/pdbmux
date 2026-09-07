@@ -343,6 +343,14 @@ func (b *backend) query(ctx context.Context, t fatalf, path string, params url.V
 // queryStatus is query without the body, for asserting what a backend rejects.
 func (b *backend) queryStatus(ctx context.Context, t fatalf, path string, params url.Values) int {
 	t.Helper()
+	status, _ := b.queryRaw(ctx, t, path, params)
+	return status
+}
+
+// queryRaw returns a backend's own status and body, so a test can compare what
+// pdbmux served against what the backend actually said.
+func (b *backend) queryRaw(ctx context.Context, t fatalf, path string, params url.Values) (int, []byte) {
+	t.Helper()
 	target := b.url + path
 	if len(params) > 0 {
 		target += "?" + params.Encode()
@@ -356,8 +364,11 @@ func (b *backend) queryStatus(ctx context.Context, t fatalf, path string, params
 		t.Fatalf("querying %s%s: %v", b.name, path, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
-	_, _ = io.Copy(io.Discard, resp.Body)
-	return resp.StatusCode
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("reading %s%s: %v", b.name, path, err)
+	}
+	return resp.StatusCode, body
 }
 
 func newNetwork(ctx context.Context, t fatalf) (string, func()) {
