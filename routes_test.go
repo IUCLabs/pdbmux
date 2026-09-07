@@ -105,7 +105,6 @@ func TestQueryRoutes_UnsummedRoutesAreTheKnownOnes(t *testing.T) {
 	want := []string{
 		aggregateEventCountsPath,
 		eventCountsPath,
-		eventsPath,
 		factNamesPath,
 		reportsPath + "/<hash>/<sub>",
 	}

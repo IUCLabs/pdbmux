@@ -95,6 +95,19 @@ func (fb *fakeBackend) params(path string) (url.Values, bool) {
 	return v, ok
 }
 
+// hits reports how many requests the backend received for a path.
+func (fb *fakeBackend) hits(path string) int {
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+	n := 0
+	for _, p := range fb.rawPaths {
+		if p == path {
+			n++
+		}
+	}
+	return n
+}
+
 // sawRawPath reports whether the backend was asked for a path with exactly that
 // escaping.
 func (fb *fakeBackend) sawRawPath(p string) bool {
@@ -594,6 +607,138 @@ func TestHandler_EventsDedupedByIdentity(t *testing.T) {
 	if len(got) != 1 {
 		t.Errorf("expected the duplicate event once, got %d: %s", len(got), rec.Body.String())
 	}
+}
+
+// An events aggregate row is a count, not an event, so the union's
+// verbatim-record key would collapse two backends' identical rows into one.
+func TestHandler_EventsAggregatesAreCombined(t *testing.T) {
+	a := newFakeBackend(t, `[]`, `[]`)
+	a.bodies[eventsPath] = `[{"count":5}]`
+	b := newFakeBackend(t, `[]`, `[]`)
+	b.bodies[eventsPath] = `[{"count":5}]`
+	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic))
+
+	rec := doGet(t, srv.Handler(), eventsPath, `["extract",[["function","count"]]]`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+	}
+	if got := counts(t, rec.Body.Bytes(), "count"); !slices.Equal(got, []float64{10}) {
+		t.Errorf("count = %v, want [10]; the identical rows were deduped instead of added", got)
+	}
+}
+
+func TestHandler_EventsGroupedAggregatesCombinePerKey(t *testing.T) {
+	a := newFakeBackend(t, `[]`, `[]`)
+	a.bodies[eventsPath] = `[{"status":"success","count":5,"max":7},{"status":"failure","count":1,"max":2}]`
+	b := newFakeBackend(t, `[]`, `[]`)
+	b.bodies[eventsPath] = `[{"status":"success","count":5,"max":3}]`
+	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic))
+
+	const q = `["extract",[["function","count"],["function","max","line"],"status"],["group_by","status"]]`
+	rec := doGet(t, srv.Handler(), eventsPath, q)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+	}
+	if got := counts(t, rec.Body.Bytes(), "count"); !slices.Equal(got, []float64{10, 1}) {
+		t.Errorf("counts = %v, want [10 1]", got)
+	}
+	if got := counts(t, rec.Body.Bytes(), "max"); !slices.Equal(got, []float64{7, 2}) {
+		t.Errorf("max = %v, want [7 2]; the column was combined by the wrong operation", got)
+	}
+}
+
+// distinct_resources sends /events to openvoxdb's legacy compiler, which has no
+// function or group_by, so an aggregate asking for it is refused with the reason
+// rather than fanned out into two identical failures and a 502.
+func TestHandler_EventsAggregateWithDistinctResourcesIsRefused(t *testing.T) {
+	const agg = `["extract",[["function","count"]]]`
+	distinct := func(q, value string) url.Values {
+		v := url.Values{"distinct_start_time": {"2026-07-01T00:00:00Z"}, "distinct_end_time": {"2026-07-02T00:00:00Z"}}
+		if q != "" {
+			v.Set("query", q)
+		}
+		if value != "" {
+			v.Set(distinctResourcesParam, value)
+		}
+		return v
+	}
+
+	t.Run("refused without any fan-out", func(t *testing.T) {
+		for _, value := range []string{"true", "TRUE", "True"} {
+			a := newFakeBackend(t, `[]`, `[]`)
+			a.bodies[eventsPath] = `[{"count":5}]`
+			b := newFakeBackend(t, `[]`, `[]`)
+			b.bodies[eventsPath] = `[{"count":5}]`
+			srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic))
+
+			rec := doGetParams(t, srv.Handler(), eventsPath, distinct(agg, value))
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("distinct_resources=%s: status %d, want 400: %s", value, rec.Code, rec.Body.String())
+			}
+			if !strings.Contains(rec.Body.String(), distinctResourcesParam) {
+				t.Errorf("distinct_resources=%s: refusal %q does not name the incompatibility", value, rec.Body.String())
+			}
+			if got := a.hits(eventsPath) + b.hits(eventsPath); got != 0 {
+				t.Errorf("distinct_resources=%s: backends saw %d requests, want 0", value, got)
+			}
+		}
+	})
+
+	// openvoxdb reads the param with Boolean/parseBoolean, so only "true" turns
+	// the distinct form on and any other spelling is an ordinary aggregate.
+	t.Run("a non-true value is still an ordinary aggregate", func(t *testing.T) {
+		a := newFakeBackend(t, `[]`, `[]`)
+		a.bodies[eventsPath] = `[{"count":5}]`
+		b := newFakeBackend(t, `[]`, `[]`)
+		b.bodies[eventsPath] = `[{"count":5}]`
+		srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic))
+
+		rec := doGetParams(t, srv.Handler(), eventsPath, distinct(agg, "yes"))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status %d, want 200: %s", rec.Code, rec.Body.String())
+		}
+		if got := counts(t, rec.Body.Bytes(), "count"); !slices.Equal(got, []float64{10}) {
+			t.Errorf("count = %v, want [10]", got)
+		}
+	})
+
+	t.Run("a plain distinct_resources query still fans out", func(t *testing.T) {
+		a := newFakeBackend(t, `[]`, `[]`)
+		a.bodies[eventsPath] = `[` + event("h1", "r1", "Package[nginx]") + `]`
+		b := newFakeBackend(t, `[]`, `[]`)
+		b.bodies[eventsPath] = `[` + event("h1", "r2", "Service[nginx]") + `]`
+		srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic))
+
+		rec := doGetParams(t, srv.Handler(), eventsPath, distinct("", "true"))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status %d, want 200: %s", rec.Code, rec.Body.String())
+		}
+		if a.hits(eventsPath) != 1 || b.hits(eventsPath) != 1 {
+			t.Fatalf("backends saw %d and %d requests, want 1 each", a.hits(eventsPath), b.hits(eventsPath))
+		}
+		got, _ := a.params(eventsPath)
+		if got.Get(distinctResourcesParam) != "true" {
+			t.Errorf("backend a got distinct_resources=%q, want %q", got.Get(distinctResourcesParam), "true")
+		}
+	})
+
+	// Only /events honours the param; on any other route openvoxdb refuses it
+	// itself, so pdbmux must not shadow that with a refusal of its own.
+	t.Run("another route keeps combining", func(t *testing.T) {
+		a := newFakeBackend(t, `[]`, `[]`)
+		a.bodies[resourcesPath] = `[{"count":5}]`
+		b := newFakeBackend(t, `[]`, `[]`)
+		b.bodies[resourcesPath] = `[{"count":5}]`
+		srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic))
+
+		rec := doGetParams(t, srv.Handler(), resourcesPath, distinct(agg, "true"))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status %d, want 200: %s", rec.Code, rec.Body.String())
+		}
+		if got := counts(t, rec.Body.Bytes(), "count"); !slices.Equal(got, []float64{10}) {
+			t.Errorf("count = %v, want [10]", got)
+		}
+	})
 }
 
 func TestHandler_ReportSubResourceFromHoldingBackend(t *testing.T) {

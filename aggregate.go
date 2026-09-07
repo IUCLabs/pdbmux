@@ -2,7 +2,9 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -165,6 +167,25 @@ func columnClash(name string) error {
 // the shape too, so refusing here is a 400 instead of a failed upstream query.
 func groupByClash(name string) error {
 	return fmt.Errorf("group_by names the aggregate column %q: pdbmux folds that column across backends, so it cannot also be a grouping key", name)
+}
+
+const distinctResourcesParam = "distinct_resources"
+
+// errDistinctResourcesAggregate refuses an aggregate asking for the
+// distinct-resources form of /events. openvoxdb answers that form from its
+// legacy events compiler, whose operator map carries neither function nor
+// group_by (src/puppetlabs/puppetdb/query_eng.clj:189-190 and
+// src/puppetlabs/puppetdb/query/events.clj:183-187), so every backend fails and
+// a fan-out could only report a client mistake as an outage.
+var errDistinctResourcesAggregate = errors.New(
+	"distinct_resources cannot be combined with an extract function column: openvoxdb answers a distinct_resources /events query from its legacy compiler, which supports neither function nor group_by")
+
+// distinctResources reports whether a request asks for the distinct-resources
+// form. openvoxdb coerces the param with Boolean/parseBoolean
+// (src/puppetlabs/puppetdb/http/query.clj:245-250, applied at query.clj:296),
+// so any capitalisation of "true" turns it on and everything else reads false.
+func distinctResources(params url.Values) bool {
+	return strings.EqualFold(params.Get(distinctResourcesParam), "true")
 }
 
 // rewriteAvg replaces the client's avg column with the sum and count of the same

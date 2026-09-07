@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 )
 
 var allNodes = []string{nodeAlpha, nodeBeta, nodeGamma, nodeShared}
@@ -645,6 +646,119 @@ func countsByName(t *testing.T, rows []map[string]any) map[string]int {
 			t.Fatalf("grouped aggregate row has no numeric count: %v", row)
 		}
 		out[name] = int(n)
+	}
+	return out
+}
+
+// An events count row is an aggregate, not an event, so the union's
+// verbatim-record dedupe would fold two backends' equal counts into one number.
+func TestEventsAggregatesAreSummed(t *testing.T) {
+	ctx := context.Background()
+	const q = `["extract",[["function","count"]]]`
+
+	wantA := backendCount(ctx, t, h.a, eventsPath, q)
+	wantB := backendCount(ctx, t, h.b, eventsPath, q)
+	if wantA == 0 || wantB == 0 {
+		t.Fatalf("the fixture gives %s %d and %s %d events, so a sum proves nothing", h.a.name, wantA, h.b.name, wantB)
+	}
+
+	resp := get(t, eventsPath, query(q))
+	if got := countOf(t, resp.rows(t)); got != wantA+wantB {
+		t.Fatalf("/events count = %d, want %d (%s=%d + %s=%d)", got, wantA+wantB, h.a.name, wantA, h.b.name, wantB)
+	}
+	if got := resp.header.Get(backendsHeader); got != "2/2" {
+		t.Errorf("%s = %q, want %q", backendsHeader, got, "2/2")
+	}
+
+	t.Run("grouped counts are summed per key", func(t *testing.T) {
+		const grouped = `["extract",[["function","count"],"certname"],["group_by","certname"]]`
+		want := map[string]int{}
+		for _, b := range []*backend{h.a, h.b} {
+			for cn, n := range countsByCertname(t, b.query(ctx, t, eventsPath, query(grouped))) {
+				want[cn] += n
+			}
+		}
+		// shared reports to both backends, so its row is the one a dedupe would
+		// leave frozen at a single backend's number.
+		if want[nodeShared] < 2 {
+			t.Fatalf("%s has %d events across the estate, so its merged row cannot show a sum", nodeShared, want[nodeShared])
+		}
+		got := countsByCertname(t, get(t, eventsPath, query(grouped)).rows(t))
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("grouped /events counts = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("a query with no function column stays on the union", func(t *testing.T) {
+		rows := get(t, eventsPath, nil).rows(t)
+		if len(rows) != wantA+wantB {
+			t.Fatalf("/events returned %d records, want %d: the union dropped or duplicated events", len(rows), wantA+wantB)
+		}
+		for _, row := range rows {
+			if _, ok := row["resource_title"].(string); !ok {
+				t.Fatalf("/events record is not an event: %v", row)
+			}
+		}
+	})
+}
+
+// distinct_resources moves /events onto openvoxdb's legacy compiler, which has
+// no function or group_by: both backends fail identically, so without a refusal
+// a client mistake reaches the caller as an outage-shaped 502.
+func TestEventsAggregateWithDistinctResourcesIsRefused(t *testing.T) {
+	ctx := context.Background()
+	distinct := func(q string) url.Values {
+		v := url.Values{
+			"distinct_resources":  {"true"},
+			"distinct_start_time": {fixtureTime(-24 * time.Hour)},
+			"distinct_end_time":   {fixtureTime(time.Hour)},
+		}
+		if q != "" {
+			v.Set("query", q)
+		}
+		return v
+	}
+
+	params := distinct(`["extract",[["function","count"]]]`)
+	resp := rawGet(t, eventsPath, params)
+	if resp.status != http.StatusBadRequest {
+		t.Fatalf("status %d, want 400: %s", resp.status, resp.body)
+	}
+	if !strings.Contains(string(resp.body), "distinct_resources") {
+		t.Errorf("refusal %q does not name the incompatibility", resp.body)
+	}
+	if got := h.a.queryStatus(ctx, t, eventsPath, params); got == http.StatusOK {
+		t.Errorf("backend %s answered the aggregate with 200, so the refusal is unnecessary", h.a.name)
+	}
+
+	t.Run("a plain distinct_resources query is still served", func(t *testing.T) {
+		params := distinct("")
+		want := len(h.a.query(ctx, t, eventsPath, params)) + len(h.b.query(ctx, t, eventsPath, params))
+		if want == 0 {
+			t.Fatal("the fixture yields no distinct-resources events, so the union proves nothing")
+		}
+		rows := get(t, eventsPath, params).rows(t)
+		if len(rows) != want {
+			t.Fatalf("/events with distinct_resources returned %d records, want %d", len(rows), want)
+		}
+		for _, row := range rows {
+			if _, ok := row["resource_title"].(string); !ok {
+				t.Fatalf("/events record is not an event: %v", row)
+			}
+		}
+	})
+}
+
+// countsByCertname reads a ["function","count"] + group_by "certname" result set.
+func countsByCertname(t *testing.T, rows []map[string]any) map[string]int {
+	t.Helper()
+	out := map[string]int{}
+	for _, row := range rows {
+		certname, ok := row["certname"].(string)
+		if !ok {
+			t.Fatalf("grouped aggregate row has no certname: %v", row)
+		}
+		out[certname] = int(aggregateNumber(t, row, "count"))
 	}
 	return out
 }
