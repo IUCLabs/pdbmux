@@ -160,6 +160,13 @@ paths add two more headers `pdbmux` sets itself, `X-Cache` and `Age` — see
   - A `/reports` or `/events` query with no `function` column is a projection of
     real records, not an aggregate, and stays on the union path — so an event
     stored identically in two backends is still served once.
+  - `distinct_resources=true` on an `/events` `extract` with a `function` column
+    is refused with **400** naming the incompatibility, before any fan-out.
+    openvoxdb answers the distinct-resources form of `/events` from its legacy
+    compiler, which supports neither `function` nor `group_by`, so every backend
+    fails and the mistake would otherwise surface as a `502`. A
+    `distinct_resources` query with no `function` column is untouched and still
+    fans out; no other endpoint `pdbmux` combines honours the parameter.
   - `include_total=true` on a combined endpoint reports the **merged** row count,
     not the sum of the backends' `X-Records`, since shared keys collapse.
 

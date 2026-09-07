@@ -204,12 +204,21 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	if rt.unsummed == "" {
 		// The one place an aggregate is read, so a query pdbmux cannot fold is
 		// refused here rather than by whichever handler happens to notice.
-		spec, err := parseAggregate(r.URL.Query().Get("query"))
+		in := r.URL.Query()
+		spec, err := parseAggregate(in.Get("query"))
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 		if spec != nil {
+			// Of the routes that reach an aggregate, only /events honours
+			// distinct_resources; every other one rejects it as an unsupported
+			// query parameter (src/puppetlabs/puppetdb/http/handlers.clj:178-189,
+			// 475-496 and src/puppetlabs/puppetdb/http/query.clj:273-277).
+			if r.URL.Path == eventsPath && distinctResources(in) {
+				http.Error(w, errDistinctResourcesAggregate.Error(), http.StatusBadRequest)
+				return
+			}
 			path := rt.fanOut
 			if path == "" {
 				path = r.URL.Path

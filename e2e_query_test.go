@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 )
 
 var allNodes = []string{nodeAlpha, nodeBeta, nodeGamma, nodeShared}
@@ -692,6 +693,53 @@ func TestEventsAggregatesAreSummed(t *testing.T) {
 		rows := get(t, eventsPath, nil).rows(t)
 		if len(rows) != wantA+wantB {
 			t.Fatalf("/events returned %d records, want %d: the union dropped or duplicated events", len(rows), wantA+wantB)
+		}
+		for _, row := range rows {
+			if _, ok := row["resource_title"].(string); !ok {
+				t.Fatalf("/events record is not an event: %v", row)
+			}
+		}
+	})
+}
+
+// distinct_resources moves /events onto openvoxdb's legacy compiler, which has
+// no function or group_by: both backends fail identically, so without a refusal
+// a client mistake reaches the caller as an outage-shaped 502.
+func TestEventsAggregateWithDistinctResourcesIsRefused(t *testing.T) {
+	ctx := context.Background()
+	distinct := func(q string) url.Values {
+		v := url.Values{
+			"distinct_resources":  {"true"},
+			"distinct_start_time": {fixtureTime(-24 * time.Hour)},
+			"distinct_end_time":   {fixtureTime(time.Hour)},
+		}
+		if q != "" {
+			v.Set("query", q)
+		}
+		return v
+	}
+
+	params := distinct(`["extract",[["function","count"]]]`)
+	resp := rawGet(t, eventsPath, params)
+	if resp.status != http.StatusBadRequest {
+		t.Fatalf("status %d, want 400: %s", resp.status, resp.body)
+	}
+	if !strings.Contains(string(resp.body), "distinct_resources") {
+		t.Errorf("refusal %q does not name the incompatibility", resp.body)
+	}
+	if got := h.a.queryStatus(ctx, t, eventsPath, params); got == http.StatusOK {
+		t.Errorf("backend %s answered the aggregate with 200, so the refusal is unnecessary", h.a.name)
+	}
+
+	t.Run("a plain distinct_resources query is still served", func(t *testing.T) {
+		params := distinct("")
+		want := len(h.a.query(ctx, t, eventsPath, params)) + len(h.b.query(ctx, t, eventsPath, params))
+		if want == 0 {
+			t.Fatal("the fixture yields no distinct-resources events, so the union proves nothing")
+		}
+		rows := get(t, eventsPath, params).rows(t)
+		if len(rows) != want {
+			t.Fatalf("/events with distinct_resources returned %d records, want %d", len(rows), want)
 		}
 		for _, row := range rows {
 			if _, ok := row["resource_title"].(string); !ok {
