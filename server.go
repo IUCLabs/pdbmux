@@ -521,6 +521,10 @@ func (s *Server) serveFirstHolder(w http.ResponseWriter, r *http.Request) {
 		alive = append(alive, res)
 	}
 	if len(alive) == 0 {
+		if ue := unanimousClientError(results); ue != nil {
+			s.writeUpstreamError(w, ue)
+			return
+		}
 		http.Error(w, "no backend holds this report", http.StatusNotFound)
 		return
 	}
@@ -533,17 +537,29 @@ func (s *Server) serveFirstHolder(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, nil)
 }
 
-// Returns errAllBackendsFailed only when every backend failed.
+// Returns an *upstreamError when every backend refused the query the same way,
+// and errAllBackendsFailed when every backend failed for any other reason.
 func (s *Server) aliveResults(ctx context.Context, path string, params url.Values) ([]backendResult, error) {
 	results := s.fanOut(ctx, path, params)
 
 	var alive []backendResult
 	for _, res := range results {
+		if res.err == nil {
+			alive = append(alive, res)
+		}
+	}
+	if len(alive) == 0 {
+		// A query every backend refuses identically is the client's mistake, not an
+		// outage, so it is neither logged as one nor counted as degraded service.
+		if ue := unanimousClientError(results); ue != nil {
+			s.log.Printf("info: every backend refused %s: %v", path, ue)
+			return nil, ue
+		}
+	}
+	for _, res := range results {
 		if res.err != nil {
 			s.log.Printf("warning: backend %q failed for %s: %v", res.name, path, res.err)
-			continue
 		}
-		alive = append(alive, res)
 	}
 	s.partial.record(len(alive), len(s.cfg.Backends), s.now())
 	if len(alive) == 0 {
@@ -596,7 +612,7 @@ func (s *Server) serveFiltered(w http.ResponseWriter, r *http.Request, path stri
 	if !enabled {
 		resp, err := build(r.Context())
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadGateway)
+			s.writeUpstreamError(w, err)
 			return
 		}
 		writeCached(w, filter.apply(resp))
@@ -648,14 +664,16 @@ func (s *Server) serveFiltered(w http.ResponseWriter, r *http.Request, path stri
 		if errors.Is(err, errFlightAbandoned) {
 			return
 		}
-		if stale != nil {
+		// A refused query is answered, not degraded, so stale records are no reply
+		// to it: the client has to see why the query was rejected.
+		if stale != nil && !errors.As(err, new(*upstreamError)) {
 			s.stale.markStale(s.now())
 			s.log.Printf("warning: serving stale %s from cache (stored %s): %v",
 				path, stale.StoredAt.UTC().Format(time.RFC3339), err)
 			s.writeStored(w, *stale, CacheStale, filter)
 			return
 		}
-		http.Error(w, err.Error(), http.StatusBadGateway)
+		s.writeUpstreamError(w, err)
 		return
 	}
 	s.stale.markFresh()
@@ -877,7 +895,7 @@ func (s *Server) queryBackend(ctx context.Context, b Backend, path string, param
 		return nil, -1, err
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, -1, fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return nil, -1, newUpstreamError(resp.StatusCode, resp.Header.Get("Content-Type"), body)
 	}
 	total := -1
 	if n, err := strconv.Atoi(resp.Header.Get(recordsHeader)); err == nil && n >= 0 {
@@ -919,7 +937,7 @@ func (s *Server) proxyUnmerged(w http.ResponseWriter, r *http.Request) {
 	}
 	setContentType(w, fallback.contentType)
 	w.WriteHeader(fallback.status)
-	_, _ = w.Write(fallback.body)
+	_, _ = w.Write(s.redactBackends(fallback.body))
 }
 
 type bufferedResponse struct {
