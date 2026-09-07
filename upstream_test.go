@@ -4,8 +4,10 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -27,6 +29,10 @@ func TestUnanimousClientError_AgreementRule(t *testing.T) {
 		{"all agree on 415", []error{upErr(415, "bad media"), upErr(415, "bad media")}, 415},
 		{"differing bodies still agree", []error{upErr(400, "one"), upErr(400, "two")}, 400},
 		{"disagreeing 4xx", []error{upErr(400, "bad"), upErr(404, "gone")}, 0},
+		// Both client-shaped, so only the same-status rule refuses these.
+		{"agree on shape, disagree on code", []error{upErr(400, "x"), upErr(415, "y")}, 0},
+		{"a majority agrees", []error{upErr(400, "x"), upErr(400, "y"), upErr(422, "z")}, 0},
+		{"the first differs", []error{upErr(422, "z"), upErr(400, "x"), upErr(400, "y")}, 0},
 		{"4xx with a 5xx", []error{upErr(400, "bad"), upErr(500, "boom")}, 0},
 		{"4xx with a transport failure", []error{upErr(400, "bad"), refused}, 0},
 		{"all 403", []error{upErr(403, "denied"), upErr(403, "denied")}, 0},
@@ -412,6 +418,70 @@ func TestWriteUpstreamError_EmptyBodyGetsAMessage(t *testing.T) {
 	}
 	if strings.TrimSpace(rec.Body.String()) == "" {
 		t.Error("a replayed rejection must carry some explanation")
+	}
+}
+
+// clientShaped calls 406 and 415 replayable on the grounds that neither is
+// reachable while the fan-out sends a bare GET. Forwarding a client's
+// negotiation headers would make them reachable, so pin the premise.
+func TestFanOut_ForwardsNoNegotiationHeaders(t *testing.T) {
+	var mu sync.Mutex
+	var seen []http.Header
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		seen = append(seen, r.Header.Clone())
+		mu.Unlock()
+		setContentType(w, "application/json")
+		_, _ = w.Write([]byte(`[]`))
+	}))
+	defer up.Close()
+
+	h := newTestServer(testConfig(up.URL, up.URL, mergeStatic)).Handler()
+	for _, path := range []string{nodesPath, resourcesPath} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.Header.Set("Accept", "application/xml")
+		req.Header.Set("Content-Encoding", "br")
+		h.ServeHTTP(httptest.NewRecorder(), req)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(seen) == 0 {
+		t.Fatal("no backend request observed")
+	}
+	for _, hdr := range seen {
+		for _, name := range []string{"Accept", "Content-Encoding", "Content-Type"} {
+			if v := hdr.Get(name); v != "" {
+				t.Errorf("fan-out forwarded %s: %q", name, v)
+			}
+		}
+	}
+}
+
+// Redaction is fail-safe: it over-matches rather than let an address through,
+// and DNS case must not be a way past it.
+func TestRedactBackends_Vectors(t *testing.T) {
+	srv := newTestServer(testConfig("http://pdb1.example.net:8080", "https://198.51.100.40:8081", mergeStatic))
+	for _, tc := range []struct {
+		name, in, want string
+	}{
+		{"url", "GET http://pdb1.example.net:8080/pdb failed", "GET <backend>/pdb failed"},
+		{"uppercase hostname", "PDB1.EXAMPLE.NET refused", "<backend> refused"},
+		{"mixed-case url", "HTTP://PDB1.Example.Net:8080/pdb", "<backend>/pdb"},
+		{"ip backend", "dial https://198.51.100.40:8081/pdb", "dial <backend>/pdb"},
+		{"json-escaped slashes", `{"at":"http:\/\/pdb1.example.net:8080\/pdb"}`, `{"at":"http:\/\/<backend>\/pdb"}`},
+		{"percent-encoded colon", "pdb1.example.net%3A8080", "<backend>%3A8080"},
+		{"trailing-dot fqdn", "pdb1.example.net. timed out", "<backend>. timed out"},
+		{"hostname as substring", "peer-pdb1.example.net-alt", "peer-<backend>-alt"},
+		{"repeated", "pdb1.example.net and PDB1.example.net", "<backend> and <backend>"},
+		{"non-ascii body survives folding", "Ünïcode PDB1.EXAMPLE.NET ✓", "Ünïcode <backend> ✓"},
+		{"names nothing", "Unrecognized column 'bogus'", "Unrecognized column 'bogus'"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := string(srv.redactBackends([]byte(tc.in))); got != tc.want {
+				t.Errorf("redactBackends(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
 	}
 }
 
