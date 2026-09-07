@@ -9,7 +9,6 @@ import (
 	"log"
 	"net/http"
 	"net/http/httptest"
-	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -274,28 +273,21 @@ func TestProber_StopLeavesNoGoroutines(t *testing.T) {
 	}
 	p := newTestProber(t, cfg)
 
-	settle := func() int {
-		runtime.GC()
-		time.Sleep(20 * time.Millisecond)
-		return runtime.NumGoroutine()
-	}
-	before := settle()
+	before, _ := goroutinesRunning(proberFrame)
 
 	p.Start(context.Background())
 	waitFor(t, func() bool {
 		snap := p.snapshot()
 		return snap["a"].Probed && snap["b"].Probed && snap["c"].Probed
 	})
+	// The assertion is only worth anything if the frame matches while the loops
+	// are up.
+	if during, _ := goroutinesRunning(proberFrame); during <= before {
+		t.Fatalf("goroutines in %s = %d with the prober running, want more than the %d before Start", proberFrame, during, before)
+	}
 	p.Stop()
 
-	deadline := time.Now().Add(5 * time.Second)
-	var after int
-	for time.Now().Before(deadline) {
-		if after = settle(); after <= before {
-			return
-		}
-	}
-	t.Fatalf("goroutines did not settle after Stop: %d before, %d after", before, after)
+	assertGoroutinesSettle(t, before, proberFrame)
 }
 
 func TestProber_StopIsIdempotentAndSafeWhenNeverStarted(t *testing.T) {
