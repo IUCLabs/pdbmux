@@ -45,6 +45,12 @@ func (e *upstreamError) Error() string {
 // backends are meant to disagree about; 408 and 429 report a backend's timing
 // and capacity. A backend that times out mid-query answers 200 with a truncated
 // body rather than any 4xx (query_eng.clj:463-483), so no timeout reaches here.
+//
+// Every 4xx left over blames the request and so is safe to replay, though none
+// is reachable while the fan-out forwards no client header: 406 needs an Accept
+// the query app refuses (http/server.clj:72; must-accept-type in
+// http.clj:136-145 is unwired), and 415 a Content-Encoding on a POST to
+// /commands (middleware.clj:165-178), which pdbmux never proxies.
 func clientShaped(status int) bool {
 	switch status {
 	case http.StatusForbidden, http.StatusNotFound,
@@ -107,10 +113,42 @@ func (s *Server) redactBackends(body []byte) []byte {
 	out := string(body)
 	for _, b := range s.cfg.Backends {
 		for _, term := range backendTerms(b) {
-			out = strings.ReplaceAll(out, term, redactedBackend)
+			out = replaceFold(out, term, redactedBackend)
 		}
 	}
 	return []byte(out)
+}
+
+// replaceFold is strings.ReplaceAll ignoring ASCII case, because DNS names are
+// case-insensitive and a backend shouted back in capitals is still named.
+func replaceFold(s, old, repl string) string {
+	if old == "" {
+		return s
+	}
+	hay, needle := foldASCII(s), foldASCII(old)
+	var out strings.Builder
+	for {
+		i := strings.Index(hay, needle)
+		if i < 0 {
+			out.WriteString(s)
+			return out.String()
+		}
+		out.WriteString(s[:i])
+		out.WriteString(repl)
+		s, hay = s[i+len(needle):], hay[i+len(needle):]
+	}
+}
+
+// foldASCII lowercases ASCII only, so byte offsets into the result also index
+// the input — which Unicode-aware folding does not guarantee.
+func foldASCII(s string) string {
+	b := []byte(s)
+	for i, c := range b {
+		if c >= 'A' && c <= 'Z' {
+			b[i] = c + 'a' - 'A'
+		}
+	}
+	return string(b)
 }
 
 // backendTerms is what identifies a backend in text: its URL, that URL's host
