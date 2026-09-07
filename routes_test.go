@@ -69,6 +69,37 @@ func TestQueryRoutes_GuardedRoutesSumAggregatesUncached(t *testing.T) {
 	}
 }
 
+// The dispatch guard and the per-function combiners have to hold at once: every
+// guarded route in the table folds each aggregate column by its own operation,
+// so a max comes back as the larger of the backends' values rather than as the
+// blanket sum a count gets. Asserting both columns of one row pins that the
+// operation is chosen per column, not per request.
+func TestQueryRoutes_GuardedRoutesCombinePerFunction(t *testing.T) {
+	const q = `["extract",[["function","count"],["function","max","report_timestamp"]],["=","environment","production"]]`
+	for _, rt := range queryRoutes {
+		if rt.unsummed != "" {
+			continue
+		}
+		t.Run(rt.name, func(t *testing.T) {
+			probe := aggregateProbes[rt.name]
+			a := newCountingBackend(t, map[string]string{probe: `[{"count":90,"max":90}]`})
+			b := newCountingBackend(t, map[string]string{probe: `[{"count":53,"max":53}]`})
+			srv, _ := newCachedServer(t, cacheTestConfig(a.srv.URL, b.srv.URL))
+
+			rec := doGet(t, srv.Handler(), probe, q)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+			}
+			if got := counts(t, rec.Body.Bytes(), "count"); !slices.Equal(got, []float64{143}) {
+				t.Errorf("count = %v, want [143]", got)
+			}
+			if got := counts(t, rec.Body.Bytes(), "max"); !slices.Equal(got, []float64{90}) {
+				t.Errorf("max = %v, want [90]; the column was combined by the wrong operation", got)
+			}
+		})
+	}
+}
+
 // The opt-out is deliberate, so widening it has to be deliberate too.
 func TestQueryRoutes_UnsummedRoutesAreTheKnownOnes(t *testing.T) {
 	want := []string{

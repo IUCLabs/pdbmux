@@ -24,11 +24,11 @@ not PQL) is forwarded verbatim.
 
 | Path | Behaviour |
 |---|---|
-| `GET /pdb/query/v4/nodes` | Fan out to all backends, dedupe by `certname`, keep the record with the newer `report_timestamp`, stamped with the winning backend's name (see provenance). An `extract`/`count` query is **summed** instead. |
-| `GET /pdb/query/v4/facts` | Fan out to all, and per `certname` keep **all** facts from the backend that owns that node (see merge semantics), plus a synthetic `pdbmux_source` fact naming it. An `extract`/`count` query is **summed** instead. |
-| `GET /pdb/query/v4/facts/<name>[/<value>]` | Same fan-out and merge as `/facts`, and an `extract`/`count` query is **summed** the same way. The path segment is a `name` constraint, so no synthetic `pdbmux_source` record is added — except on the fact's own path, which is **synthesised** from the `/facts` merge (see provenance). |
+| `GET /pdb/query/v4/nodes` | Fan out to all backends, dedupe by `certname`, keep the record with the newer `report_timestamp`, stamped with the winning backend's name (see provenance). An `extract` query with a `function` column is **combined** instead. |
+| `GET /pdb/query/v4/facts` | Fan out to all, and per `certname` keep **all** facts from the backend that owns that node (see merge semantics), plus a synthetic `pdbmux_source` fact naming it. An `extract` query with a `function` column is **combined** instead. |
+| `GET /pdb/query/v4/facts/<name>[/<value>]` | Same fan-out and merge as `/facts`, and an `extract` query with a `function` column is **combined** the same way. The path segment is a `name` constraint, so no synthetic `pdbmux_source` record is added — except on the fact's own path, which is **synthesised** from the `/facts` merge (see provenance). |
 | `GET /pdb/query/v4/fact-names` | Fan out to all and serve the **union** of the flat name arrays, deduped and re-sorted, re-paged across backends, plus the `pdbmux_source` name while injection is on. `order_by` is only valid on `name`. |
-| `GET /pdb/query/v4/resources` | An `extract`/`count` query is fanned out and **summed**; any other query is an unmerged pass-through. |
+| `GET /pdb/query/v4/resources` | An `extract` query with a `function` column is fanned out and **combined**; any other query is an unmerged pass-through. |
 | `GET /pdb/query/v4/reports` | Fan out to all and serve the **union**, deduped by report `hash`, re-ordered and re-paged across backends. |
 | `GET /pdb/query/v4/events` | Fan out to all and serve the **union**, deduped by record identity, re-ordered and re-paged. |
 | `GET /pdb/query/v4/event-counts` | Fan out to all and **sum** each subject's counts into one row per subject. |
@@ -87,36 +87,79 @@ paths add two more headers `pdbmux` sets itself, `X-Cache` and `Age` — see
   events, which carry no id of their own, dedupe on the verbatim record (a node
   reporting to more than one backend stores identical records in each).
 - **Aggregates** — `extract`/`group_by` rows are counts, not records, so each
-  backend returns a partial answer that has to be **added**, not deduped. This
+  backend returns a partial answer that has to be **combined**, not deduped. This
   covers `/event-counts`, `/aggregate-event-counts`, and any `/reports`,
   `/nodes`, `/resources`, `/facts` or `/facts/<name>[/<value>]` query whose
   `extract` carries a `["function", ...]` column.
-  - The grouping key is the row's non-aggregate fields: for `/reports`,
-    `/nodes`, `/resources`, `/facts` and `/facts/<name>` they come from the
-    query — the plain `extract` fields plus any `group_by` clause — and for the
-    event-count endpoints from the row itself (`subject_type`/`subject`, or
-    `summarize_by`), whose remaining fields are all counts.
+  - The grouping key is the row's full set of non-aggregate columns: for
+    `/reports`, `/nodes`, `/resources`, `/facts` and `/facts/<name>` they come
+    from the query — the plain `extract` fields, the row-function columns and
+    any `group_by` clause — and for the event-count endpoints from the row
+    itself (`subject_type`/`subject`, or `summarize_by`), whose remaining fields
+    are all counts.
   - On `/nodes`, `/facts` and `/facts/<name>[/<value>]` this takes precedence
     over the `certname` merge: an aggregate row has no `certname`, so deduping
     would collapse every backend's rows into one backend's numbers. A query with
     no `function` column — including a plain `extract` projection — still merges
     by `certname`.
   - PuppetDB accepts `count`, `sum`, `avg`, `min`, `max`, `to_string` and
-    `jsonb_typeof` as `extract` functions. Only `count` and `sum` are additive,
-    so only those two merge correctly. `avg`, `min` and `max` are folded like any
-    other numeric column and their merged value is **wrong**; `to_string` and
-    `jsonb_typeof` are row functions whose non-numeric column is carried through
-    from the first backend to report the key. Query a single backend directly
-    for any of those five.
+    `jsonb_typeof` as `extract` functions, and names each response column after
+    the function itself. Each is combined by its own rule rather than by a
+    blanket sum:
+
+    | function | merged across backends by |
+    | --- | --- |
+    | `count` | adding |
+    | `sum` | adding |
+    | `min` | the smallest value any backend reported, on text columns as well as numeric ones |
+    | `max` | the largest value any backend reported, likewise |
+    | `avg` | rewriting the upstream query into `sum` + `count` of the same column and dividing the totals, so the answer is the estate's true weighted average, not an average of averages |
+    | `to_string` | nothing — it is a row function, so it groups like a plain projected column |
+    | `jsonb_typeof` | likewise |
+
+  - Because each column is named after its function, an `extract` that projects
+    the **same function twice** — any of them — names one response column twice.
+    openvoxdb aliases the repeat as `<name>_2` (then `_3`, and so on), which is
+    neither a grouping key nor an aggregate `pdbmux` knows to fold, so the first
+    backend's value would freeze into the merged row. Such a query is refused
+    with **400** naming the clashing column, as is one whose plain `extract`
+    field takes the name a projected function would use. Repeating a plain field
+    is not a clash: the copy holds the same value as the key it duplicates.
+  - The `avg` rewrite is invisible to the client: the request still answers under
+    the `avg` key. It needs the `sum` and `count` response columns for itself, so
+    an `extract` that also projects a `sum` or a `count` is refused with **400**
+    naming the clash rather than answered with a wrong number. An `avg` over no
+    rows stays `null`, as upstream. An `order_by` on `avg` is applied to the
+    merged rows here, not upstream.
+  - `avg` is folded as `sum / count` in float64, while a single openvoxdb divides
+    in Postgres `numeric`, which is arbitrary-precision. Whole-number averages
+    round-trip exactly; a fractional one can differ from a single backend's
+    answer in the low-order digits, as can a `sum` beyond 2^53.
+  - An `extract` function `pdbmux` has no combiner for is refused with **400**
+    rather than folded on a guess.
   - `/resources` has no cross-backend record identity to dedupe on, so only its
     aggregate queries merge; everything else stays an unmerged pass-through.
-  - Rows sharing a key collapse into one with their numeric columns summed. A key
-    only one backend reported is passed through byte-for-byte. An aggregate column
-    that is absent or non-numeric in a row is skipped, never zeroed, so the
-    backends that did report a number still count.
+  - Rows sharing a key collapse into one with each aggregate column combined by
+    its own rule. A key only one backend reported is passed through
+    byte-for-byte. An aggregate column that is absent or `null` in a row is
+    skipped, never zeroed or treated as an extreme, so the backends that did
+    report a value still count.
+  - `to_string` and `jsonb_typeof` compile to scalar expressions upstream, so
+    they return one row per record rather than an aggregate. They form part of
+    the grouping key alongside the plain `extract` fields and the `group_by`
+    clause — including a `group_by` that names the function itself. An `extract`
+    of nothing but row functions has no aggregate to fold, so every backend's
+    rows are kept as they came — and, having one row per record rather than per
+    group, they keep the upstream `limit` that bounds them.
+  - `limit` and `offset` are **not** forwarded for an `extract` that folds: a
+    backend's own first N groups are not the merged result's first N, and a group
+    truncated away on one backend would fold to a wrong value. Every group is
+    fetched and the window cut after the fold, which an aggregate's row count —
+    one per distinct group value — keeps affordable. `include_total` still
+    reports the merged group count.
   - A `/reports` query with no `function` column is a projection of real reports,
     not an aggregate, and stays on the union path.
-  - `include_total=true` on a summed endpoint reports the **merged** row count,
+  - `include_total=true` on a combined endpoint reports the **merged** row count,
     not the sum of the backends' `X-Records`, since shared keys collapse.
 
 ### Provenance: the `pdbmux_source` fact
@@ -191,7 +234,7 @@ answered `[]` from the configured names alone, with no fan-out at all, and a
 value naming one filters a record set fetched under a key the value is not part
 of. The record set is a property of the estate rather than of the filter, so
 every value of it — and the unfiltered path — share one entry and one fetch.
-An `extract`/`count` query still takes the summing branch, and the gated query
+An `extract` query with a `function` column still takes the combining branch, and the gated query
 shapes above still answer `[]`, as does every form while injection is off — with
 the name kept out of `/fact-names`, since nothing then produces it.
 
@@ -251,9 +294,11 @@ Each backend applies `order_by`/`limit`/`offset` to its own slice only, so
   the merged set's existing order). A record missing an ordered field sorts first.
 - Backends are asked for the first `offset + limit` records — never an `offset`
   — and the requested window is then cut from the merged, re-sorted set.
+- A folded `extract` aggregate is the exception: neither `limit` nor `offset` is
+  forwarded, since a group truncated on one backend cannot be folded correctly.
 - `include_total=true` on a union endpoint makes `pdbmux` sum each backend's
   `X-Records` header into one merged header. Deduped records are counted once per
-  backend, so the total is an upper bound. Summed endpoints report the merged row
+  backend, so the total is an upper bound. Combined endpoints report the merged row
   count instead.
 - A malformed `limit`, `offset` or `order_by` gets a `400` rather than being
   forwarded.
@@ -364,7 +409,7 @@ not answering.
 `/fact-names` record sets **in memory** so a busy Puppetboard does not re-fan-out
 the same query every few seconds — its facts overview and fact drilldown are two
 of the pages that hit hardest. Everything else runs uncached — including
-`extract`/`count` aggregates on those paths, and
+`extract` aggregates on those paths, and
 the `/pdb/meta/v1/*` and `/metrics/*` endpoints, which are served live on every
 request. The cache is an interface, and `/reports` gets its own (S3-backed)
 backend later without further handler changes.

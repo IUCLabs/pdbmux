@@ -150,6 +150,41 @@ func valueRank(v any) int {
 	}
 }
 
+// dropOrderBy removes one field from an upstream order_by, for a column the
+// rewritten query no longer projects. An unparseable or emptied order_by is
+// dropped entirely; pdbmux re-sorts the merged rows on the client's own order.
+func dropOrderBy(params url.Values, field string) {
+	raw := params.Get("order_by")
+	if strings.TrimSpace(raw) == "" {
+		return
+	}
+	var entries []map[string]any
+	if json.Unmarshal([]byte(raw), &entries) != nil {
+		params.Del("order_by")
+		return
+	}
+	kept := make([]map[string]any, 0, len(entries))
+	for _, e := range entries {
+		if f, ok := e["field"].(string); ok && f == field {
+			continue
+		}
+		kept = append(kept, e)
+	}
+	if len(kept) == len(entries) {
+		return
+	}
+	if len(kept) == 0 {
+		params.Del("order_by")
+		return
+	}
+	encoded, err := json.Marshal(kept)
+	if err != nil {
+		params.Del("order_by")
+		return
+	}
+	params.Set("order_by", string(encoded))
+}
+
 type paging struct {
 	limit     int // -1 when unset
 	offset    int
@@ -184,13 +219,29 @@ func parsePaging(v url.Values) (paging, error) {
 
 // Backends are asked for the first offset+limit records with no offset; the offset is applied to the union instead.
 func (p paging) upstreamParams(in url.Values) url.Values {
-	out := url.Values{}
-	for k, vs := range in {
-		out[k] = append([]string(nil), vs...)
-	}
+	out := copyParams(in)
 	out.Del("offset")
 	if p.limit >= 0 {
 		out.Set("limit", strconv.Itoa(p.limit+p.offset))
+	}
+	return out
+}
+
+// unpagedParams is upstreamParams for a response whose rows are folded together:
+// a backend's own first N groups are not the merged result's first N, and a
+// group truncated away on one backend folds to a wrong value, so every group is
+// fetched and the window is cut after the fold.
+func unpagedParams(in url.Values) url.Values {
+	out := copyParams(in)
+	out.Del("offset")
+	out.Del("limit")
+	return out
+}
+
+func copyParams(in url.Values) url.Values {
+	out := url.Values{}
+	for k, vs := range in {
+		out[k] = append([]string(nil), vs...)
 	}
 	return out
 }

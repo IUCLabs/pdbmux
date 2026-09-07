@@ -102,9 +102,9 @@ func (s *Server) StopProbes() { s.health.Stop() }
 func (s *Server) cacheFor(path string, params url.Values) (Cache, bool) {
 	switch {
 	case path == factsPath, path == nodesPath, path == factNamesPath, isFactsSubPath(path):
-		// An aggregate row is a summed count, not the merged record set the
+		// An aggregate row is a combined count, not the merged record set the
 		// cache was built for, so it stays on the live path.
-		if parseAggregate(params.Get("query")) != nil {
+		if spec, err := parseAggregate(params.Get("query")); spec != nil || err != nil {
 			return noopCache{}, false
 		}
 		if s.factsCache != nil {
@@ -126,15 +126,15 @@ func (s *Server) Handler() http.Handler {
 
 // route is one query endpoint: how a request selects it, the path its fan-out
 // asks backends for, and how it answers a plain query. handleQuery diverts an
-// extract/function query to serveSummed before serve runs, so aggregate rows —
+// extract/function query to serveCombined before serve runs, so aggregate rows —
 // which carry none of the certname, hash or name the merges key on, and would
 // collapse into one backend's numbers — cannot reach an identity-keyed merge.
 // unsummed opts a route out and records why; the zero value is guarded, so a
-// route added without a decision is summed rather than silently merged.
+// route added without a decision is combined rather than silently merged.
 type route struct {
 	name    string
 	matches func(path string) bool
-	// fanOut is the path backends are queried on when the guard sums; empty
+	// fanOut is the path backends are queried on when the guard combines; empty
 	// means the request's own path.
 	fanOut   string
 	serve    func(*Server, http.ResponseWriter, *http.Request)
@@ -207,12 +207,19 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	}
 	rt := routeFor(r.URL.Path)
 	if rt.unsummed == "" {
-		if spec := parseAggregate(r.URL.Query().Get("query")); spec != nil {
+		// The one place an aggregate is read, so a query pdbmux cannot fold is
+		// refused here rather than by whichever handler happens to notice.
+		spec, err := parseAggregate(r.URL.Query().Get("query"))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if spec != nil {
 			path := rt.fanOut
 			if path == "" {
 				path = r.URL.Path
 			}
-			s.serveSummed(w, r, path, spec.columns)
+			s.serveCombined(w, r, path, spec, spec.shape)
 			return
 		}
 	}
@@ -449,25 +456,39 @@ func (s *Server) serveEvents(w http.ResponseWriter, r *http.Request) {
 	s.serveUnion(w, r, eventsPath, rawKey)
 }
 
+// The columns come from the row rather than a query spec, so there is no
+// grouping key or rewrite for serveCombined to apply.
 func (s *Server) serveEventCounts(w http.ResponseWriter, r *http.Request) {
-	s.serveSummed(w, r, r.URL.Path, inferredColumns)
+	s.serveCombined(w, r, r.URL.Path, nil, inferredShape)
 }
 
 // Merged rows are fewer than the backends' combined records, so include_total reports the merged count rather than a sum of X-Records.
-func (s *Server) serveSummed(w http.ResponseWriter, r *http.Request, path string, columns func(map[string]json.RawMessage) ([]string, []string)) {
+func (s *Server) serveCombined(w http.ResponseWriter, r *http.Request, path string, spec *aggregateSpec, shape func(map[string]json.RawMessage) rowShape) {
 	in := r.URL.Query()
 	page, err := parsePaging(in)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	upstream := page.upstreamParams(in)
+	if spec != nil && len(spec.aggs) > 0 {
+		// An aggregate returns one row per distinct group, so the whole result is
+		// fetched and paged locally rather than truncated per backend.
+		upstream = unpagedParams(in)
+	}
+	if spec != nil && spec.query != "" {
+		// The backends answer the rewritten query, so they no longer carry the
+		// column the client's order_by may name; the merged rows are sorted here.
+		upstream.Set("query", spec.query)
+		dropOrderBy(upstream, avgColumn)
+	}
 
 	s.serveCached(w, r, path, in, func(ctx context.Context) (cachedResponse, error) {
-		alive, err := s.aliveResults(ctx, path, page.upstreamParams(in))
+		alive, err := s.aliveResults(ctx, path, upstream)
 		if err != nil {
 			return cachedResponse{}, err
 		}
-		merged := sumRows(alive, columns)
+		merged := combineRows(alive, shape)
 		sortRecords(merged, page.order)
 		resp := cachedResponse{Body: encodeRecords(page.apply(merged)), Records: -1}
 		s.countBackends(&resp, alive)
