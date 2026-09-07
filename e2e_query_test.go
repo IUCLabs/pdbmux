@@ -649,6 +649,72 @@ func countsByName(t *testing.T, rows []map[string]any) map[string]int {
 	return out
 }
 
+// An events count row is an aggregate, not an event, so the union's
+// verbatim-record dedupe would fold two backends' equal counts into one number.
+func TestEventsAggregatesAreSummed(t *testing.T) {
+	ctx := context.Background()
+	const q = `["extract",[["function","count"]]]`
+
+	wantA := backendCount(ctx, t, h.a, eventsPath, q)
+	wantB := backendCount(ctx, t, h.b, eventsPath, q)
+	if wantA == 0 || wantB == 0 {
+		t.Fatalf("the fixture gives %s %d and %s %d events, so a sum proves nothing", h.a.name, wantA, h.b.name, wantB)
+	}
+
+	resp := get(t, eventsPath, query(q))
+	if got := countOf(t, resp.rows(t)); got != wantA+wantB {
+		t.Fatalf("/events count = %d, want %d (%s=%d + %s=%d)", got, wantA+wantB, h.a.name, wantA, h.b.name, wantB)
+	}
+	if got := resp.header.Get(backendsHeader); got != "2/2" {
+		t.Errorf("%s = %q, want %q", backendsHeader, got, "2/2")
+	}
+
+	t.Run("grouped counts are summed per key", func(t *testing.T) {
+		const grouped = `["extract",[["function","count"],"certname"],["group_by","certname"]]`
+		want := map[string]int{}
+		for _, b := range []*backend{h.a, h.b} {
+			for cn, n := range countsByCertname(t, b.query(ctx, t, eventsPath, query(grouped))) {
+				want[cn] += n
+			}
+		}
+		// shared reports to both backends, so its row is the one a dedupe would
+		// leave frozen at a single backend's number.
+		if want[nodeShared] < 2 {
+			t.Fatalf("%s has %d events across the estate, so its merged row cannot show a sum", nodeShared, want[nodeShared])
+		}
+		got := countsByCertname(t, get(t, eventsPath, query(grouped)).rows(t))
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("grouped /events counts = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("a query with no function column stays on the union", func(t *testing.T) {
+		rows := get(t, eventsPath, nil).rows(t)
+		if len(rows) != wantA+wantB {
+			t.Fatalf("/events returned %d records, want %d: the union dropped or duplicated events", len(rows), wantA+wantB)
+		}
+		for _, row := range rows {
+			if _, ok := row["resource_title"].(string); !ok {
+				t.Fatalf("/events record is not an event: %v", row)
+			}
+		}
+	})
+}
+
+// countsByCertname reads a ["function","count"] + group_by "certname" result set.
+func countsByCertname(t *testing.T, rows []map[string]any) map[string]int {
+	t.Helper()
+	out := map[string]int{}
+	for _, row := range rows {
+		certname, ok := row["certname"].(string)
+		if !ok {
+			t.Fatalf("grouped aggregate row has no certname: %v", row)
+		}
+		out[certname] = int(aggregateNumber(t, row, "count"))
+	}
+	return out
+}
+
 // The provenance fact must name the backend whose data won, and must be absent
 // from the query shapes it would corrupt.
 func TestSourceFactInjectionAndGating(t *testing.T) {

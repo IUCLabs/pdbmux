@@ -596,6 +596,44 @@ func TestHandler_EventsDedupedByIdentity(t *testing.T) {
 	}
 }
 
+// An events aggregate row is a count, not an event, so the union's
+// verbatim-record key would collapse two backends' identical rows into one.
+func TestHandler_EventsAggregatesAreCombined(t *testing.T) {
+	a := newFakeBackend(t, `[]`, `[]`)
+	a.bodies[eventsPath] = `[{"count":5}]`
+	b := newFakeBackend(t, `[]`, `[]`)
+	b.bodies[eventsPath] = `[{"count":5}]`
+	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic))
+
+	rec := doGet(t, srv.Handler(), eventsPath, `["extract",[["function","count"]]]`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+	}
+	if got := counts(t, rec.Body.Bytes(), "count"); !slices.Equal(got, []float64{10}) {
+		t.Errorf("count = %v, want [10]; the identical rows were deduped instead of added", got)
+	}
+}
+
+func TestHandler_EventsGroupedAggregatesCombinePerKey(t *testing.T) {
+	a := newFakeBackend(t, `[]`, `[]`)
+	a.bodies[eventsPath] = `[{"status":"success","count":5,"max":7},{"status":"failure","count":1,"max":2}]`
+	b := newFakeBackend(t, `[]`, `[]`)
+	b.bodies[eventsPath] = `[{"status":"success","count":5,"max":3}]`
+	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic))
+
+	const q = `["extract",[["function","count"],["function","max","line"],"status"],["group_by","status"]]`
+	rec := doGet(t, srv.Handler(), eventsPath, q)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+	}
+	if got := counts(t, rec.Body.Bytes(), "count"); !slices.Equal(got, []float64{10, 1}) {
+		t.Errorf("counts = %v, want [10 1]", got)
+	}
+	if got := counts(t, rec.Body.Bytes(), "max"); !slices.Equal(got, []float64{7, 2}) {
+		t.Errorf("max = %v, want [7 2]; the column was combined by the wrong operation", got)
+	}
+}
+
 func TestHandler_ReportSubResourceFromHoldingBackend(t *testing.T) {
 	// Only a holds report r1, so its logs come from a; an unmerged pass-through
 	// to whichever backend answered first could have 404'd.

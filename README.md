@@ -30,7 +30,7 @@ not PQL) is forwarded verbatim.
 | `GET /pdb/query/v4/fact-names` | Fan out to all and serve the **union** of the flat name arrays, deduped and re-sorted, re-paged across backends, plus the `pdbmux_source` name while injection is on. `order_by` is only valid on `name`. |
 | `GET /pdb/query/v4/resources` | An `extract` query with a `function` column is fanned out and **combined**; any other query is an unmerged pass-through. |
 | `GET /pdb/query/v4/reports` | Fan out to all and serve the **union**, deduped by report `hash`, re-ordered and re-paged across backends. |
-| `GET /pdb/query/v4/events` | Fan out to all and serve the **union**, deduped by record identity, re-ordered and re-paged. |
+| `GET /pdb/query/v4/events` | Fan out to all and serve the **union**, deduped by record identity, re-ordered and re-paged. An `extract` query with a `function` column is **combined** instead. |
 | `GET /pdb/query/v4/event-counts` | Fan out to all and **sum** each subject's counts into one row per subject. |
 | `GET /pdb/query/v4/aggregate-event-counts` | Fan out to all and **sum** the summary object's counts. |
 | `GET /pdb/query/v4/reports/<hash>/{events,logs,metrics}` | Ask every backend; serve the answer from whichever backend actually holds that report. `404` when none does. |
@@ -89,14 +89,14 @@ paths add two more headers `pdbmux` sets itself, `X-Cache` and `Age` — see
 - **Aggregates** — `extract`/`group_by` rows are counts, not records, so each
   backend returns a partial answer that has to be **combined**, not deduped. This
   covers `/event-counts`, `/aggregate-event-counts`, and any `/reports`,
-  `/nodes`, `/resources`, `/facts` or `/facts/<name>[/<value>]` query whose
-  `extract` carries a `["function", ...]` column.
+  `/events`, `/nodes`, `/resources`, `/facts` or `/facts/<name>[/<value>]` query
+  whose `extract` carries a `["function", ...]` column.
   - The grouping key is the row's full set of non-aggregate columns: for
-    `/reports`, `/nodes`, `/resources`, `/facts` and `/facts/<name>` they come
-    from the query — the plain `extract` fields, the row-function columns and
-    any `group_by` clause — and for the event-count endpoints from the row
-    itself (`subject_type`/`subject`, or `summarize_by`), whose remaining fields
-    are all counts.
+    `/reports`, `/events`, `/nodes`, `/resources`, `/facts` and `/facts/<name>`
+    they come from the query — the plain `extract` fields, the row-function
+    columns and any `group_by` clause — and for the event-count endpoints from
+    the row itself (`subject_type`/`subject`, or `summarize_by`), whose
+    remaining fields are all counts.
   - On `/nodes`, `/facts` and `/facts/<name>[/<value>]` this takes precedence
     over the `certname` merge: an aggregate row has no `certname`, so deduping
     would collapse every backend's rows into one backend's numbers. A query with
@@ -157,8 +157,9 @@ paths add two more headers `pdbmux` sets itself, `X-Cache` and `Age` — see
     fetched and the window cut after the fold, which an aggregate's row count —
     one per distinct group value — keeps affordable. `include_total` still
     reports the merged group count.
-  - A `/reports` query with no `function` column is a projection of real reports,
-    not an aggregate, and stays on the union path.
+  - A `/reports` or `/events` query with no `function` column is a projection of
+    real records, not an aggregate, and stays on the union path — so an event
+    stored identically in two backends is still served once.
   - `include_total=true` on a combined endpoint reports the **merged** row count,
     not the sum of the backends' `X-Records`, since shared keys collapse.
 

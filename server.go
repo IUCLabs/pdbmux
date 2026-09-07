@@ -151,18 +151,13 @@ var queryRoutes = []route{
 	// /resources has no cross-backend record identity, so only its aggregates merge.
 	{name: resourcesPath, matches: pathIs(resourcesPath), fanOut: resourcesPath, serve: (*Server).proxyUnmerged},
 	{name: reportsPath, matches: pathIs(reportsPath), fanOut: reportsPath, serve: (*Server).serveReports},
+	{name: eventsPath, matches: pathIs(eventsPath), fanOut: eventsPath, serve: (*Server).serveEvents},
 	{name: factsPath + "/<name>", matches: isFactsSubPath, serve: (*Server).serveFactsByName},
 	{
 		name:     factNamesPath,
 		matches:  pathIs(factNamesPath),
 		serve:    (*Server).serveFactNames,
 		unsummed: "the union dedupes names across backends, so a count of it is not the sum of the backends' counts",
-	},
-	{
-		name:     eventsPath,
-		matches:  pathIs(eventsPath),
-		serve:    (*Server).serveEvents,
-		unsummed: "unioned on the verbatim record; summing aggregates here would change what the route answers, so it is a change of its own",
 	},
 	{
 		name:     eventCountsPath,
@@ -452,6 +447,11 @@ func (s *Server) serveReports(w http.ResponseWriter, r *http.Request) {
 	s.serveUnion(w, r, reportsPath, reportKey)
 }
 
+// Only a plain query reaches here: openvoxdb serves events from the same generic
+// query engine as every other entity, so an extract carrying a ["function", ...]
+// column is an aggregate handleQuery has already diverted —
+// src/puppetlabs/puppetdb/http/handlers.clj:178-189 and
+// src/puppetlabs/puppetdb/query_eng/engine.clj:1120-1210,1889-1911,2719-2733.
 func (s *Server) serveEvents(w http.ResponseWriter, r *http.Request) {
 	s.serveUnion(w, r, eventsPath, rawKey)
 }
