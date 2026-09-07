@@ -769,12 +769,7 @@ func TestHandler_DisconnectedRequestsDoNotPinBackends(t *testing.T) {
 	srv, _ := newCachedServer(t, cfg)
 	h := srv.Handler()
 
-	// Keep-alive plumbing outlives the requests, so the transport is ours to shut
-	// down before counting goroutines.
-	transport := &http.Transport{}
-	srv.client.Transport = transport
-
-	baseline := runtime.NumGoroutine()
+	baseline, _ := goroutinesRunning(flightFrame, fanOutFrame)
 	const callers = 25
 	var wg sync.WaitGroup
 	start := time.Now()
@@ -802,8 +797,7 @@ func TestHandler_DisconnectedRequestsDoNotPinBackends(t *testing.T) {
 	// nothing to release, so one release per caller is the floor.
 	waitForReleases(t, aborted, callers, start.Add(cfg.Timeout/2))
 	assertNoFlights(t, &srv.flights)
-	transport.CloseIdleConnections()
-	assertGoroutinesSettle(t, baseline, 2)
+	assertGoroutinesSettle(t, baseline, flightFrame, fanOutFrame)
 }
 
 // waitForReleases fails unless at least want backend requests were released by
@@ -1010,7 +1004,7 @@ func TestFlightGroup_LeaderLeavingKeepsFlightAliveForWaiter(t *testing.T) {
 // goroutines behind.
 func TestFlightGroup_HammerRandomCancellations(t *testing.T) {
 	var g flightGroup
-	baseline := runtime.NumGoroutine()
+	baseline, _ := goroutinesRunning(flightFrame)
 
 	const callers = 400
 	var wg sync.WaitGroup
@@ -1040,7 +1034,7 @@ func TestFlightGroup_HammerRandomCancellations(t *testing.T) {
 	wg.Wait()
 
 	assertNoFlights(t, &g)
-	assertGoroutinesSettle(t, baseline, 2)
+	assertGoroutinesSettle(t, baseline, flightFrame)
 }
 
 func waiterMustNotBuild(t *testing.T) func(context.Context) (cachedResponse, error) {
@@ -1061,18 +1055,61 @@ func assertNoFlights(t *testing.T, g *flightGroup) {
 	}
 }
 
+// The goroutines these leak assertions own. Counting stacks that name them
+// rather than every goroutine in the process keeps the assertions valid under
+// -tags e2e, where the harness holds a live server, its prober and a pile of
+// testcontainers goroutines open for the whole binary. Method expressions rather
+// than literals, so renaming one of these breaks the build instead of quietly
+// matching nothing.
+var (
+	flightFrame = frameName((*flightGroup).run)
+	fanOutFrame = frameName((*Server).fanOutTo)
+	proberFrame = frameName((*prober).loop)
+)
+
+// frameName is how fn is spelled in a stack trace. A goroutine started from a
+// closure inside fn carries the same name with a ".funcN" suffix, so matching on
+// this as a substring covers both.
+func frameName(fn any) string {
+	return strings.TrimSuffix(runtime.FuncForPC(reflect.ValueOf(fn).Pointer()).Name(), "-fm")
+}
+
+// goroutinesRunning returns how many live goroutines have one of frames on their
+// stack, plus those stacks.
+func goroutinesRunning(frames ...string) (int, string) {
+	buf := make([]byte, 1<<16)
+	for {
+		n := runtime.Stack(buf, true)
+		if n < len(buf) {
+			buf = buf[:n]
+			break
+		}
+		buf = make([]byte, 2*len(buf))
+	}
+	var count int
+	var matched strings.Builder
+	for stack := range strings.SplitSeq(string(buf), "\n\n") {
+		if !slices.ContainsFunc(frames, func(f string) bool { return strings.Contains(stack, f) }) {
+			continue
+		}
+		count++
+		matched.WriteString(stack + "\n\n")
+	}
+	return count, matched.String()
+}
+
 // Goroutines unwind after their caller returns, so settling is polled rather
 // than sampled once.
-func assertGoroutinesSettle(t *testing.T, baseline, slack int) {
+func assertGoroutinesSettle(t *testing.T, baseline int, frames ...string) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		got := runtime.NumGoroutine()
-		if got <= baseline+slack {
+		got, stacks := goroutinesRunning(frames...)
+		if got <= baseline {
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Errorf("goroutines = %d, want back near the baseline of %d", got, baseline)
+			t.Errorf("%d goroutines in %v, want back to the baseline of %d:\n%s", got, frames, baseline, stacks)
 			return
 		}
 		time.Sleep(10 * time.Millisecond)
