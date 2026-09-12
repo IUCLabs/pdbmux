@@ -34,6 +34,7 @@ not PQL) is forwarded verbatim.
 | `GET /pdb/query/v4/event-counts` | Fan out to all and **sum** each subject's counts into one row per subject. |
 | `GET /pdb/query/v4/aggregate-event-counts` | Fan out to all and **sum** the summary object's counts. |
 | `GET /pdb/query/v4/reports/<hash>/{events,logs,metrics}` | Ask every backend; serve the answer from whichever backend actually holds that report. `404` when none does. |
+| `GET /pdb/query/v4/{nodes,factsets,catalogs}/<certname>[/...]` | Ask the backend that owns that `certname` — the same owner the `/facts` merge attributes records to — and serve its reply verbatim. The remaining backends are tried after it, so a node only one backend holds is still served, and openvoxdb's own `404` body is replayed when none holds it. |
 | `GET /pdb/query/v4/*` (any other) | No merge rule, so backends are tried in configured order and the first success is streamed back verbatim; if all reject it, the first upstream error response is replayed. |
 | `GET /pdb/meta/v1/version` | Fan out to all and report the **lowest** version any backend runs. |
 | `GET /pdb/meta/v1/server-time` | Fan out to all and serve the first reachable backend's clock. |
@@ -264,11 +265,12 @@ such a query correctly for every operator (`not`, `or`, subqueries) and does not
 pretend to for some. Read the fact from an unfiltered (or `certname`-filtered)
 `/facts` response, from the path route above, and filter client-side.
 
-**Not covered:** `/factsets` and `/inventory`. Both carry facts, but `pdbmux`
-does not merge either today — they take the unmerged pass-through path, where
-the answer comes from whichever backend replied first rather than from a merge
-winner, so there is no owner to attribute. Injecting there would state a
-provenance that isn't true.
+**Not covered:** `/factsets`, `/inventory` and the per-certname routes. The
+first two carry facts but are not merged today — they take the unmerged
+pass-through path, where the answer comes from whichever backend replied first
+rather than from a merge winner, so there is no owner to attribute. The
+per-certname routes do resolve to an owner, but their bodies are passed through
+verbatim rather than rebuilt, so nothing is added to them either.
 
 ### Metadata and metrics
 

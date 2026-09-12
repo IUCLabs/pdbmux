@@ -177,6 +177,12 @@ var queryRoutes = []route{
 		serve:    (*Server).serveFirstHolder,
 		unsummed: "one backend holds the report, so nothing is merged across backends",
 	},
+	{
+		name:     certnameRouteName,
+		matches:  isCertnameRoute,
+		serve:    (*Server).serveByOwner,
+		unsummed: "one certname's own data, from the backend that owns it; nothing is merged across backends",
+	},
 }
 
 // unmergedRoute answers every path no merged route claims.
@@ -907,8 +913,13 @@ func (s *Server) queryBackend(ctx context.Context, b Backend, path string, param
 
 // The record shape is unknown, so a union would be guesswork: the first 2xx wins and the first error response is replayed when none succeeds.
 func (s *Server) proxyUnmerged(w http.ResponseWriter, r *http.Request) {
+	s.proxyOrdered(w, r, s.cfg.Backends)
+}
+
+// proxyOrdered asks backends in the given order, which is what decides the answer when more than one of them holds the path.
+func (s *Server) proxyOrdered(w http.ResponseWriter, r *http.Request, backends []Backend) {
 	var fallback *bufferedResponse
-	for _, b := range s.cfg.Backends {
+	for _, b := range backends {
 		resp, err := s.passThrough(r, b)
 		if err != nil {
 			s.log.Printf("warning: backend %q pass-through failed for %s: %v", b.Name, r.URL.Path, err)

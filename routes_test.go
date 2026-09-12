@@ -21,6 +21,7 @@ var aggregateProbes = map[string]string{
 	eventCountsPath:               eventCountsPath,
 	aggregateEventCountsPath:      aggregateEventCountsPath,
 	reportsPath + "/<hash>/<sub>": reportsPath + "/abc123/events",
+	certnameRouteName:             nodesPath + "/h1/facts",
 }
 
 func TestQueryRoutes_EveryRouteIsProbed(t *testing.T) {
@@ -107,6 +108,7 @@ func TestQueryRoutes_UnsummedRoutesAreTheKnownOnes(t *testing.T) {
 		eventCountsPath,
 		factNamesPath,
 		reportsPath + "/<hash>/<sub>",
+		certnameRouteName,
 	}
 	var got []string
 	for _, rt := range queryRoutes {
