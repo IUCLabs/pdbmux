@@ -32,11 +32,6 @@ const (
 	// PuppetDB only sends this when the request carries include_total=true.
 	recordsHeader = "X-Records"
 
-	// Set by pdbmux, not by PuppetDB: how a cache-backed response was answered
-	// and how old the served copy is.
-	cacheStatusHeader = "X-Cache"
-	ageHeader         = "Age"
-
 	// Set by pdbmux: "<contributed>/<configured>" backends behind a merged response.
 	backendsHeader = "X-Backends"
 )
@@ -61,16 +56,17 @@ type Server struct {
 	client *http.Client
 	log    *log.Logger
 
-	// factsCache is nil when caching is disabled; cacheFor hands out a noop then.
-	factsCache Cache
-	flights    flightGroup
-	stale      staleTracker
+	// nodeCache is nil when caching is disabled; cacheFor hands out a noop then.
+	nodeCache Cache
+	flights   flightGroup
+	stale     staleTracker
 
 	// health is nil when probing is disabled, which makes every backend healthy.
 	health  *prober
 	partial partialTracker
 
-	// now is shared with the cache's clock so Age matches the stored timestamp.
+	// now is shared with the cache's clock so a stale fallback is reported
+	// against the same timestamps the cache stamps entries with.
 	now func() time.Time
 
 	// freshness cache (freshness merge only).
@@ -88,7 +84,7 @@ func NewServer(cfg Config, logger *log.Logger) *Server {
 		now:    time.Now,
 	}
 	if cfg.cacheEnabled() {
-		s.factsCache = newMemoryCache(cfg.FactsTTL, cfg.CacheBytes)
+		s.nodeCache = newMemoryCache(cfg.FactsTTL, cfg.CacheBytes)
 	}
 	s.health = newProber(cfg, logger)
 	return s
@@ -101,20 +97,21 @@ func (s *Server) StartProbes(ctx context.Context) { s.health.Start(ctx) }
 // StopProbes stops the probing goroutines and waits for them to exit.
 func (s *Server) StopProbes() { s.health.Stop() }
 
-// cacheFor picks the cache backing a request. The merged /nodes and fact record
-// sets — /facts, /facts/<name>[/<value>] and /fact-names — share the in-memory
-// cache; every other path is uncached until the reports cache lands, and a new
-// backend is a case here rather than a change to any handler.
+// cacheFor picks the cache backing a request. Only the merged /nodes record set
+// is cached: its report columns move once per node run, while fact answers must
+// be as current as a backend's own, so no fact-serving path is cached here.
+// Every other path is uncached until the reports cache lands, and a new backend
+// is a case here rather than a change to any handler.
 func (s *Server) cacheFor(path string, params url.Values) (Cache, bool) {
-	switch {
-	case path == factsPath, path == nodesPath, path == factNamesPath, isFactsSubPath(path):
+	switch path {
+	case nodesPath:
 		// An aggregate row is a combined count, not the merged record set the
 		// cache was built for, so it stays on the live path.
 		if spec, err := parseAggregate(params.Get("query")); spec != nil || err != nil {
 			return noopCache{}, false
 		}
-		if s.factsCache != nil {
-			return s.factsCache, true
+		if s.nodeCache != nil {
+			return s.nodeCache, true
 		}
 	}
 	return noopCache{}, false
@@ -595,10 +592,9 @@ type cachedResponse struct {
 	Configured int             `json:"configured"` // backends configured at build time
 }
 
-// recordFilter narrows a response's records after it has been built or read back
-// from the cache, so requests differing only in the filter share one stored entry
-// and one fan-out. It leaves Records alone, so it only suits responses that set
-// no X-Records.
+// recordFilter narrows a response's records after it has been built, so a route
+// that answers from another path's merge can pin part of it per request. It
+// leaves Records alone, so it only suits responses that set no X-Records.
 type recordFilter func([]json.RawMessage) []json.RawMessage
 
 func (f recordFilter) apply(resp cachedResponse) cachedResponse {
@@ -644,7 +640,7 @@ func (s *Server) serveFiltered(w http.ResponseWriter, r *http.Request, path stri
 		s.log.Printf("warning: cache lookup for %s failed: %v", key, err)
 	case status == CacheFresh:
 		s.stale.markFresh()
-		s.writeStored(w, ent, CacheFresh, filter)
+		s.writeStored(w, ent, filter)
 		return
 	case status == CacheStale:
 		stale = &ent
@@ -687,14 +683,13 @@ func (s *Server) serveFiltered(w http.ResponseWriter, r *http.Request, path stri
 			s.stale.markStale(s.now())
 			s.log.Printf("warning: serving stale %s from cache (stored %s): %v",
 				path, stale.StoredAt.UTC().Format(time.RFC3339), err)
-			s.writeStored(w, *stale, CacheStale, filter)
+			s.writeStored(w, *stale, filter)
 			return
 		}
 		s.writeUpstreamError(w, err)
 		return
 	}
 	s.stale.markFresh()
-	s.setCacheHeaders(w, CacheMiss, time.Time{})
 	writeCached(w, filter.apply(resp))
 }
 
@@ -707,37 +702,17 @@ func (s *Server) flightTimeout() time.Duration {
 	return defaultTimeout
 }
 
-func (s *Server) writeStored(w http.ResponseWriter, ent CacheEntry, status CacheStatus, filter recordFilter) {
+// writeStored answers from a cache entry. Whether a response came from the cache
+// is deliberately invisible to the client: PuppetDB sets no X-Cache or Age, so
+// neither does pdbmux, and /healthz carries the cache state instead.
+func (s *Server) writeStored(w http.ResponseWriter, ent CacheEntry, filter recordFilter) {
 	var resp cachedResponse
 	if err := json.Unmarshal(ent.Body, &resp); err != nil {
 		s.log.Printf("warning: unreadable cache entry: %v", err)
 		http.Error(w, "unreadable cache entry", http.StatusBadGateway)
 		return
 	}
-	s.setCacheHeaders(w, status, ent.StoredAt)
 	writeCached(w, filter.apply(resp))
-}
-
-// setCacheHeaders labels a response from a cache-backed path: X-Cache is
-// hit/stale/miss and Age is whole seconds since the served copy was stored (0
-// for a response built by this request). It reads the same clock the cache
-// stamps entries with, so the two never disagree.
-func (s *Server) setCacheHeaders(w http.ResponseWriter, status CacheStatus, storedAt time.Time) {
-	label := "miss"
-	switch status {
-	case CacheFresh:
-		label = "hit"
-	case CacheStale:
-		label = "stale"
-	}
-	age := 0
-	if !storedAt.IsZero() {
-		if secs := int(s.now().Sub(storedAt).Seconds()); secs > 0 {
-			age = secs
-		}
-	}
-	w.Header().Set(cacheStatusHeader, label)
-	w.Header().Set(ageHeader, strconv.Itoa(age))
 }
 
 func writeCached(w http.ResponseWriter, resp cachedResponse) {
@@ -1033,8 +1008,8 @@ type cacheHealth struct {
 func (s *Server) cacheHealth() cacheHealth {
 	stats := CacheStats{Backend: "none"}
 	ttl := time.Duration(0)
-	if s.factsCache != nil {
-		stats = s.factsCache.Stats()
+	if s.nodeCache != nil {
+		stats = s.nodeCache.Stats()
 		ttl = s.cfg.FactsTTL
 	}
 	serving, served, last := s.stale.snapshot()

@@ -59,7 +59,7 @@ type Config struct {
 	Merge        string        `yaml:"merge"`
 	Timeout      time.Duration `yaml:"timeout"`
 	FreshnessTTL time.Duration `yaml:"freshness_ttl"`
-	FactsTTL     time.Duration `yaml:"facts_ttl"`         // 0 disables the /facts+/nodes cache
+	FactsTTL     time.Duration `yaml:"facts_ttl"`         // 0 disables the merged /nodes cache
 	CacheBytes   int64         `yaml:"facts_cache_bytes"` // byte budget for that cache
 
 	SourceFact        string `yaml:"source_fact"`
@@ -344,8 +344,8 @@ func (c Config) Validate() error {
 	return nil
 }
 
-// cacheEnabled reports whether a facts/nodes cache should be built: both a TTL
-// and a byte budget are required.
+// cacheEnabled reports whether the merged /nodes cache should be built: both a
+// TTL and a byte budget are required.
 func (c Config) cacheEnabled() bool { return c.FactsTTL > 0 && c.CacheBytes > 0 }
 
 func writeDefaultConfig(path string) error {
@@ -366,8 +366,8 @@ func writeDefaultConfig(path string) error {
 		"#   PDBMUX_HEALTH_PROBE_ENABLED, PDBMUX_HEALTH_PROBE_PATH,\n" +
 		"#   PDBMUX_HEALTH_PROBE_INTERVAL, PDBMUX_HEALTH_PROBE_TIMEOUT,\n" +
 		"#   PDBMUX_HEALTH_PROBE_FAILURES, PDBMUX_HEALTH_PROBE_SUCCESSES.\n" +
-		"# facts_ttl caches merged /facts and /nodes in memory; it is capped at 30s\n" +
-		"# (a larger value is clamped) and 0 disables the cache.\n" +
+		"# facts_ttl caches merged /nodes in memory; it is capped at 30s (a larger\n" +
+		"# value is clamped) and 0 disables the cache. Fact answers are never cached.\n" +
 		"# health_probe_* polls each backend's status endpoint so queries skip a\n" +
 		"# backend that is down; when every backend is down all are queried anyway.\n\n")
 	if err := os.WriteFile(path, append(header, data...), 0o644); err != nil {

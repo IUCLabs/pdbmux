@@ -75,9 +75,10 @@ reporting their own fault, so it is replayed just as faithfully but still counts
 as a failed round and still falls back to a stale cache entry where there is one.
 
 Responses carry PuppetDB's `X-Records` when the query asked for a total, and on
-the merged paths `X-Backends` (see [Backend health](#backend-health)). Cached
-paths add two more headers `pdbmux` sets itself, `X-Cache` and `Age` — see
-[Caching](#caching).
+the merged paths `X-Backends` (see [Backend health](#backend-health)). Successful
+query responses carry PuppetDB's own `Content-Type: application/json;charset=utf-8`.
+Nothing tells a client whether a response came from the cache: PuppetDB sets no
+`X-Cache` or `Age`, so neither does `pdbmux` — see [Caching](#caching).
 
 ## Merge semantics
 
@@ -258,7 +259,7 @@ record of that name, so the route does not serve its own fan-out: it takes the
 records from the `/facts` merge that produces them, which makes the `certname`
 set, the owner and the `environment` identical to the ones an unfiltered `/facts`
 response reports, and lets the request's own `query` narrow the result upstream.
-That costs one `/facts` fan-out per cache miss — the widest fan-out `pdbmux`
+That costs one `/facts` fan-out per request — the widest fan-out `pdbmux`
 makes — on a rare, user-initiated path.
 
 `/facts/pdbmux_source/<value>` pins the backend name, so it answers with the
@@ -419,8 +420,8 @@ not answering.
   asked, never what a merged answer means: a response built from a subset is
   still served, as before. Every merged response carries `X-Backends:
   <contributed>/<configured>` naming how many backends' records went into it, so
-  a client can tell a full answer from a partial one. On a cache hit the header
-  describes the stored body, not the current backend count.
+  a client can tell a full answer from a partial one. On a `/nodes` cache hit the
+  header describes the stored body, not the current backend count.
 - **`/healthz`** gives each backend a `state` (`healthy`, `unhealthy`,
   `probe_unsupported`, `unprobed`, or `unmonitored` when probing is off),
   `consecutive_failures`,
@@ -440,21 +441,27 @@ not answering.
 
 ## Caching
 
-`pdbmux` caches merged `/nodes`, `/facts`, `/facts/<name>[/<value>]` and
-`/fact-names` record sets **in memory** so a busy Puppetboard does not re-fan-out
-the same query every few seconds — its facts overview and fact drilldown are two
-of the pages that hit hardest. Everything else runs uncached — including
-`extract` aggregates on those paths, and
-the `/pdb/meta/v1/*` and `/metrics/*` endpoints, which are served live on every
-request. The cache is an interface, and `/reports` gets its own (S3-backed)
-backend later without further handler changes.
+`pdbmux` caches the merged `/nodes` record set **in memory** so a busy
+Puppetboard does not re-fan-out the node list every few seconds. Its report
+columns only move when a node finishes a run, so a `30s` answer is a `30s`-old
+report timestamp and nothing else.
+
+**No fact-serving path is cached.** `/facts`, `/facts/<name>[/<value>]`,
+`/fact-names`, `/factsets*`, `/nodes/<certname>/facts`, `/fact-contents`,
+`/fact-paths` and `/inventory` all fan out on every request, so a fact answer is
+exactly as current as the backend's own. Cache fact data client-side if you want
+it cached. Everything else runs uncached too — including `extract` aggregates on
+`/nodes`, and the `/pdb/meta/v1/*` and `/metrics/*` endpoints. The cache is an
+interface, and `/reports` gets its own (S3-backed) backend later without further
+handler changes.
 
 - **Key** — `<path>?<params>`, where the params are the ones that actually
   determine the response, URL-encoded with keys sorted ascending and a repeated
   param's values sorted ascending. Param order in the request is therefore
   irrelevant: one canonical key per distinct request. A request with no params
   keys on the bare path.
-- **TTL** — `facts_ttl`, default `30s`, **hard cap `30s`**. A larger configured
+- **TTL** — `facts_ttl` (the key predates the cache narrowing to `/nodes`),
+  default `30s`, **hard cap `30s`**. A larger configured
   value is **clamped** down to the cap, not rejected, so a stray env var cannot
   crash-loop a container; `pdbmux config show` prints
   `facts_ttl : 30s (clamped from 600s, cap 30s)` when that happens. `facts_ttl: 0`
@@ -478,29 +485,20 @@ backend later without further handler changes.
   client goes away leaves the flight running for the others. The flight is
   cancelled once its last participant leaves, so a lone client disconnecting
   releases the upstream connections straight away.
-- **Response headers** — every response on a cached path carries `X-Cache`
-  (`hit` served from a fresh entry, `miss` built by this request, `stale` the
-  expired-entry fallback) and `Age` in whole seconds since the served copy was
-  stored (`0` on a `miss`). Uncached paths carry neither.
+- **Invisible to clients** — a cached response is byte-for-byte a live one, with
+  the same headers. PuppetDB emits no `X-Cache` and no `Age`, so neither does
+  `pdbmux`; read the cache state off `/healthz` instead.
 - **Visibility** — `/healthz` carries a `cache` object: `backend`
   (`memory`/`none`), `ttl`, `entries`, `stale_entries`, `bytes`, `serving_stale`,
   `stale_served` and `last_stale_served`. `serving_stale` is `true` from the
   moment a stale fallback is served until the next response comes from a live
   fan-out or a fresh entry.
-- **Provenance is stored, not re-applied** — what a cache entry holds is the
-  fully merged body, `pdbmux_source` already injected and upstream records of
-  that name already dropped. Attribution names the backend that supplied the
-  data, which is a property of that fetch, so it stays correct for as long as the
-  body does and ages out with it — `X-Cache` and `Age` say how old both are. Two
-  requests can only share an entry when they share a key, and the key is path
-  plus query, which is exactly what decides whether injection applies; a
-  name-filtered `/facts` query and a plain one therefore cache separately and
-  neither is ever served the other's shape. The one path that keys on less than
-  it is asked is the `pdbmux_source` drilldown, whose `<value>` is dropped from
-  the key and applied to the shared entry instead. `source_fact` and
-  `source_fact_enabled` are read once at startup, and the cache lives for the
-  same process, so changing either cannot leave differently-shaped entries
-  behind.
+- **Merged bodies are stored, not re-merged** — an entry holds the fully merged
+  `/nodes` body, `pdbmux_source` already stamped on, and the
+  `X-Records`/`X-Backends` it was built with, so a hit reproduces all three.
+  Attribution is a property of that fetch, so it stays correct for as long as the
+  body does and ages out with it. Two requests share an entry only when they
+  share a key, and the key is path plus query.
 
 ## Config
 
@@ -526,7 +524,7 @@ backends:                          # order is a tie-break only, not a ranking
 merge: freshness             # freshness | static
 timeout: 10s                 # per-upstream request timeout
 freshness_ttl: 30s           # freshness-map cache TTL (freshness merge only)
-facts_ttl: 30s               # /facts + /nodes response cache TTL; 0 disables, capped at 30s
+facts_ttl: 30s               # merged /nodes response cache TTL; 0 disables, capped at 30s
 facts_cache_bytes: 67108864  # byte budget for that cache (64 MiB), LRU-evicted
 source_fact: pdbmux_source   # name of the synthetic provenance fact
 source_fact_enabled: true    # false serves backends' records untouched

@@ -371,18 +371,18 @@ func TestHandler_RejectedQueryIsNotCached(t *testing.T) {
 	b.reject, b.rejectBody = http.StatusBadRequest, badOrderBy
 	srv, _ := newCachedServer(t, cacheTestConfig(a.srv.URL, b.srv.URL))
 
-	rec := doGet(t, srv.Handler(), factsPath, "")
+	rec := doGet(t, srv.Handler(), nodesPath, "")
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want the upstream 400 replayed: %s", rec.Code, rec.Body.String())
 	}
-	if n := srv.factsCache.Stats().Entries; n != 0 {
+	if n := srv.nodeCache.Stats().Entries; n != 0 {
 		t.Fatalf("cache holds %d entries after a rejected query", n)
 	}
 
 	// The rejection left nothing behind, so the next good query is served fresh.
 	a.reject, b.reject = 0, 0
-	a.factsBody = `[` + fact("h1", "role", "web", "") + `]`
-	ok := doGet(t, srv.Handler(), factsPath, "")
+	a.nodesBody = `[` + node("web", "2026-01-01T00:00:00.000Z") + `]`
+	ok := doGet(t, srv.Handler(), nodesPath, "")
 	if ok.Code != http.StatusOK || !strings.Contains(ok.Body.String(), "web") {
 		t.Fatalf("follow-up = %d %s", ok.Code, ok.Body.String())
 	}
@@ -394,10 +394,10 @@ func TestHandler_AllBackendsFailedIsNotCached(t *testing.T) {
 	a.dead, b.dead = true, true
 	srv, _ := newCachedServer(t, cacheTestConfig(a.srv.URL, b.srv.URL))
 
-	if rec := doGet(t, srv.Handler(), factsPath, ""); rec.Code != http.StatusBadGateway {
+	if rec := doGet(t, srv.Handler(), nodesPath, ""); rec.Code != http.StatusBadGateway {
 		t.Fatalf("status = %d, want 502", rec.Code)
 	}
-	if n := srv.factsCache.Stats().Entries; n != 0 {
+	if n := srv.nodeCache.Stats().Entries; n != 0 {
 		t.Fatalf("cache holds %d entries after a failed fan-out", n)
 	}
 }
@@ -405,18 +405,18 @@ func TestHandler_AllBackendsFailedIsNotCached(t *testing.T) {
 // Stale records answer an outage. They do not answer a query the estate refused:
 // the client has to be told why, not handed data for a question it did not ask.
 func TestHandler_RejectedQueryIsNotAnsweredFromStale(t *testing.T) {
-	a := newFakeBackend(t, `[]`, `[`+fact("h1", "role", "old", "")+`]`)
+	a := newFakeBackend(t, `[`+node("old", "2026-01-01T00:00:00.000Z")+`]`, `[]`)
 	b := newFakeBackend(t, `[]`, `[]`)
 	srv, clk := newCachedServer(t, cacheTestConfig(a.srv.URL, b.srv.URL))
 
-	if warm := doGet(t, srv.Handler(), factsPath, ""); warm.Code != http.StatusOK {
+	if warm := doGet(t, srv.Handler(), nodesPath, ""); warm.Code != http.StatusOK {
 		t.Fatalf("warm-up status %d", warm.Code)
 	}
 
 	clk.advance(31 * time.Second)
 	a.reject, a.rejectBody = http.StatusBadRequest, badOrderBy
 	b.reject, b.rejectBody = http.StatusBadRequest, badOrderBy
-	rec := doGet(t, srv.Handler(), factsPath, "")
+	rec := doGet(t, srv.Handler(), nodesPath, "")
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want the rejection rather than the stale entry: %s", rec.Code, rec.Body.String())
 	}
@@ -430,16 +430,16 @@ func TestHandler_RejectedQueryIsNotAnsweredFromStale(t *testing.T) {
 
 // An outage still falls back to the stale copy, unchanged by the replay path.
 func TestHandler_OutageStillFallsBackToStale(t *testing.T) {
-	a := newFakeBackend(t, `[]`, `[`+fact("h1", "role", "old", "")+`]`)
+	a := newFakeBackend(t, `[`+node("old", "2026-01-01T00:00:00.000Z")+`]`, `[]`)
 	b := newFakeBackend(t, `[]`, `[]`)
 	srv, clk := newCachedServer(t, cacheTestConfig(a.srv.URL, b.srv.URL))
 
-	if warm := doGet(t, srv.Handler(), factsPath, ""); warm.Code != http.StatusOK {
+	if warm := doGet(t, srv.Handler(), nodesPath, ""); warm.Code != http.StatusOK {
 		t.Fatalf("warm-up status %d", warm.Code)
 	}
 	clk.advance(31 * time.Second)
 	a.fail, b.fail = true, true
-	rec := doGet(t, srv.Handler(), factsPath, "")
+	rec := doGet(t, srv.Handler(), nodesPath, "")
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "old") {
 		t.Fatalf("stale fallback = %d %s", rec.Code, rec.Body.String())
 	}
@@ -652,14 +652,14 @@ func TestHandler_SuccessContentTypeMatchesUpstream(t *testing.T) {
 }
 
 func TestHandler_CachedSuccessContentTypeMatchesUpstream(t *testing.T) {
-	a := newFakeBackend(t, `[]`, `[`+fact("h1", "role", "web", "")+`]`)
+	a := newFakeBackend(t, `[`+node("h1", "2026-07-20T00:00:00Z")+`]`, `[]`)
 	b := newFakeBackend(t, `[]`, `[]`)
 	srv, _ := newCachedServer(t, cacheTestConfig(a.srv.URL, b.srv.URL))
 	h := srv.Handler()
 
 	// The miss builds the entry and the hit replays it; both are the client's view.
 	for _, label := range []string{"miss", "hit"} {
-		rec := doGet(t, h, factsPath, "")
+		rec := doGet(t, h, nodesPath, "")
 		if got := rec.Header().Get("Content-Type"); got != upstreamJSONContentType {
 			t.Errorf("%s Content-Type = %q, want %q", label, got, upstreamJSONContentType)
 		}
