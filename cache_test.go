@@ -61,6 +61,7 @@ type countingBackend struct {
 	hits   map[string]int
 	bodies map[string]string
 	fail   bool
+	dead   bool
 	block  chan struct{}
 }
 
@@ -70,11 +71,14 @@ func newCountingBackend(t *testing.T, bodies map[string]string) *countingBackend
 	cb.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		cb.mu.Lock()
 		cb.hits[r.URL.Path]++
-		fail, block, body := cb.fail, cb.block, cb.bodies[r.URL.Path]
+		fail, dead, block, body := cb.fail, cb.dead, cb.block, cb.bodies[r.URL.Path]
 		cb.mu.Unlock()
 
 		if block != nil {
 			<-block
+		}
+		if dead {
+			panic(http.ErrAbortHandler)
 		}
 		if fail {
 			http.Error(w, "boom", http.StatusInternalServerError)
@@ -106,6 +110,12 @@ func (cb *countingBackend) totalHits() int {
 		n += c
 	}
 	return n
+}
+
+func (cb *countingBackend) setDead(v bool) {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	cb.dead = v
 }
 
 func (cb *countingBackend) setFail(v bool) {
@@ -355,8 +365,8 @@ func TestHandler_ServesStaleOnlyWhenBackendsFail(t *testing.T) {
 func TestHandler_NoCacheEntryMeansBackendFailureIs502(t *testing.T) {
 	a := newCountingBackend(t, map[string]string{nodesPath: `[]`})
 	b := newCountingBackend(t, map[string]string{nodesPath: `[]`})
-	a.setFail(true)
-	b.setFail(true)
+	a.setDead(true)
+	b.setDead(true)
 	srv, _ := newCachedServer(t, cacheTestConfig(a.srv.URL, b.srv.URL))
 
 	rec := doGet(t, srv.Handler(), nodesPath, "")

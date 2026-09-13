@@ -65,7 +65,13 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		writeRaw(w, alive[0])
 		return
 	}
-	w.Header().Set("Content-Type", "application/json")
+	// The merged body is the backends' own payload reshaped, so it keeps their
+	// content type rather than announcing a different one.
+	contentType := alive[0].contentType
+	if contentType == "" {
+		contentType = jsonContentType
+	}
+	w.Header().Set("Content-Type", contentType)
 	_, _ = w.Write(body)
 }
 

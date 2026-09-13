@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -85,13 +86,67 @@ func TestMetaVersion_OneBackendDown(t *testing.T) {
 
 func TestMetaVersion_AllBackendsDown(t *testing.T) {
 	a := newFakeBackend(t, `[]`, `[]`)
-	a.fail = true
+	a.dead = true
 	b := newFakeBackend(t, `[]`, `[]`)
-	b.fail = true
+	b.dead = true
 	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic))
 
 	if rec := metaGet(t, srv.Handler(), metaVersionPath); rec.Code != http.StatusBadGateway {
 		t.Errorf("status %d, want 502", rec.Code)
+	}
+}
+
+// /pdb/meta had its own copy of the gateway error, so a status both backends
+// agreed on never reached the client. It answers failures the way the query
+// routes do now.
+func TestMeta_ReplaysUnanimousUpstreamStatus(t *testing.T) {
+	for _, path := range []string{metaVersionPath, metaServerTimePath} {
+		for _, status := range []int{http.StatusNotFound, http.StatusForbidden, http.StatusInternalServerError} {
+			t.Run(path+"/"+http.StatusText(status), func(t *testing.T) {
+				a := newFakeBackend(t, `[]`, `[]`)
+				b := newFakeBackend(t, `[]`, `[]`)
+				a.reject, a.rejectBody = status, "upstream said no"
+				b.reject, b.rejectBody = status, "upstream said no"
+				srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic))
+
+				rec := metaGet(t, srv.Handler(), path)
+				if rec.Code != status {
+					t.Fatalf("status %d, want the upstream %d: %s", rec.Code, status, rec.Body.String())
+				}
+				if !strings.Contains(rec.Body.String(), "upstream said no") {
+					t.Errorf("body = %q, want the upstream explanation", rec.Body.String())
+				}
+			})
+		}
+	}
+}
+
+func TestMeta_DisagreeingStatusesStay502(t *testing.T) {
+	a := newFakeBackend(t, `[]`, `[]`)
+	b := newFakeBackend(t, `[]`, `[]`)
+	a.reject, a.rejectBody = http.StatusNotFound, "gone"
+	b.reject, b.rejectBody = http.StatusInternalServerError, "boom"
+	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic))
+
+	if rec := metaGet(t, srv.Handler(), metaVersionPath); rec.Code != http.StatusBadGateway {
+		t.Errorf("status %d, want 502 when backends disagree", rec.Code)
+	}
+}
+
+// A replayed body must not name a backend, on /pdb/meta as anywhere else.
+func TestMeta_ReplayedBodyIsRedacted(t *testing.T) {
+	a := newFakeBackend(t, `[]`, `[]`)
+	b := newFakeBackend(t, `[]`, `[]`)
+	a.reject, a.rejectBody = http.StatusInternalServerError, "upstream "+a.srv.URL+" blew up"
+	b.reject, b.rejectBody = http.StatusInternalServerError, "upstream "+b.srv.URL+" blew up"
+	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic))
+
+	rec := metaGet(t, srv.Handler(), metaVersionPath)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status %d, want the upstream 500", rec.Code)
+	}
+	if strings.Contains(rec.Body.String(), hostOf(t, a.srv.URL)) {
+		t.Errorf("replayed body names a backend: %q", rec.Body.String())
 	}
 }
 
