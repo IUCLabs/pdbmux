@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"reflect"
 	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -229,13 +230,64 @@ func TestMetrics_OneBackendDown(t *testing.T) {
 
 func TestMetrics_AllBackendsDown(t *testing.T) {
 	a := newFakeBackend(t, `[]`, `[]`)
-	a.fail = true
+	a.dead = true
 	b := newFakeBackend(t, `[]`, `[]`)
-	b.fail = true
+	b.dead = true
 	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic))
 
 	if rec := metaGet(t, srv.Handler(), numNodesEscaped); rec.Code != http.StatusBadGateway {
 		t.Errorf("status %d, want 502", rec.Code)
+	}
+}
+
+// /metrics/v1/mbeans is a unanimous 404 on this estate and /metrics/v2 a
+// unanimous 403; both used to come back as 502.
+func TestMetrics_ReplaysUnanimousUpstreamStatus(t *testing.T) {
+	for _, status := range []int{http.StatusNotFound, http.StatusForbidden, http.StatusInternalServerError} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			a := newFakeBackend(t, `[]`, `[]`)
+			b := newFakeBackend(t, `[]`, `[]`)
+			a.reject, a.rejectBody = status, "Forbidden request: /metrics/v2/list (method :get)."
+			b.reject, b.rejectBody = status, "Forbidden request: /metrics/v2/list (method :get)."
+			srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic))
+
+			rec := metaGet(t, srv.Handler(), numNodesEscaped)
+			if rec.Code != status {
+				t.Fatalf("status %d, want the upstream %d: %s", rec.Code, status, rec.Body.String())
+			}
+			if !strings.Contains(rec.Body.String(), "Forbidden request") {
+				t.Errorf("body = %q, want the upstream explanation", rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestMetrics_DisagreeingStatusesStay502(t *testing.T) {
+	a := newFakeBackend(t, `[]`, `[]`)
+	b := newFakeBackend(t, `[]`, `[]`)
+	a.reject, a.rejectBody = http.StatusNotFound, "gone"
+	b.reject, b.rejectBody = http.StatusForbidden, "denied"
+	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic))
+
+	if rec := metaGet(t, srv.Handler(), numNodesEscaped); rec.Code != http.StatusBadGateway {
+		t.Errorf("status %d, want 502 when backends disagree", rec.Code)
+	}
+}
+
+// One backend refusing is not the estate's answer, so the other still serves.
+func TestMetrics_OneRefusalStillServesTheOther(t *testing.T) {
+	a := newFakeBackend(t, `[]`, `[]`)
+	b := newFakeBackend(t, `[]`, `[]`)
+	a.reject, a.rejectBody = http.StatusForbidden, "denied"
+	b.bodies[numNodesPath] = `{"request":{},"value":{"Value":7},"status":200}`
+	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic))
+
+	rec := metaGet(t, srv.Handler(), numNodesEscaped)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d, want the surviving backend's 200: %s", rec.Code, rec.Body.String())
+	}
+	if got := metricValue(t, rec.Body.Bytes())["Value"]; got != float64(7) {
+		t.Errorf("Value = %v, want 7", got)
 	}
 }
 
