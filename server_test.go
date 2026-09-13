@@ -29,8 +29,11 @@ type fakeBackend struct {
 	// totals is the X-Records count advertised per path when the request asks
 	// for include_total.
 	totals map[string]int
-	fail   bool          // return 500 for everything
-	delay  time.Duration // artificial latency
+	fail   bool // answer 500 for everything, as a backend admitting a fault
+	// dead aborts the connection instead of answering, standing in for a backend
+	// that is unreachable rather than one that replies badly.
+	dead  bool
+	delay time.Duration // artificial latency
 	// reject answers every request with this status and rejectBody, standing in
 	// for a PuppetDB refusing a query it cannot answer.
 	reject     int
@@ -60,6 +63,9 @@ func newFakeBackend(t *testing.T, nodesBody, factsBody string) *fakeBackend {
 		fb.gotParams[r.URL.Path] = r.URL.Query()
 		fb.rawPaths = append(fb.rawPaths, r.URL.EscapedPath())
 		fb.mu.Unlock()
+		if fb.dead {
+			panic(http.ErrAbortHandler)
+		}
 		if fb.fail {
 			http.Error(w, "boom", http.StatusInternalServerError)
 			return
@@ -285,7 +291,7 @@ func TestHandler_OneBackendDown(t *testing.T) {
 func TestHandler_BothBackendsDown(t *testing.T) {
 	a := newFakeBackend(t, `[]`, `[]`)
 	b := newFakeBackend(t, `[]`, `[]`)
-	a.fail, b.fail = true, true
+	a.dead, b.dead = true, true
 	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic))
 
 	rec := doGet(t, srv.Handler(), nodesPath, "")

@@ -35,45 +35,42 @@ func (e *upstreamError) Error() string {
 	return fmt.Sprintf("HTTP %d: %s", e.status, strings.TrimSpace(string(e.body)))
 }
 
-// clientShaped reports whether a status blames the request rather than the
-// backend or pdbmux itself. openvoxdb answers every bad query with 400 —
-// src/puppetlabs/puppetdb/middleware.clj:98-116 and http.clj:115-129 — and its
-// other 4xx say something a client of pdbmux neither caused nor can fix: 403 is
-// pdbmux's own certificate being refused (middleware.clj:44-58); 404 is either
-// an absent object or an unknown path (http.clj:238-242,
-// middleware.clj:381-398), and which objects a backend holds is the one thing
-// backends are meant to disagree about; 408 and 429 report a backend's timing
-// and capacity. A backend that times out mid-query answers 200 with a truncated
-// body rather than any 4xx (query_eng.clj:463-483), so no timeout reaches here.
+// replayableStatus reports whether a status is an error a backend explained and
+// so can stand as the answer when every backend gave it. Everything from 400 up
+// qualifies, because openvoxdb does not reserve 5xx for its own faults: a
+// malformed query reaches the client as a 400 only when something on the way
+// down happens to throw a class the query engine catches (query_eng.clj:571-583
+// catches IllegalArgumentException and the :puppetlabs.puppetdb.query/invalid
+// ExceptionInfo), and as a 500 otherwise. ["=","name"] is a 400 on /nodes and a
+// 500 with an empty body on /facts, because only the facts entity runs
+// rewrite-fact-query, whose name-constraint does an unguarded (nth clause 2)
+// (engine.clj:2988-3003); a bare string or number for query is a 500 reading
+// "Output of convert-query-params does not match schema" from the schema check
+// in front of the parser. Drawing the line at 500 would replay one of those and
+// swallow the other, which is the route-dependence clients notice.
 //
-// Every 4xx left over blames the request and so is safe to replay, though none
-// is reachable while the fan-out forwards no client header: 406 needs an Accept
-// the query app refuses (http/server.clj:72; must-accept-type in
-// http.clj:136-145 is unwired), and 415 a Content-Encoding on a POST to
-// /commands (middleware.clj:165-178), which pdbmux never proxies.
-func clientShaped(status int) bool {
-	switch status {
-	case http.StatusForbidden, http.StatusNotFound,
-		http.StatusRequestTimeout, http.StatusTooManyRequests:
-		return false
-	}
-	return status >= 400 && status < 500
+// Below 400 nothing is replayed. A 3xx carries its meaning in Location, which
+// the fan-out does not keep, and a non-200 2xx is not an error at all.
+func replayableStatus(status int) bool {
+	return status >= 400
 }
 
-// unanimousClientError returns the rejection to replay when every backend in a
-// fan-out refused the same query with the same client-shaped status, and nil
-// otherwise. Every backend is asked the same question, so unanimity is what
-// distinguishes a bad query from a sick estate: a transport failure, a 5xx, or
-// two backends disagreeing on the status all leave at least one backend whose
-// answer is evidence about the backend rather than about the request.
+// unanimousUpstreamError returns the reply to replay when every backend answered
+// the same request the same way, and nil otherwise. Every backend is asked the
+// same question, so unanimity is what separates the estate's real answer from a
+// sick estate: a transport failure, or two backends disagreeing on the status,
+// leaves at least one backend whose answer is evidence about the backend rather
+// than about the request, and that is what 502 describes.
+//
+// A nil entry stands for a backend that did not answer with an HTTP status at
+// all, which defeats unanimity.
 //
 // The reply returned is the first in configured order, so a client retrying a
 // rejected query is told the same thing every time.
-func unanimousClientError(results []backendResult) *upstreamError {
+func unanimousUpstreamError(errs []*upstreamError) *upstreamError {
 	var first *upstreamError
-	for _, res := range results {
-		var ue *upstreamError
-		if !errors.As(res.err, &ue) || !clientShaped(ue.status) {
+	for _, ue := range errs {
+		if ue == nil || !replayableStatus(ue.status) {
 			return nil
 		}
 		if first == nil {
@@ -85,8 +82,42 @@ func unanimousClientError(results []backendResult) *upstreamError {
 	return first
 }
 
+// upstreamOutcome is the error to answer a fan-out with when it produced
+// nothing: the backends' own unanimous reply where there is one, and pdbmux's
+// gateway error otherwise. Every handler ends here, so no route answers a
+// failure differently from any other.
+func upstreamOutcome(errs []*upstreamError) error {
+	if ue := unanimousUpstreamError(errs); ue != nil {
+		return ue
+	}
+	return errAllBackendsFailed
+}
+
+// backendUpstreamErrors reduces a merged fan-out's results to one entry per
+// backend, nil where the backend answered or failed without a status.
+func backendUpstreamErrors(results []backendResult) []*upstreamError {
+	errs := make([]*upstreamError, len(results))
+	for i, res := range results {
+		var ue *upstreamError
+		if errors.As(res.err, &ue) {
+			errs[i] = ue
+		}
+	}
+	return errs
+}
+
+// clientRefusal reports whether err is a unanimous upstream rejection blaming
+// the request. Only those mean the estate is healthy and the query was wrong,
+// which is why they are neither counted as degraded service nor answered from
+// the cache; a unanimous 5xx is replayed just the same but is the backends
+// reporting their own fault.
+func clientRefusal(err error) bool {
+	var ue *upstreamError
+	return errors.As(err, &ue) && ue != nil && ue.status < 500
+}
+
 // writeUpstreamError answers a fan-out that produced no records. A unanimous
-// client-shaped rejection is replayed with the backend's own status and
+// upstream error is replayed with the backend's own status, content type and
 // explanation; anything else is reported as a gateway failure.
 func (s *Server) writeUpstreamError(w http.ResponseWriter, err error) {
 	var ue *upstreamError
@@ -98,7 +129,7 @@ func (s *Server) writeUpstreamError(w http.ResponseWriter, err error) {
 	if len(strings.TrimSpace(string(body))) == 0 {
 		setContentType(w, "text/plain; charset=utf-8")
 		w.WriteHeader(ue.status)
-		_, _ = fmt.Fprintf(w, "upstream rejected the query: %s\n", http.StatusText(ue.status))
+		_, _ = fmt.Fprintf(w, "every backend answered %d %s\n", ue.status, http.StatusText(ue.status))
 		return
 	}
 	setContentType(w, ue.contentType)

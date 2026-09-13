@@ -72,8 +72,10 @@ func (s *Server) rawBackend(ctx context.Context, b Backend, path, rawQuery strin
 	}
 }
 
-// aliveRaw drops backends that errored or answered non-2xx, writing a 502 and
-// returning ok=false only when none is left.
+// aliveRaw drops backends that errored or answered non-2xx, returning ok=false
+// when none is left. The reply it writes then is the same one the merged query
+// handlers write, so /pdb/meta and /metrics answer a failure exactly as
+// /pdb/query does: a unanimous upstream error replayed, anything else a 502.
 func (s *Server) aliveRaw(w http.ResponseWriter, results []rawResult, path string) ([]rawResult, bool) {
 	var alive []rawResult
 	for _, res := range results {
@@ -84,10 +86,23 @@ func (s *Server) aliveRaw(w http.ResponseWriter, results []rawResult, path strin
 		alive = append(alive, res)
 	}
 	if len(alive) == 0 {
-		http.Error(w, "all backends failed", http.StatusBadGateway)
+		s.writeUpstreamError(w, upstreamOutcome(rawUpstreamErrors(results)))
 		return nil, false
 	}
 	return alive, true
+}
+
+// rawUpstreamErrors reduces a raw fan-out to one entry per backend, nil where
+// the backend answered 2xx or never answered at all.
+func rawUpstreamErrors(results []rawResult) []*upstreamError {
+	errs := make([]*upstreamError, len(results))
+	for i, res := range results {
+		if res.err != nil || res.ok() {
+			continue
+		}
+		errs[i] = newUpstreamError(res.status, res.contentType, res.body)
+	}
+	return errs
 }
 
 func (r rawResult) reason() string {

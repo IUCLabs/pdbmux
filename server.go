@@ -50,6 +50,12 @@ type backendResult struct {
 
 var errAllBackendsFailed = errors.New("all backends failed")
 
+// jsonContentType is the spelling openvoxdb puts on the wire for a query
+// response, charset and all. Its own reader treats the space after the
+// semicolon as insignificant (http.clj:55-66, simple-utf8-ctype?), but a client
+// comparing the raw header must see no difference between pdbmux and a PuppetDB.
+const jsonContentType = "application/json;charset=utf-8"
+
 type Server struct {
 	cfg    Config
 	client *http.Client
@@ -527,11 +533,9 @@ func (s *Server) serveFirstHolder(w http.ResponseWriter, r *http.Request) {
 		alive = append(alive, res)
 	}
 	if len(alive) == 0 {
-		if ue := unanimousClientError(results); ue != nil {
-			s.writeUpstreamError(w, ue)
-			return
-		}
-		http.Error(w, "no backend holds this report", http.StatusNotFound)
+		// Unanimity is the whole answer here too: every backend saying 404 means
+		// nobody holds the report, while one silent backend leaves that unknown.
+		s.writeUpstreamError(w, upstreamOutcome(backendUpstreamErrors(results)))
 		return
 	}
 	for _, res := range alive {
@@ -543,8 +547,8 @@ func (s *Server) serveFirstHolder(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, nil)
 }
 
-// Returns an *upstreamError when every backend refused the query the same way,
-// and errAllBackendsFailed when every backend failed for any other reason.
+// Returns an *upstreamError when every backend answered the same way, and
+// errAllBackendsFailed when every backend failed for any other reason.
 func (s *Server) aliveResults(ctx context.Context, path string, params url.Values) ([]backendResult, error) {
 	results := s.fanOut(ctx, path, params)
 
@@ -554,13 +558,17 @@ func (s *Server) aliveResults(ctx context.Context, path string, params url.Value
 			alive = append(alive, res)
 		}
 	}
+	var unanimous *upstreamError
 	if len(alive) == 0 {
-		// A query every backend refuses identically is the client's mistake, not an
-		// outage, so it is neither logged as one nor counted as degraded service.
-		if ue := unanimousClientError(results); ue != nil {
-			s.log.Printf("info: every backend refused %s: %v", path, ue)
-			return nil, ue
-		}
+		unanimous = unanimousUpstreamError(backendUpstreamErrors(results))
+	}
+	// A query every backend refuses identically is the client's mistake, not an
+	// outage, so it is neither logged as one nor counted as degraded service. A
+	// unanimous 5xx is replayed just as faithfully, but it is the backends
+	// reporting their own fault, so it still counts against service health.
+	if clientRefusal(unanimous) {
+		s.log.Printf("info: every backend refused %s: %v", path, unanimous)
+		return nil, unanimous
 	}
 	for _, res := range results {
 		if res.err != nil {
@@ -569,6 +577,9 @@ func (s *Server) aliveResults(ctx context.Context, path string, params url.Value
 	}
 	s.partial.record(len(alive), len(s.cfg.Backends), s.now())
 	if len(alive) == 0 {
+		if unanimous != nil {
+			return nil, unanimous
+		}
 		return nil, errAllBackendsFailed
 	}
 	return alive, nil
@@ -672,7 +683,7 @@ func (s *Server) serveFiltered(w http.ResponseWriter, r *http.Request, path stri
 		}
 		// A refused query is answered, not degraded, so stale records are no reply
 		// to it: the client has to see why the query was rejected.
-		if stale != nil && !errors.As(err, new(*upstreamError)) {
+		if stale != nil && !clientRefusal(err) {
 			s.stale.markStale(s.now())
 			s.log.Printf("warning: serving stale %s from cache (stored %s): %v",
 				path, stale.StoredAt.UTC().Format(time.RFC3339), err)
@@ -730,7 +741,7 @@ func (s *Server) setCacheHeaders(w http.ResponseWriter, status CacheStatus, stor
 }
 
 func writeCached(w http.ResponseWriter, resp cachedResponse) {
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", jsonContentType)
 	if resp.Records >= 0 {
 		w.Header().Set(recordsHeader, strconv.Itoa(resp.Records))
 	}
@@ -918,11 +929,12 @@ func (s *Server) proxyUnmerged(w http.ResponseWriter, r *http.Request) {
 
 // proxyOrdered asks backends in the given order, which is what decides the answer when more than one of them holds the path.
 func (s *Server) proxyOrdered(w http.ResponseWriter, r *http.Request, backends []Backend) {
-	var fallback *bufferedResponse
+	refusals := make([]*upstreamError, 0, len(backends))
 	for _, b := range backends {
 		resp, err := s.passThrough(r, b)
 		if err != nil {
 			s.log.Printf("warning: backend %q pass-through failed for %s: %v", b.Name, r.URL.Path, err)
+			refusals = append(refusals, nil)
 			continue
 		}
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
@@ -934,27 +946,9 @@ func (s *Server) proxyOrdered(w http.ResponseWriter, r *http.Request, backends [
 		}
 		body, _ := io.ReadAll(resp.Body)
 		_ = resp.Body.Close()
-		if fallback == nil {
-			fallback = &bufferedResponse{
-				status:      resp.StatusCode,
-				contentType: resp.Header.Get("Content-Type"),
-				body:        body,
-			}
-		}
+		refusals = append(refusals, newUpstreamError(resp.StatusCode, resp.Header.Get("Content-Type"), body))
 	}
-	if fallback == nil {
-		http.Error(w, "all backends failed", http.StatusBadGateway)
-		return
-	}
-	setContentType(w, fallback.contentType)
-	w.WriteHeader(fallback.status)
-	_, _ = w.Write(s.redactBackends(fallback.body))
-}
-
-type bufferedResponse struct {
-	status      int
-	contentType string
-	body        []byte
+	s.writeUpstreamError(w, upstreamOutcome(refusals))
 }
 
 func (s *Server) passThrough(r *http.Request, b Backend) (*http.Response, error) {
@@ -1106,7 +1100,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 func writeJSON(w http.ResponseWriter, recs []json.RawMessage) {
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", jsonContentType)
 	if recs == nil {
 		recs = []json.RawMessage{}
 	}

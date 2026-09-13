@@ -47,17 +47,24 @@ Fan-out is concurrent, and goes only to the backends the health prober currently
 believes are up — see [Backend health](#backend-health). If one backend errors or
 times out, `pdbmux` serves the surviving backends' results and logs a warning; a
 merged endpoint only returns `502` when **every** backend fails. Response records
-are passed through as raw JSON so unknown fields survive untouched.
+are passed through as raw JSON so unknown fields survive untouched, under
+openvoxdb's own `application/json;charset=utf-8`.
 
-Every backend is asked the same question, so a query all of them *refuse* with
-the same client-shaped status — a `400` naming an unknown field, say — is the
-query's fault rather than an outage: that status and openvoxdb's own explanation
-are replayed to the client instead of a `502`, with any backend address stripped
-out of the body first. Backends disagreeing on the status, a `403` (`pdbmux`'s
-own credentials, not the client's), a `404` (which records a backend holds is
-exactly what backends disagree about), `408`, `429` and every `5xx` still return
-`502`. A refused query is not counted as a partial round on `/healthz`, and
-nothing about it is cached.
+Every backend is asked the same question, so a status **every** backend answered
+with is the estate's own answer, not an outage: that status, openvoxdb's own
+explanation and its content type are replayed to the client instead of a `502`,
+with any backend address stripped out of the body first. This holds for every
+status from `400` up — openvoxdb answers `["=","name"]` with `400` on `/nodes`
+but `500` on `/facts`, and `/metrics/v2` with a flat `403`, so a rule drawn at
+`500` would replay one and swallow the other. `502` is kept for what it actually
+describes: backends **disagreeing** on the status, or a backend that answered
+nothing at all. The rule is the same on `/pdb/query`, `/pdb/meta` and `/metrics`,
+so no route answers a failure differently from any other.
+
+A unanimous `4xx` blames the request, so it is not counted as a partial round on
+`/healthz` and nothing about it is cached. A unanimous `5xx` is the backends
+reporting their own fault, so it is replayed just as faithfully but still counts
+as a failed round and still falls back to a stale cache entry where there is one.
 
 Responses carry PuppetDB's `X-Records` when the query asked for a total, and on
 the merged paths `X-Backends` (see [Backend health](#backend-health)). Cached
@@ -448,7 +455,8 @@ backend later without further handler changes.
   has passed `pdbmux` always re-queries the backends; the expired copy is served
   **only** if every backend fails, which turns a `502` into slightly-old data. A
   healthy backend is never shadowed by a stale entry, and a query every backend
-  refuses is answered with the refusal rather than the stale copy.
+  *refuses* with a `4xx` is answered with the refusal rather than the stale copy —
+  a unanimous `5xx` is an outage like any other and still takes the stale copy.
 - **Bounded** — `facts_cache_bytes` (default 64 MiB) is a byte budget, evicted
   least-recently-used; reads count as use, so a stale entry that is still being
   asked for survives. A single response larger than the whole budget is not
