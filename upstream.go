@@ -94,12 +94,12 @@ const (
 	// reply they all gave is the estate's answer; anything else leaves a backend
 	// whose reply is evidence about the backend, which is what 502 reports.
 	askPeers askOrder = iota
-	// askOwnerFirst: the path names one entity, the backend holding it is asked
-	// first and the rest only as fallbacks in case it does not answer. A backend
-	// that does not hold the entity replies 404 to say exactly that, which is not
-	// a dissent from the holder's reply, so requiring the two to agree asks a
-	// question nobody was posed. The first backend that answered is the one that
-	// knows.
+	// askOwnerFirst: the path names one entity, so the backend holding it is
+	// asked first — or, where no owner is known, they are asked in configured
+	// order — and the rest only as fallbacks. A backend that does not hold the
+	// entity replies 404 to say exactly that, which is not a dissent from the
+	// holder's reply, so requiring the two to agree asks a question nobody was
+	// posed. The first backend that answered is the one that knows.
 	askOwnerFirst
 )
 
