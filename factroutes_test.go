@@ -370,9 +370,9 @@ func TestHandler_FactsBySourceNameUnknownValueSkipsFanOut(t *testing.T) {
 	}
 }
 
-// The record set is the estate's, not the pinned value's, so every value shares
-// one entry: two valid values must not cost two whole-estate fan-outs.
-func TestHandler_FactsBySourceNameValuesShareOneFetch(t *testing.T) {
+// The record set is the estate's, not the pinned value's: the <value> segment is
+// applied to the merged records rather than fanned out as a path of its own.
+func TestHandler_FactsBySourceNameValuesFilterOneFetch(t *testing.T) {
 	a := newCountingBackend(t, map[string]string{factsPath: `[` + fact("h1", "osfamily", "RedHat", "") + `]`})
 	b := newCountingBackend(t, map[string]string{factsPath: `[` + fact("h2", "osfamily", "Debian", "") + `]`})
 	srv, _ := newCachedServer(t, cacheTestConfig(a.srv.URL, b.srv.URL))
@@ -392,8 +392,8 @@ func TestHandler_FactsBySourceNameValuesShareOneFetch(t *testing.T) {
 		}
 	}
 	for _, cb := range []*countingBackend{a, b} {
-		if got := cb.hitCount(factsPath); got != 1 {
-			t.Errorf("%s fetched %d times, want 1 shared fetch", factsPath, got)
+		if got := cb.hitCount(factsPath); got != 3 {
+			t.Errorf("%s fetched %d times, want one uncached fetch per request", factsPath, got)
 		}
 		if got := cb.hitCount(sourceFactURL); got != 0 {
 			t.Errorf("%s was fanned out %d times, want 0", sourceFactURL, got)
@@ -678,21 +678,27 @@ func TestHandler_FactNamesSurvivesOneBackend(t *testing.T) {
 	}
 }
 
-// Both routes are merged record sets, so they use the same cache /facts does.
-func TestHandler_FactRoutesAreCached(t *testing.T) {
+// Every route that serves fact records fans out per request, even with the
+// cache configured: a fact answer is only ever as old as the backend's own.
+func TestHandler_FactRoutesAreNotCached(t *testing.T) {
 	for _, path := range []string{roleFactPath, roleFactPath + "/web", sourceFactURL, factNamesPath} {
 		t.Run(path, func(t *testing.T) {
+			// The source-fact drilldown is answered from the /facts merge, so
+			// that is the path its fan-out lands on.
+			fanOut := path
+			if path == sourceFactURL {
+				fanOut = factsPath
+			}
 			a := newFakeBackend(t, `[]`, `[]`)
-			a.bodies[path] = `[]`
+			a.bodies[fanOut] = `[]`
 			b := newFakeBackend(t, `[]`, `[]`)
-			b.bodies[path] = `[]`
+			b.bodies[fanOut] = `[]`
 			srv := newTestServer(cacheTestConfig(a.srv.URL, b.srv.URL))
 
-			if got := doGet(t, srv.Handler(), path, "").Header().Get(cacheStatusHeader); got != "miss" {
-				t.Errorf("first %s = %q, want miss", cacheStatusHeader, got)
-			}
-			if got := doGet(t, srv.Handler(), path, "").Header().Get(cacheStatusHeader); got != "hit" {
-				t.Errorf("second %s = %q, want hit", cacheStatusHeader, got)
+			doGet(t, srv.Handler(), path, "")
+			doGet(t, srv.Handler(), path, "")
+			if got := a.hits(fanOut); got != 2 {
+				t.Errorf("backend a saw %d requests for %s, want one per request", got, fanOut)
 			}
 		})
 	}

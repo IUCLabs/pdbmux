@@ -126,13 +126,13 @@ func (cb *countingBackend) setBlock(ch chan struct{}) {
 	cb.block = ch
 }
 
-// newCachedServer builds a server whose facts cache runs on a fake clock.
+// newCachedServer builds a server whose /nodes cache runs on a fake clock.
 func newCachedServer(t *testing.T, cfg Config) (*Server, *fakeClock) {
 	t.Helper()
 	srv := newTestServer(cfg)
-	mc, ok := srv.factsCache.(*memoryCache)
+	mc, ok := srv.nodeCache.(*memoryCache)
 	if !ok {
-		t.Fatalf("expected a memory cache, got %T", srv.factsCache)
+		t.Fatalf("expected a memory cache, got %T", srv.nodeCache)
 	}
 	clk := newFakeClock()
 	mc.now = clk.now
@@ -267,14 +267,14 @@ func TestNoopCache_AlwaysMisses(t *testing.T) {
 	}
 }
 
-func TestHandler_FactsCacheFreshHit(t *testing.T) {
-	body := `[` + fact("h1", "role", "web", "") + `]`
-	a := newCountingBackend(t, map[string]string{factsPath: body})
-	b := newCountingBackend(t, map[string]string{factsPath: `[]`})
+func TestHandler_NodesCacheFreshHit(t *testing.T) {
+	body := `[` + node("h1", "2026-01-01T00:00:00.000Z") + `]`
+	a := newCountingBackend(t, map[string]string{nodesPath: body})
+	b := newCountingBackend(t, map[string]string{nodesPath: `[]`})
 	srv, _ := newCachedServer(t, cacheTestConfig(a.srv.URL, b.srv.URL))
 
-	first := doGet(t, srv.Handler(), factsPath, `["=","name","role"]`)
-	second := doGet(t, srv.Handler(), factsPath, `["=","name","role"]`)
+	first := doGet(t, srv.Handler(), nodesPath, `["=","certname","h1"]`)
+	second := doGet(t, srv.Handler(), nodesPath, `["=","certname","h1"]`)
 
 	if first.Code != http.StatusOK || second.Code != http.StatusOK {
 		t.Fatalf("statuses %d/%d", first.Code, second.Code)
@@ -282,40 +282,40 @@ func TestHandler_FactsCacheFreshHit(t *testing.T) {
 	if first.Body.String() != second.Body.String() {
 		t.Errorf("cache hit changed the body:\n %s\n %s", first.Body.String(), second.Body.String())
 	}
-	if got := a.hitCount(factsPath); got != 1 {
+	if got := a.hitCount(nodesPath); got != 1 {
 		t.Errorf("backend a saw %d requests, want 1 (second served from cache)", got)
 	}
-	if got := b.hitCount(factsPath); got != 1 {
+	if got := b.hitCount(nodesPath); got != 1 {
 		t.Errorf("backend b saw %d requests, want 1", got)
 	}
 
 	// A different query is a different key and must go upstream.
-	doGet(t, srv.Handler(), factsPath, `["=","name","osfamily"]`)
-	if got := a.hitCount(factsPath); got != 2 {
+	doGet(t, srv.Handler(), nodesPath, `["=","certname","h2"]`)
+	if got := a.hitCount(nodesPath); got != 2 {
 		t.Errorf("a different query should refetch: %d requests, want 2", got)
 	}
 }
 
-func TestHandler_FactsCacheExpires(t *testing.T) {
-	a := newCountingBackend(t, map[string]string{factsPath: `[` + fact("h1", "role", "web", "") + `]`})
-	b := newCountingBackend(t, map[string]string{factsPath: `[]`})
+func TestHandler_NodesCacheExpires(t *testing.T) {
+	a := newCountingBackend(t, map[string]string{nodesPath: `[` + node("h1", "2026-01-01T00:00:00.000Z") + `]`})
+	b := newCountingBackend(t, map[string]string{nodesPath: `[]`})
 	srv, clk := newCachedServer(t, cacheTestConfig(a.srv.URL, b.srv.URL))
 
-	doGet(t, srv.Handler(), factsPath, "")
+	doGet(t, srv.Handler(), nodesPath, "")
 	clk.advance(31 * time.Second)
-	doGet(t, srv.Handler(), factsPath, "")
+	doGet(t, srv.Handler(), nodesPath, "")
 
-	if got := a.hitCount(factsPath); got != 2 {
+	if got := a.hitCount(nodesPath); got != 2 {
 		t.Errorf("an expired entry should refetch: %d requests, want 2", got)
 	}
 }
 
 func TestHandler_ServesStaleOnlyWhenBackendsFail(t *testing.T) {
-	a := newCountingBackend(t, map[string]string{factsPath: `[` + fact("h1", "role", "old", "") + `]`})
-	b := newCountingBackend(t, map[string]string{factsPath: `[]`})
+	a := newCountingBackend(t, map[string]string{nodesPath: `[` + node("old", "2026-01-01T00:00:00.000Z") + `]`})
+	b := newCountingBackend(t, map[string]string{nodesPath: `[]`})
 	srv, clk := newCachedServer(t, cacheTestConfig(a.srv.URL, b.srv.URL))
 
-	warm := doGet(t, srv.Handler(), factsPath, "")
+	warm := doGet(t, srv.Handler(), nodesPath, "")
 	if warm.Code != http.StatusOK {
 		t.Fatalf("warm-up status %d", warm.Code)
 	}
@@ -325,8 +325,8 @@ func TestHandler_ServesStaleOnlyWhenBackendsFail(t *testing.T) {
 
 	// Backends healthy but the entry expired: fresh data wins, never the stale copy.
 	clk.advance(31 * time.Second)
-	a.setBody(factsPath, `[`+fact("h1", "role", "new", "")+`]`)
-	refetch := doGet(t, srv.Handler(), factsPath, "")
+	a.setBody(nodesPath, `[`+node("new", "2026-01-01T00:00:00.000Z")+`]`)
+	refetch := doGet(t, srv.Handler(), nodesPath, "")
 	if !strings.Contains(refetch.Body.String(), `"new"`) {
 		t.Errorf("a healthy backend must not be shadowed by the stale entry: %s", refetch.Body.String())
 	}
@@ -338,7 +338,7 @@ func TestHandler_ServesStaleOnlyWhenBackendsFail(t *testing.T) {
 	clk.advance(31 * time.Second)
 	a.setFail(true)
 	b.setFail(true)
-	stale := doGet(t, srv.Handler(), factsPath, "")
+	stale := doGet(t, srv.Handler(), nodesPath, "")
 	if stale.Code != http.StatusOK {
 		t.Fatalf("stale fallback status %d: %s", stale.Code, stale.Body.String())
 	}
@@ -352,51 +352,14 @@ func TestHandler_ServesStaleOnlyWhenBackendsFail(t *testing.T) {
 	}
 }
 
-// The stored entry is the whole estate's record set and the pinned value narrows
-// it per request, so the fallback has to keep narrowing: a client asking for one
-// backend's records must not be handed every backend's because the entry expired.
-func TestHandler_StaleSourceFactDrilldownStaysFilteredByOwner(t *testing.T) {
-	a := newCountingBackend(t, map[string]string{factsPath: `[` + fact("h1", "osfamily", "RedHat", "") + `]`})
-	b := newCountingBackend(t, map[string]string{factsPath: `[` + fact("h2", "osfamily", "Debian", "") + `]`})
-	srv, clk := newCachedServer(t, cacheTestConfig(a.srv.URL, b.srv.URL))
-
-	drilldown := sourceFactURL + "/a"
-	want := map[string]string{"h1": "a"}
-
-	warm := doGet(t, srv.Handler(), drilldown, "")
-	if warm.Code != http.StatusOK {
-		t.Fatalf("warm-up status %d: %s", warm.Code, warm.Body.String())
-	}
-	if got, n := sourceValues(t, warm.Body.Bytes(), defaultSourceFact); n != len(want) || !reflect.DeepEqual(got, want) {
-		t.Fatalf("warm-up %s = %v (%d records), want %v", drilldown, got, n, want)
-	}
-
-	// Every backend down and the entry expired: the stale copy is served.
-	clk.advance(31 * time.Second)
-	a.setFail(true)
-	b.setFail(true)
-
-	rec := doGet(t, srv.Handler(), drilldown, "")
-	if rec.Code != http.StatusOK {
-		t.Fatalf("stale fallback status %d: %s", rec.Code, rec.Body.String())
-	}
-	if got := rec.Header().Get(cacheStatusHeader); got != "stale" {
-		t.Fatalf("%s = %q, want stale: the request did not take the fallback path", cacheStatusHeader, got)
-	}
-	got, n := sourceValues(t, rec.Body.Bytes(), defaultSourceFact)
-	if n != len(want) || !reflect.DeepEqual(got, want) {
-		t.Errorf("stale %s = %v (%d records), want only backend a's %v", drilldown, got, n, want)
-	}
-}
-
 func TestHandler_NoCacheEntryMeansBackendFailureIs502(t *testing.T) {
-	a := newCountingBackend(t, map[string]string{factsPath: `[]`})
-	b := newCountingBackend(t, map[string]string{factsPath: `[]`})
+	a := newCountingBackend(t, map[string]string{nodesPath: `[]`})
+	b := newCountingBackend(t, map[string]string{nodesPath: `[]`})
 	a.setFail(true)
 	b.setFail(true)
 	srv, _ := newCachedServer(t, cacheTestConfig(a.srv.URL, b.srv.URL))
 
-	rec := doGet(t, srv.Handler(), factsPath, "")
+	rec := doGet(t, srv.Handler(), nodesPath, "")
 	if rec.Code != http.StatusBadGateway {
 		t.Fatalf("status %d, want 502", rec.Code)
 	}
@@ -406,8 +369,8 @@ func TestHandler_NoCacheEntryMeansBackendFailureIs502(t *testing.T) {
 }
 
 func TestHandler_SingleFlightCollapsesConcurrentRequests(t *testing.T) {
-	a := newCountingBackend(t, map[string]string{factsPath: `[` + fact("h1", "role", "web", "") + `]`})
-	b := newCountingBackend(t, map[string]string{factsPath: `[]`})
+	a := newCountingBackend(t, map[string]string{nodesPath: `[` + node("h1", "2026-01-01T00:00:00.000Z") + `]`})
+	b := newCountingBackend(t, map[string]string{nodesPath: `[]`})
 	srv, _ := newCachedServer(t, cacheTestConfig(a.srv.URL, b.srv.URL))
 	h := srv.Handler()
 
@@ -422,13 +385,13 @@ func TestHandler_SingleFlightCollapsesConcurrentRequests(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			codes[i] = doGet(t, h, factsPath, "").Code
+			codes[i] = doGet(t, h, nodesPath, "").Code
 		}(i)
 	}
 
 	// The leader is parked inside the blocked backend, so every caller that
 	// reaches the handler before the release joins its flight.
-	waitFor(t, func() bool { return a.hitCount(factsPath) >= 1 })
+	waitFor(t, func() bool { return a.hitCount(nodesPath) >= 1 })
 	time.Sleep(250 * time.Millisecond)
 	close(release)
 	wg.Wait()
@@ -438,10 +401,10 @@ func TestHandler_SingleFlightCollapsesConcurrentRequests(t *testing.T) {
 			t.Fatalf("caller %d got %d", i, code)
 		}
 	}
-	if got := a.hitCount(factsPath); got != 1 {
+	if got := a.hitCount(nodesPath); got != 1 {
 		t.Errorf("backend a saw %d requests, want 1 for %d concurrent callers", got, callers)
 	}
-	if got := b.hitCount(factsPath); got != 1 {
+	if got := b.hitCount(nodesPath); got != 1 {
 		t.Errorf("backend b saw %d requests, want 1 for %d concurrent callers", got, callers)
 	}
 }
@@ -557,15 +520,15 @@ func TestFlightGroup_LeaderPanicFailsLeaderAndWaiters(t *testing.T) {
 }
 
 func TestServeCached_BuildPanicIs502ThenStale(t *testing.T) {
-	a := newCountingBackend(t, map[string]string{factsPath: `[]`})
-	b := newCountingBackend(t, map[string]string{factsPath: `[]`})
+	a := newCountingBackend(t, map[string]string{nodesPath: `[]`})
+	b := newCountingBackend(t, map[string]string{nodesPath: `[]`})
 	srv, clk := newCachedServer(t, cacheTestConfig(a.srv.URL, b.srv.URL))
 
 	panicBuild := func(context.Context) (cachedResponse, error) { panic("build exploded") }
 	serve := func(build func(context.Context) (cachedResponse, error)) *httptest.ResponseRecorder {
 		rec := httptest.NewRecorder()
-		req := httptest.NewRequest(http.MethodGet, factsPath, nil)
-		srv.serveCached(rec, req, factsPath, nil, build)
+		req := httptest.NewRequest(http.MethodGet, nodesPath, nil)
+		srv.serveCached(rec, req, nodesPath, nil, build)
 		return rec
 	}
 
@@ -575,7 +538,7 @@ func TestServeCached_BuildPanicIs502ThenStale(t *testing.T) {
 		t.Fatalf("status %d (%s), want 502", rec.Code, rec.Body.String())
 	}
 
-	stored := `[` + fact("h1", "role", "web", "") + `]`
+	stored := `[` + node("h1", "2026-01-01T00:00:00.000Z") + `]`
 	rec = serve(func(context.Context) (cachedResponse, error) {
 		return cachedResponse{Body: json.RawMessage(stored), Records: 1}, nil
 	})
@@ -600,16 +563,16 @@ func TestServeCached_BuildPanicIs502ThenStale(t *testing.T) {
 }
 
 func TestServeCached_BuildPanicFailsConcurrentWaiters(t *testing.T) {
-	a := newCountingBackend(t, map[string]string{factsPath: `[]`})
-	b := newCountingBackend(t, map[string]string{factsPath: `[]`})
+	a := newCountingBackend(t, map[string]string{nodesPath: `[]`})
+	b := newCountingBackend(t, map[string]string{nodesPath: `[]`})
 	srv, _ := newCachedServer(t, cacheTestConfig(a.srv.URL, b.srv.URL))
 
 	entered := make(chan struct{})
 	release := make(chan struct{})
 	serve := func(build func(context.Context) (cachedResponse, error)) *httptest.ResponseRecorder {
 		rec := httptest.NewRecorder()
-		req := httptest.NewRequest(http.MethodGet, factsPath, nil)
-		srv.serveCached(rec, req, factsPath, nil, build)
+		req := httptest.NewRequest(http.MethodGet, nodesPath, nil)
+		srv.serveCached(rec, req, nodesPath, nil, build)
 		return rec
 	}
 
@@ -710,8 +673,8 @@ func TestHandler_LeaderDisconnectDoesNotFailFollowers(t *testing.T) {
 
 	// The flight the leader started still populated the cache.
 	warmed := doGet(t, h, nodesPath, "")
-	if got := warmed.Header().Get(cacheStatusHeader); got != "hit" {
-		t.Errorf("%s = %q, want hit: the abandoned leader's flight must still warm the cache", cacheStatusHeader, got)
+	if got := strings.TrimSpace(warmed.Body.String()); !sameJSON(t, got, want) {
+		t.Errorf("warmed body = %s, want %s: the abandoned leader's flight must still warm the cache", got, want)
 	}
 	if got := a.hitCount(nodesPath); got != 1 {
 		t.Errorf("backend a saw %d requests after the cached read, want 1", got)
@@ -750,7 +713,7 @@ func TestHandler_SoloDisconnectAbortsFanOutPromptly(t *testing.T) {
 	}()
 
 	start := time.Now()
-	req := httptest.NewRequest(http.MethodGet, factsPath, nil).WithContext(ctx)
+	req := httptest.NewRequest(http.MethodGet, nodesPath, nil).WithContext(ctx)
 	srv.Handler().ServeHTTP(httptest.NewRecorder(), req)
 	if elapsed := time.Since(start); elapsed >= cfg.Timeout/2 {
 		t.Errorf("handler returned after %s, want well under cfg.Timeout %s", elapsed, cfg.Timeout)
@@ -783,7 +746,7 @@ func TestHandler_DisconnectedRequestsDoNotPinBackends(t *testing.T) {
 				time.Sleep(disconnectAfter)
 				cancel()
 			}()
-			target := factsPath + "?query=" + url.QueryEscape(strconv.Itoa(i))
+			target := nodesPath + "?query=" + url.QueryEscape(strconv.Itoa(i))
 			req := httptest.NewRequest(http.MethodGet, target, nil).WithContext(ctx)
 			h.ServeHTTP(httptest.NewRecorder(), req)
 		}(i)
@@ -1116,47 +1079,39 @@ func assertGoroutinesSettle(t *testing.T, baseline int, frames ...string) {
 	}
 }
 
-func TestServeCached_CacheStatusHeaders(t *testing.T) {
-	stored := `[` + fact("h1", "role", "web", "") + `]`
-	a := newCountingBackend(t, map[string]string{factsPath: stored})
-	b := newCountingBackend(t, map[string]string{factsPath: `[]`})
+// PuppetDB emits no X-Cache and no Age, so a client cannot tell a cached
+// response from a live one. Covers the fresh hit, the miss and the stale
+// fallback, which are the three ways a response can leave the cached path.
+func TestHandler_CachedResponsesCarryNoCacheHeaders(t *testing.T) {
+	a := newCountingBackend(t, map[string]string{nodesPath: `[` + node("h1", "2026-01-01T00:00:00.000Z") + `]`})
+	b := newCountingBackend(t, map[string]string{nodesPath: `[]`})
 	srv, clk := newCachedServer(t, cacheTestConfig(a.srv.URL, b.srv.URL))
 	h := srv.Handler()
 
-	rec := doGet(t, h, factsPath, "")
-	if got := rec.Header().Get(cacheStatusHeader); got != "miss" {
-		t.Errorf("first request %s = %q, want miss", cacheStatusHeader, got)
-	}
-	if got := rec.Header().Get(ageHeader); got != "0" {
-		t.Errorf("first request %s = %q, want 0", ageHeader, got)
-	}
+	assertNoCacheHeaders(t, doGet(t, h, nodesPath, ""), "miss")
 
 	clk.advance(7 * time.Second)
-	rec = doGet(t, h, factsPath, "")
-	if got := rec.Header().Get(cacheStatusHeader); got != "hit" {
-		t.Errorf("cached request %s = %q, want hit", cacheStatusHeader, got)
-	}
-	if got := rec.Header().Get(ageHeader); got != "7" {
-		t.Errorf("cached request %s = %q, want 7", ageHeader, got)
-	}
+	assertNoCacheHeaders(t, doGet(t, h, nodesPath, ""), "fresh hit")
 
-	// Past the TTL with every backend down, the stale fallback must say so.
 	clk.advance(24 * time.Second)
 	a.setFail(true)
 	b.setFail(true)
-	rec = doGet(t, h, factsPath, "")
+	rec := doGet(t, h, nodesPath, "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("stale fallback status %d (%s)", rec.Code, rec.Body.String())
 	}
-	if got := rec.Header().Get(cacheStatusHeader); got != "stale" {
-		t.Errorf("stale fallback %s = %q, want stale", cacheStatusHeader, got)
+	if serving, _, _ := srv.stale.snapshot(); !serving {
+		t.Fatal("the third request did not take the stale fallback path")
 	}
-	if got := rec.Header().Get(ageHeader); got != "31" {
-		t.Errorf("stale fallback %s = %q, want 31 seconds since the entry was stored", ageHeader, got)
-	}
-	want := `[` + fact("h1", "role", "web", "") + `,` + factEnv("h1", defaultSourceFact, "a", "") + `]`
-	if got := strings.TrimSpace(rec.Body.String()); !sameJSON(t, got, want) {
-		t.Errorf("stale body = %s, want %s", got, want)
+	assertNoCacheHeaders(t, rec, "stale fallback")
+}
+
+func assertNoCacheHeaders(t *testing.T, rec *httptest.ResponseRecorder, what string) {
+	t.Helper()
+	for _, h := range []string{"X-Cache", "Age"} {
+		if got := rec.Header().Get(h); got != "" {
+			t.Errorf("%s response carries %s: %q, want no such header", what, h, got)
+		}
 	}
 }
 
@@ -1193,18 +1148,18 @@ func (c *recordingCache) Stats() CacheStats { return CacheStats{Backend: "record
 func TestServeCached_PutRunsOnDetachedContext(t *testing.T) {
 	srv := newTestServer(cacheTestConfig("http://backend.invalid", "http://backend.invalid"))
 	cache := newRecordingCache()
-	srv.factsCache = cache
+	srv.nodeCache = cache
 
 	entered := make(chan struct{})
 	release := make(chan struct{})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	req := httptest.NewRequest(http.MethodGet, factsPath, nil).WithContext(ctx)
+	req := httptest.NewRequest(http.MethodGet, nodesPath, nil).WithContext(ctx)
 
 	served := make(chan struct{})
 	go func() {
 		defer close(served)
-		srv.serveCached(httptest.NewRecorder(), req, factsPath, nil, func(context.Context) (cachedResponse, error) {
+		srv.serveCached(httptest.NewRecorder(), req, nodesPath, nil, func(context.Context) (cachedResponse, error) {
 			close(entered)
 			<-release
 			return cachedResponse{Body: json.RawMessage(`[]`), Records: -1}, nil
@@ -1236,8 +1191,8 @@ func TestServeCached_PutRunsOnDetachedContext(t *testing.T) {
 }
 
 func TestHandler_HealthzReportsCacheState(t *testing.T) {
-	a := newCountingBackend(t, map[string]string{factsPath: `[` + fact("h1", "role", "web", "") + `]`})
-	b := newCountingBackend(t, map[string]string{factsPath: `[]`})
+	a := newCountingBackend(t, map[string]string{nodesPath: `[` + node("h1", "2026-01-01T00:00:00.000Z") + `]`})
+	b := newCountingBackend(t, map[string]string{nodesPath: `[]`})
 	srv, clk := newCachedServer(t, cacheTestConfig(a.srv.URL, b.srv.URL))
 
 	hr := health(t, srv)
@@ -1248,7 +1203,7 @@ func TestHandler_HealthzReportsCacheState(t *testing.T) {
 		t.Fatalf("a cold cache should be empty and not stale: %+v", hr.Cache)
 	}
 
-	doGet(t, srv.Handler(), factsPath, "")
+	doGet(t, srv.Handler(), nodesPath, "")
 	hr = health(t, srv)
 	if hr.Cache.Entries != 1 || hr.Cache.StaleEntries != 0 || hr.Cache.Bytes == 0 {
 		t.Fatalf("after one request: %+v", hr.Cache)
@@ -1264,7 +1219,7 @@ func TestHandler_HealthzReportsCacheState(t *testing.T) {
 
 	a.setFail(true)
 	b.setFail(true)
-	doGet(t, srv.Handler(), factsPath, "")
+	doGet(t, srv.Handler(), nodesPath, "")
 	hr = health(t, srv)
 	if !hr.Cache.ServingStale || hr.Cache.StaleServed != 1 || hr.Cache.LastStale == "" {
 		t.Errorf("staleness not surfaced in /healthz: %+v", hr.Cache)
@@ -1444,9 +1399,9 @@ func TestNewServer_ClampsFactsTTL(t *testing.T) {
 	cfg.CacheBytes = 1 << 20
 	srv := newTestServer(cfg)
 
-	mc, ok := srv.factsCache.(*memoryCache)
+	mc, ok := srv.nodeCache.(*memoryCache)
 	if !ok {
-		t.Fatalf("expected a memory cache, got %T", srv.factsCache)
+		t.Fatalf("expected a memory cache, got %T", srv.nodeCache)
 	}
 	if mc.ttl != maxFactsTTL {
 		t.Errorf("cache ttl = %s, want %s", mc.ttl, maxFactsTTL)
@@ -1520,35 +1475,6 @@ func stamped(t *testing.T, raw, field, value string) string {
 // The injector is per-request but a cache entry is shared, so a second caller is
 // served a body built for the first. Provenance names the backend that supplied
 // the data, which is a property of that fetch, so the shared body stays correct.
-func TestHandler_CachedFactsKeepSourceAttribution(t *testing.T) {
-	a := newCountingBackend(t, map[string]string{factsPath: `[` + fact("h1", "role", "web", "") + `]`})
-	b := newCountingBackend(t, map[string]string{factsPath: `[]`})
-	srv, _ := newCachedServer(t, cacheTestConfig(a.srv.URL, b.srv.URL))
-	h := srv.Handler()
-
-	first := doGet(t, h, factsPath, "")
-	if got := first.Header().Get(cacheStatusHeader); got != "miss" {
-		t.Fatalf("first %s = %q, want miss", cacheStatusHeader, got)
-	}
-	srcs, n := sourceValues(t, first.Body.Bytes(), defaultSourceFact)
-	if n != 1 || srcs["h1"] != "a" {
-		t.Fatalf("first request sources = %v (%d records), want h1 -> a", srcs, n)
-	}
-
-	second := doGet(t, h, factsPath, "")
-	if got := second.Header().Get(cacheStatusHeader); got != "hit" {
-		t.Fatalf("second %s = %q, want hit", cacheStatusHeader, got)
-	}
-	srcs, n = sourceValues(t, second.Body.Bytes(), defaultSourceFact)
-	if n != 1 || srcs["h1"] != "a" {
-		t.Errorf("cached request sources = %v (%d records), want exactly one h1 -> a", srcs, n)
-	}
-	if got := a.hitCount(factsPath); got != 1 {
-		t.Errorf("backend a saw %d requests, want 1: the second read must come from the cache", got)
-	}
-}
-
-// The same, for the /nodes stamp rather than the synthetic /facts record.
 func TestHandler_CachedNodesKeepSourceStamp(t *testing.T) {
 	a := newCountingBackend(t, map[string]string{nodesPath: `[` + node("h1", "2026-01-02T00:00:00.000Z") + `]`})
 	b := newCountingBackend(t, map[string]string{nodesPath: `[` + node("h1", "2026-01-01T00:00:00.000Z") + `]`})
@@ -1561,9 +1487,6 @@ func TestHandler_CachedNodesKeepSourceStamp(t *testing.T) {
 	}
 
 	second := doGet(t, h, nodesPath, "")
-	if got := second.Header().Get(cacheStatusHeader); got != "hit" {
-		t.Fatalf("second %s = %q, want hit", cacheStatusHeader, got)
-	}
 	want := `[` + stamped(t, node("h1", "2026-01-02T00:00:00.000Z"), defaultSourceFact, "a") + `]`
 	if got := strings.TrimSpace(second.Body.String()); !sameJSON(t, got, want) {
 		t.Errorf("cached body = %s, want %s", got, want)
@@ -1577,77 +1500,115 @@ func TestHandler_CachedNodesKeepSourceStamp(t *testing.T) {
 // while the entry is served the attribution is the one that fetch had, and the
 // rebuild after the TTL picks up the move.
 func TestHandler_CachedSourceAgesWithItsData(t *testing.T) {
-	a := newCountingBackend(t, map[string]string{factsPath: `[` + fact("h1", "role", "web", "") + `]`})
-	b := newCountingBackend(t, map[string]string{factsPath: `[]`})
+	a := newCountingBackend(t, map[string]string{nodesPath: `[` + node("h1", "2026-01-01T00:00:00.000Z") + `]`})
+	b := newCountingBackend(t, map[string]string{nodesPath: `[]`})
 	srv, clk := newCachedServer(t, cacheTestConfig(a.srv.URL, b.srv.URL))
 	h := srv.Handler()
 
-	doGet(t, h, factsPath, "")
+	doGet(t, h, nodesPath, "")
 
 	// The node moves to b while the entry is still fresh.
-	a.setBody(factsPath, `[]`)
-	b.setBody(factsPath, `[`+fact("h1", "role", "web", "")+`]`)
+	a.setBody(nodesPath, `[]`)
+	b.setBody(nodesPath, `[`+node("h1", "2026-01-01T00:00:00.000Z")+`]`)
 
-	cached := doGet(t, h, factsPath, "")
-	if got := cached.Header().Get(cacheStatusHeader); got != "hit" {
-		t.Fatalf("%s = %q, want hit", cacheStatusHeader, got)
+	cached := doGet(t, h, nodesPath, "")
+	if got := nodeSources(t, cached.Body.Bytes(), defaultSourceFact); got["h1"] != "a" {
+		t.Errorf("cached stamp = %v, want h1 -> a: the body and its attribution come from the same fetch", got)
 	}
-	if srcs, _ := sourceValues(t, cached.Body.Bytes(), defaultSourceFact); srcs["h1"] != "a" {
-		t.Errorf("cached sources = %v, want h1 -> a: the body and its attribution come from the same fetch", srcs)
+	if got := a.hitCount(nodesPath); got != 1 {
+		t.Errorf("backend a saw %d requests, want 1 while the entry is fresh", got)
 	}
 
 	clk.advance(31 * time.Second)
-	rebuilt := doGet(t, h, factsPath, "")
-	if srcs, _ := sourceValues(t, rebuilt.Body.Bytes(), defaultSourceFact); srcs["h1"] != "b" {
-		t.Errorf("rebuilt sources = %v, want h1 -> b once the entry expired", srcs)
+	rebuilt := doGet(t, h, nodesPath, "")
+	if got := nodeSources(t, rebuilt.Body.Bytes(), defaultSourceFact); got["h1"] != "b" {
+		t.Errorf("rebuilt stamp = %v, want h1 -> b once the entry expired", got)
 	}
 }
 
-// The injection gate is a pure function of path and query, both of which are in
-// the cache key, so a gated request can never be served an injected body cached
-// for an ungated one.
-func TestHandler_SourceGateIsPerCacheKey(t *testing.T) {
+// Fact answers must be as current as a backend's own, so every fact-serving
+// route refetches: the second request sees data that changed between the two.
+func TestHandler_FactPathsAreNeverCached(t *testing.T) {
+	for _, path := range []string{
+		factsPath,
+		factsPath + "/role",
+		factsPath + "/role/web",
+		factNamesPath,
+		factsetsPath,
+		nodesPath + "/h1/facts",
+		"/pdb/query/v4/fact-contents",
+		"/pdb/query/v4/fact-paths",
+		"/pdb/query/v4/inventory",
+	} {
+		t.Run(path, func(t *testing.T) {
+			before := `[{"certname":"h1","name":"role","value":"before"}]`
+			after := `[{"certname":"h1","name":"role","value":"after"}]`
+			a := newCountingBackend(t, map[string]string{path: before})
+			b := newCountingBackend(t, map[string]string{path: `[]`})
+			srv, _ := newCachedServer(t, cacheTestConfig(a.srv.URL, b.srv.URL))
+			h := srv.Handler()
+
+			if first := doGet(t, h, path, ""); !strings.Contains(first.Body.String(), "before") {
+				t.Fatalf("first %s = %s, want the backend's own records", path, first.Body.String())
+			}
+			a.setBody(path, after)
+
+			second := doGet(t, h, path, "")
+			if strings.Contains(second.Body.String(), "before") {
+				t.Errorf("second %s = %s, want the changed data rather than a cached copy", path, second.Body.String())
+			}
+			if !strings.Contains(second.Body.String(), "after") {
+				t.Errorf("second %s = %s, want the changed data", path, second.Body.String())
+			}
+			if got := a.hitCount(path); got != 2 {
+				t.Errorf("backend a saw %d requests for %s, want one per request", got, path)
+			}
+		})
+	}
+}
+
+// No fact response may carry the cache headers PuppetDB never sends, whatever
+// else pdbmux is doing with the merged body.
+func TestHandler_FactResponsesCarryNoCacheHeaders(t *testing.T) {
 	body := `[` + fact("h1", "role", "web", "") + `]`
-	a := newCountingBackend(t, map[string]string{factsPath: body})
-	b := newCountingBackend(t, map[string]string{factsPath: `[]`})
-	srv, _ := newCachedServer(t, cacheTestConfig(a.srv.URL, b.srv.URL))
-	h := srv.Handler()
+	for _, path := range []string{factsPath, factsPath + "/role", factNamesPath, sourceFactURL} {
+		t.Run(path, func(t *testing.T) {
+			a := newCountingBackend(t, map[string]string{path: body, factsPath: body})
+			b := newCountingBackend(t, map[string]string{path: `[]`, factsPath: `[]`})
+			srv, _ := newCachedServer(t, cacheTestConfig(a.srv.URL, b.srv.URL))
+			h := srv.Handler()
 
-	const nameFiltered = `["=","name","role"]`
-	for _, pass := range []string{"first", "cached"} {
-		open := doGet(t, h, factsPath, "")
-		if srcs, n := sourceValues(t, open.Body.Bytes(), defaultSourceFact); n != 1 || srcs["h1"] != "a" {
-			t.Errorf("%s unfiltered request sources = %v (%d records), want h1 -> a", pass, srcs, n)
-		}
-		gated := doGet(t, h, factsPath, nameFiltered)
-		if _, n := sourceValues(t, gated.Body.Bytes(), defaultSourceFact); n != 0 {
-			t.Errorf("%s name-filtered request carried %d synthetic record(s), want none", pass, n)
-		}
-		if got := strings.TrimSpace(gated.Body.String()); !sameJSON(t, got, body) {
-			t.Errorf("%s name-filtered body = %s, want %s", pass, got, body)
-		}
-	}
-	if got := a.hitCount(factsPath); got != 2 {
-		t.Errorf("backend a saw %d requests, want 2: one per distinct cache key", got)
+			assertNoCacheHeaders(t, doGet(t, h, path, ""), path)
+			assertNoCacheHeaders(t, doGet(t, h, path, ""), path+" repeated")
+		})
 	}
 }
 
-// Suppression of an upstream fact of the configured name is part of the merged
-// body, so it survives into the cache rather than being re-applied per request.
-func TestHandler_SuppressionSurvivesCacheHit(t *testing.T) {
-	upstream := `[` + fact("h1", defaultSourceFact, "somewhere-else", "") + `,` + fact("h1", "role", "web", "") + `]`
-	a := newCountingBackend(t, map[string]string{factsPath: upstream})
-	b := newCountingBackend(t, map[string]string{factsPath: `[]`})
+// openvoxdb answers a successful query with application/json;charset=utf-8
+// (src/puppetlabs/puppetdb/query_eng.clj:555 through http.clj:80), so a merged
+// response has to as well or a client can tell the proxy from the real thing.
+func TestHandler_SuccessContentTypeMatchesPuppetDB(t *testing.T) {
+	bodies := map[string]string{
+		nodesPath:     `[` + node("h1", "2026-01-01T00:00:00.000Z") + `]`,
+		factsPath:     `[` + fact("h1", "role", "web", "") + `]`,
+		factNamesPath: `["role"]`,
+		reportsPath:   `[` + report("h1", "abc", "2026-01-01T00:00:00.000Z") + `]`,
+	}
+	a := newCountingBackend(t, bodies)
+	b := newCountingBackend(t, map[string]string{nodesPath: `[]`, factsPath: `[]`, factNamesPath: `[]`, reportsPath: `[]`})
 	srv, _ := newCachedServer(t, cacheTestConfig(a.srv.URL, b.srv.URL))
 	h := srv.Handler()
 
-	doGet(t, h, factsPath, "")
-	cached := doGet(t, h, factsPath, "")
-	if got := cached.Header().Get(cacheStatusHeader); got != "hit" {
-		t.Fatalf("%s = %q, want hit", cacheStatusHeader, got)
-	}
-	srcs, n := sourceValues(t, cached.Body.Bytes(), defaultSourceFact)
-	if n != 1 || srcs["h1"] != "a" {
-		t.Errorf("cached sources = %v (%d records), want exactly one h1 -> a, the upstream value dropped", srcs, n)
+	for path := range bodies {
+		// Twice, so a cache hit is held to the same content type as a live build.
+		for _, pass := range []string{"live", "repeated"} {
+			rec := doGet(t, h, path, "")
+			if rec.Code != http.StatusOK {
+				t.Fatalf("%s %s status %d (%s)", pass, path, rec.Code, rec.Body.String())
+			}
+			if got := rec.Header().Get("Content-Type"); got != "application/json;charset=utf-8" {
+				t.Errorf("%s %s Content-Type = %q, want application/json;charset=utf-8", pass, path, got)
+			}
+		}
 	}
 }
