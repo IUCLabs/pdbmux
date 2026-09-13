@@ -86,7 +86,7 @@ func (s *Server) aliveRaw(w http.ResponseWriter, results []rawResult, path strin
 		alive = append(alive, res)
 	}
 	if len(alive) == 0 {
-		s.writeUpstreamError(w, upstreamOutcome(rawUpstreamErrors(results)))
+		s.writeUpstreamError(w, peerOutcome(rawUpstreamErrors(results)))
 		return nil, false
 	}
 	return alive, true

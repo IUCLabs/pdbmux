@@ -55,6 +55,13 @@ type voxBackend struct {
 	// nodes maps a certname it holds to that node's report_timestamp.
 	nodes map[string]string
 	fail  bool
+	// perNodeStatus and perNodeBody answer the per-certname routes with a fixed
+	// reply, leaving /nodes alone so the freshness map still resolves an owner.
+	perNodeStatus int
+	perNodeBody   string
+	// perNodeDead aborts the per-certname routes without a status, standing in
+	// for a backend that is unreachable only for that request.
+	perNodeDead bool
 
 	mu        sync.Mutex
 	gotParams map[string]url.Values
@@ -72,6 +79,17 @@ func newVoxBackend(t *testing.T, name string, nodes map[string]string) *voxBacke
 			return
 		}
 		w.Header().Set("Content-Type", "application/json;charset=utf-8")
+
+		if isCertnameRoute(r.URL.Path) {
+			if vb.perNodeDead {
+				panic(http.ErrAbortHandler)
+			}
+			if vb.perNodeStatus != 0 {
+				w.WriteHeader(vb.perNodeStatus)
+				_, _ = io.WriteString(w, vb.perNodeBody)
+				return
+			}
+		}
 
 		if certname, ok := strings.CutPrefix(r.URL.Path, factsetsPath+"/"); ok {
 			ts, held := vb.nodes[certname]
@@ -340,5 +358,78 @@ func TestCertnameRoutes_ClaimedByTheRouteTable(t *testing.T) {
 		if got := routeFor(path).name; got != certnameRouteName {
 			t.Errorf("routeFor(%q) = %q, want %q", path, got, certnameRouteName)
 		}
+	}
+}
+
+// The owner holds the node, so its answer is the answer: a non-owner's 404 only
+// says the node is not its own, and demanding it agree turns the owner's real
+// error into a 502 that describes neither backend.
+func TestCertnameRoutes_OwnerAnswerWins(t *testing.T) {
+	const certname = "h1.example.net"
+	for _, tc := range []struct {
+		name string
+		// setUp configures the owner (a, which reported later) and the backend
+		// that does not hold the node (b).
+		setUp    func(a, b *voxBackend)
+		wantCode int
+		wantBody string
+	}{
+		{
+			name:     "owner errors while the non-owner 404s",
+			setUp:    func(a, b *voxBackend) { a.perNodeStatus, a.perNodeBody = http.StatusInternalServerError, "boom" },
+			wantCode: http.StatusInternalServerError,
+			wantBody: "boom",
+		},
+		{
+			name: "owner and non-owner error differently",
+			setUp: func(a, b *voxBackend) {
+				a.perNodeStatus, a.perNodeBody = http.StatusInternalServerError, "boom"
+				b.perNodeStatus, b.perNodeBody = http.StatusServiceUnavailable, "busy"
+			},
+			wantCode: http.StatusInternalServerError,
+			wantBody: "boom",
+		},
+		{
+			// The fallback chain is there so an unreachable owner does not take the
+			// node with it; a backend that did answer explains more than a 502.
+			name: "owner unreachable, fallback answers",
+			setUp: func(a, b *voxBackend) {
+				a.perNodeDead = true
+				b.perNodeStatus, b.perNodeBody = http.StatusServiceUnavailable, "busy"
+			},
+			wantCode: http.StatusServiceUnavailable,
+			wantBody: "busy",
+		},
+		{
+			name: "owner succeeds while the non-owner errors",
+			setUp: func(a, b *voxBackend) {
+				b.perNodeStatus, b.perNodeBody = http.StatusInternalServerError, "boom"
+			},
+			wantCode: http.StatusOK,
+			wantBody: `"a"`,
+		},
+		{
+			// Nothing answered at all, so there is no upstream reply to replay.
+			name:     "every backend unreachable",
+			setUp:    func(a, b *voxBackend) { a.perNodeDead, b.perNodeDead = true, true },
+			wantCode: http.StatusBadGateway,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := newVoxBackend(t, "a", map[string]string{certname: "2026-07-20T00:00:00Z"})
+			b := newVoxBackend(t, "b", map[string]string{})
+			tc.setUp(a, b)
+			srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeFreshness))
+
+			for _, rt := range perNodePaths {
+				rec := doGet(t, srv.Handler(), rt.path(certname), "")
+				if rec.Code != tc.wantCode {
+					t.Fatalf("%s: status = %d, want %d: %s", rt.name, rec.Code, tc.wantCode, rec.Body.String())
+				}
+				if tc.wantBody != "" && !strings.Contains(rec.Body.String(), tc.wantBody) {
+					t.Errorf("%s: body = %q, want it to contain %q", rt.name, rec.Body.String(), tc.wantBody)
+				}
+			}
+		})
 	}
 }

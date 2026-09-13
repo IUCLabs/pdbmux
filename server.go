@@ -535,7 +535,7 @@ func (s *Server) serveFirstHolder(w http.ResponseWriter, r *http.Request) {
 	if len(alive) == 0 {
 		// Unanimity is the whole answer here too: every backend saying 404 means
 		// nobody holds the report, while one silent backend leaves that unknown.
-		s.writeUpstreamError(w, upstreamOutcome(backendUpstreamErrors(results)))
+		s.writeUpstreamError(w, peerOutcome(backendUpstreamErrors(results)))
 		return
 	}
 	for _, res := range alive {
@@ -922,19 +922,21 @@ func (s *Server) queryBackend(ctx context.Context, b Backend, path string, param
 	return recs, total, err
 }
 
-// The record shape is unknown, so a union would be guesswork: the first 2xx wins and the first error response is replayed when none succeeds.
+// The record shape is unknown, so a union would be guesswork: the first 2xx wins, and every backend was asked the same question, so only a reply they all gave is replayed.
 func (s *Server) proxyUnmerged(w http.ResponseWriter, r *http.Request) {
-	s.proxyOrdered(w, r, s.cfg.Backends)
+	s.proxyOrdered(w, r, s.cfg.Backends, askPeers)
 }
 
-// proxyOrdered asks backends in the given order, which is what decides the answer when more than one of them holds the path.
-func (s *Server) proxyOrdered(w http.ResponseWriter, r *http.Request, backends []Backend) {
-	refusals := make([]*upstreamError, 0, len(backends))
+// proxyOrdered asks backends in the given order, which is what decides the
+// answer when more than one of them holds the path. order says why they are in
+// that order, which is what decides whose reply is served when none answers 2xx.
+func (s *Server) proxyOrdered(w http.ResponseWriter, r *http.Request, backends []Backend, order askOrder) {
+	replies := make([]*upstreamError, 0, len(backends))
 	for _, b := range backends {
 		resp, err := s.passThrough(r, b)
 		if err != nil {
 			s.log.Printf("warning: backend %q pass-through failed for %s: %v", b.Name, r.URL.Path, err)
-			refusals = append(refusals, nil)
+			replies = append(replies, nil)
 			continue
 		}
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
@@ -946,9 +948,9 @@ func (s *Server) proxyOrdered(w http.ResponseWriter, r *http.Request, backends [
 		}
 		body, _ := io.ReadAll(resp.Body)
 		_ = resp.Body.Close()
-		refusals = append(refusals, newUpstreamError(resp.StatusCode, resp.Header.Get("Content-Type"), body))
+		replies = append(replies, newUpstreamError(resp.StatusCode, resp.Header.Get("Content-Type"), body))
 	}
-	s.writeUpstreamError(w, upstreamOutcome(refusals))
+	s.writeUpstreamError(w, order.outcome(replies))
 }
 
 func (s *Server) passThrough(r *http.Request, b Backend) (*http.Response, error) {

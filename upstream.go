@@ -82,13 +82,62 @@ func unanimousUpstreamError(errs []*upstreamError) *upstreamError {
 	return first
 }
 
-// upstreamOutcome is the error to answer a fan-out with when it produced
-// nothing: the backends' own unanimous reply where there is one, and pdbmux's
-// gateway error otherwise. Every handler ends here, so no route answers a
-// failure differently from any other.
-func upstreamOutcome(errs []*upstreamError) error {
+// askOrder says why a set of backends was asked, which is what decides whose
+// reply becomes the client's answer when none of them answered 2xx. The two
+// cases are not settings on one rule, they are different questions, and reading
+// a reply under the wrong one is how a real answer turns into a 502.
+type askOrder int
+
+const (
+	// askPeers: every backend was asked the same question and any of them could
+	// have answered it, so each reply is an opinion about that question. Only a
+	// reply they all gave is the estate's answer; anything else leaves a backend
+	// whose reply is evidence about the backend, which is what 502 reports.
+	askPeers askOrder = iota
+	// askOwnerFirst: the path names one entity, the backend holding it is asked
+	// first and the rest only as fallbacks in case it does not answer. A backend
+	// that does not hold the entity replies 404 to say exactly that, which is not
+	// a dissent from the holder's reply, so requiring the two to agree asks a
+	// question nobody was posed. The first backend that answered is the one that
+	// knows.
+	askOwnerFirst
+)
+
+// outcome turns a round's replies — one entry per backend in the order they were
+// asked, nil where a backend produced no HTTP status at all — into the error to
+// answer with.
+func (o askOrder) outcome(replies []*upstreamError) error {
+	if o == askOwnerFirst {
+		return ownerOutcome(replies)
+	}
+	return peerOutcome(replies)
+}
+
+// peerOutcome is the error to answer a fan-out of peers with when it produced
+// nothing: their unanimous reply where there is one, and pdbmux's gateway error
+// otherwise.
+func peerOutcome(errs []*upstreamError) error {
 	if ue := unanimousUpstreamError(errs); ue != nil {
 		return ue
+	}
+	return errAllBackendsFailed
+}
+
+// ownerOutcome is the error to answer an owner-routed path with: the reply of
+// the first backend that answered. The owner is asked first, so that is the
+// owner's own reply — it holds the entity, so its 500 is the truth about this
+// request whatever a backend that does not hold the entity said.
+//
+// An owner that produced no status at all leaves a nil entry and the next
+// backend's reply stands instead. The fallback chain exists so a node whose
+// owner is unreachable is still served, and a backend that did answer explains
+// more than a 502 that describes neither. Only a round where nothing answered is
+// pdbmux's own gateway error.
+func ownerOutcome(replies []*upstreamError) error {
+	for _, ue := range replies {
+		if ue != nil && replayableStatus(ue.status) {
+			return ue
+		}
 	}
 	return errAllBackendsFailed
 }
@@ -111,14 +160,21 @@ func backendUpstreamErrors(results []backendResult) []*upstreamError {
 // which is why they are neither counted as degraded service nor answered from
 // the cache; a unanimous 5xx is replayed just the same but is the backends
 // reporting their own fault.
+//
+// Every 4xx openvoxdb answers a fan-out with is about the request, including the
+// 403 on /metrics/v2/list, which is that backend's own policy rather than an
+// authentication failure. That holds only while pdbmux presents no client
+// certificate: authenticate to backends and a rejected certificate becomes a
+// 403 on every route at once, which this would read as a healthy estate refusing
+// a bad query and hide a total outage behind a replayed 403.
 func clientRefusal(err error) bool {
 	var ue *upstreamError
 	return errors.As(err, &ue) && ue != nil && ue.status < 500
 }
 
-// writeUpstreamError answers a fan-out that produced no records. A unanimous
-// upstream error is replayed with the backend's own status, content type and
-// explanation; anything else is reported as a gateway failure.
+// writeUpstreamError answers a round that produced no records. An upstream
+// error the askOrder resolved to is replayed with the backend's own status,
+// content type and explanation; anything else is reported as a gateway failure.
 func (s *Server) writeUpstreamError(w http.ResponseWriter, err error) {
 	var ue *upstreamError
 	if !errors.As(err, &ue) {
@@ -129,7 +185,7 @@ func (s *Server) writeUpstreamError(w http.ResponseWriter, err error) {
 	if len(strings.TrimSpace(string(body))) == 0 {
 		setContentType(w, "text/plain; charset=utf-8")
 		w.WriteHeader(ue.status)
-		_, _ = fmt.Fprintf(w, "every backend answered %d %s\n", ue.status, http.StatusText(ue.status))
+		_, _ = fmt.Fprintf(w, "upstream answered %d %s\n", ue.status, http.StatusText(ue.status))
 		return
 	}
 	setContentType(w, ue.contentType)

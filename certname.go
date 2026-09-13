@@ -50,8 +50,12 @@ func isCertnameRoute(path string) bool { return certnameFor(path) != "" }
 // which is the record array the merges are built on. The remaining backends are
 // tried after it, so a node only one backend holds is still served and a
 // certname no backend holds still answers with openvoxdb's own 404 body.
+//
+// askOwnerFirst is what makes the owner's reply the answer even when it is an
+// error. A backend that does not hold the certname 404s to say so, so it has no
+// opinion to weigh against the owner's.
 func (s *Server) serveByOwner(w http.ResponseWriter, r *http.Request) {
-	s.proxyOrdered(w, r, s.ownerFirst(r.Context(), certnameFor(r.URL.Path)))
+	s.proxyOrdered(w, r, s.ownerFirst(r.Context(), certnameFor(r.URL.Path)), askOwnerFirst)
 }
 
 // ownerFirst puts the backend holding a certname's newest report ahead of the
