@@ -44,6 +44,8 @@ type fakeBackend struct {
 	// rawPaths records the still-escaped request paths, so tests can assert an
 	// MBean name's percent-encoding survived the proxy.
 	rawPaths []string
+	// handle, when set, runs first and answers the request itself by returning true.
+	handle func(w http.ResponseWriter, r *http.Request) bool
 }
 
 func newFakeBackend(t *testing.T, nodesBody, factsBody string) *fakeBackend {
@@ -63,6 +65,9 @@ func newFakeBackend(t *testing.T, nodesBody, factsBody string) *fakeBackend {
 		fb.gotParams[r.URL.Path] = r.URL.Query()
 		fb.rawPaths = append(fb.rawPaths, r.URL.EscapedPath())
 		fb.mu.Unlock()
+		if fb.handle != nil && fb.handle(w, r) {
+			return
+		}
 		if fb.dead {
 			panic(http.ErrAbortHandler)
 		}

@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -387,7 +388,65 @@ func (s *Server) serveUnion(w http.ResponseWriter, r *http.Request, path string,
 }
 
 func (s *Server) serveFacts(w http.ResponseWriter, r *http.Request) {
-	s.serveMerged(w, r, factsPath, s.mergeFactsResponse(r))
+	query := r.URL.Query().Get("query")
+	inject := s.newSourceInjector(query, true)
+	if ast := inject.sourceQuery(query); ast != nil {
+		s.serveSourceFactQuery(w, r, inject, ast)
+		return
+	}
+	s.serveMerged(w, r, factsPath, s.mergeFactsWith(inject))
+}
+
+// serveSourceFactQuery answers a /facts query that selects the owned fact by
+// name. The query still goes upstream for the real facts it selects; the
+// synthetic records come from the same merge serveSourceFact uses, fetched for
+// the query's certname scope, and are filtered by the query locally, since no
+// backend holds them.
+func (s *Server) serveSourceFactQuery(w http.ResponseWriter, r *http.Request, inject *sourceInjector, ast []json.RawMessage) {
+	params := queryParams(r.URL.Query().Get("query"))
+	s.serveCached(w, r, factsPath, params, func(ctx context.Context) (cachedResponse, error) {
+		alive, err := s.aliveResults(ctx, factsPath, params)
+		if err != nil {
+			return cachedResponse{}, err
+		}
+		recs := s.mergeFactsWith(inject)(alive)
+		synth, scoped, err := s.sourceFacts(ctx, s.newSourceInjector("", true), queryParams(certnameScope(ast)))
+		if err != nil {
+			return cachedResponse{}, err
+		}
+		for _, raw := range synth {
+			var f factFields
+			if json.Unmarshal(raw, &f) != nil {
+				continue
+			}
+			if match, _ := matchFact(ast, f); match {
+				recs = append(recs, raw)
+			}
+		}
+		resp := cachedResponse{Body: encodeRecords(recs), Records: -1}
+		s.countBackends(&resp, aliveInBoth(alive, scoped))
+		return resp, nil
+	})
+}
+
+func aliveInBoth(a, b []backendResult) []backendResult {
+	var out []backendResult
+	for _, x := range a {
+		if slices.ContainsFunc(b, func(y backendResult) bool { return y.name == x.name }) {
+			out = append(out, x)
+		}
+	}
+	return out
+}
+
+// sourceFacts is the owned fact's synthetic record set for the nodes params
+// selects, taken from the /facts merge so owner and environment match it.
+func (s *Server) sourceFacts(ctx context.Context, inject *sourceInjector, params url.Values) ([]json.RawMessage, []backendResult, error) {
+	alive, err := s.aliveResults(ctx, factsPath, params)
+	if err != nil {
+		return nil, nil, err
+	}
+	return sourceFactRecords(s.mergeFactsWith(inject)(alive), inject.name, "", false), alive, nil
 }
 
 // Both path forms are the facts entity with a name (and value) constraint ANDed
@@ -427,7 +486,6 @@ func (s *Server) serveSourceFact(w http.ResponseWriter, r *http.Request, inject 
 	}
 
 	params := queryParams(r.URL.Query().Get("query"))
-	merge := s.mergeFactsWith(inject)
 	var filter recordFilter
 	if valued {
 		filter = func(recs []json.RawMessage) []json.RawMessage {
@@ -437,11 +495,10 @@ func (s *Server) serveSourceFact(w http.ResponseWriter, r *http.Request, inject 
 	// The stored set is the whole owned-fact record set, so every value of it
 	// keys, and waits on, the same fetch.
 	s.serveFiltered(w, r, factsPath+"/"+inject.name, params, filter, func(ctx context.Context) (cachedResponse, error) {
-		alive, err := s.aliveResults(ctx, factsPath, params)
+		recs, alive, err := s.sourceFacts(ctx, inject, params)
 		if err != nil {
 			return cachedResponse{}, err
 		}
-		recs := sourceFactRecords(merge(alive), inject.name, "", false)
 		resp := cachedResponse{Body: encodeRecords(recs), Records: -1}
 		s.countBackends(&resp, alive)
 		return resp, nil
@@ -764,10 +821,6 @@ func (s *Server) mergeNodesResponse(r *http.Request) func([]backendResult) []jso
 	return func(results []backendResult) []json.RawMessage {
 		return mergeNodes(results, inject)
 	}
-}
-
-func (s *Server) mergeFactsResponse(r *http.Request) func([]backendResult) []json.RawMessage {
-	return s.mergeFactsWith(s.newSourceInjector(r.URL.Query().Get("query"), true))
 }
 
 // The path segment of /facts/<name> is the same outer `name` constraint the

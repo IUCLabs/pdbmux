@@ -247,7 +247,13 @@ matters more.
   friends ask for specific facts, and the synthetic record is not one of them.
   Only the outer query is inspected: a `name` filter inside an `in`/`select_facts`
   subquery narrows which *nodes* match, not which facts come back, so injection
-  still happens;
+  still happens. The exception is a query whose `name` comparison (`=`, `~` or
+  `in` an `array`) selects `pdbmux_source` itself, built only from
+  `and`/`or`/`not` over `=`, `~` and `in`-`array` on `certname`, `environment`,
+  `name` and `value`: it is still fanned out for the real facts it names, and
+  the synthetic records are added after being filtered by the query locally.
+  Their fetch carries only the query's top-level `and` conjuncts on
+  `certname`, so a single-host lookup stays single-host;
 - the path is `/facts/<name>` for any other fact. The path segment is the same
   outer `name` constraint, so only the fact's own path carries the record;
 - injection is turned off (see `source_fact_enabled`).

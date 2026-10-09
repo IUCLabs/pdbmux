@@ -6,6 +6,8 @@ import (
 	"net/url"
 	"reflect"
 	"slices"
+	"sync"
+	"sync/atomic"
 	"testing"
 )
 
@@ -701,5 +703,131 @@ func TestHandler_FactRoutesAreNotCached(t *testing.T) {
 				t.Errorf("backend a saw %d requests for %s, want one per request", got, fanOut)
 			}
 		})
+	}
+}
+
+// PuppetDB clients and puppetboard filter /facts by name with an AST rather than the
+// drilldown path; those queries select the synthetic records the path serves.
+func TestHandler_FactsQuerySelectsSourceFact(t *testing.T) {
+	src := defaultSourceFact
+	tests := []struct {
+		query string
+		want  map[string]string
+	}{
+		{`["=","name","` + src + `"]`, map[string]string{"h1": "a", "h2": "b", "h3": "b"}},
+		{`["and",["=","name","` + src + `"]]`, map[string]string{"h1": "a", "h2": "b", "h3": "b"}},
+		{`["and",["=","name","` + src + `"],["=","value","b"]]`, map[string]string{"h2": "b", "h3": "b"}},
+		{`["and",["=","name","` + src + `"],["not",["~","value","^b$"]]]`, map[string]string{"h1": "a"}},
+		{`["and",["=","certname","h3"],["=","name","` + src + `"]]`, map[string]string{"h3": "b"}},
+		{`["and",["or",["=","name","osfamily"],["=","name","` + src + `"]]]`, map[string]string{"h1": "a", "h2": "b", "h3": "b"}},
+		{`["in","name",["array",["osfamily","` + src + `"]]]`, map[string]string{"h1": "a", "h2": "b", "h3": "b"}},
+		{`["and",["or",["=","name","` + src + `"]],["=","environment","prod"]]`, map[string]string{"h1": "a"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.query, func(t *testing.T) {
+			a, b := sourceFactBackends(t)
+			a.bodies[factsPath] = `[` + factEnv("h1", "osfamily", "RedHat", "prod") + `,` + fact("h1", src, "stale", "") + `]`
+			srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeFreshness))
+
+			rec := doGet(t, srv.Handler(), factsPath, tc.query)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+			}
+			got, n := sourceValues(t, rec.Body.Bytes(), src)
+			if n != len(tc.want) || !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("got %v (%d records), want %v: %s", got, n, tc.want, rec.Body.String())
+			}
+		})
+	}
+}
+
+// The query still reaches the backends, so the real facts it names come back
+// beside the synthetic ones.
+func TestHandler_FactsQueryMixedNamesKeepsRealFacts(t *testing.T) {
+	a, b := sourceFactBackends(t)
+	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeFreshness))
+
+	rec := doGet(t, srv.Handler(), factsPath, `["in","name",["array",["osfamily","`+defaultSourceFact+`"]]]`)
+	if os, _ := sourceValues(t, rec.Body.Bytes(), "osfamily"); len(os) != 3 {
+		t.Errorf("osfamily = %v, want all three nodes: %s", os, rec.Body.String())
+	}
+	if h := rec.Header().Get(backendsHeader); h != "2/2" {
+		t.Errorf("%s = %q, want 2/2", backendsHeader, h)
+	}
+}
+
+// With the feature off the name is an ordinary fact, so the query is fanned out
+// untouched and nothing is synthesised.
+func TestHandler_FactsQuerySourceFactDisabled(t *testing.T) {
+	a, b := sourceFactBackends(t)
+	cfg := testConfig(a.srv.URL, b.srv.URL, mergeFreshness)
+	cfg.SourceFactEnabled = false
+	srv := newTestServer(cfg)
+
+	rec := doGet(t, srv.Handler(), factsPath, `["=","name","`+defaultSourceFact+`"]`)
+	if _, n := sourceValues(t, rec.Body.Bytes(), defaultSourceFact); n != 0 {
+		t.Errorf("disabled feature synthesised %d records: %s", n, rec.Body.String())
+	}
+}
+
+// The synthetic set is fetched with the query's top-level certname conjuncts
+// only, so a single-host lookup never pulls the whole estate.
+func TestHandler_FactsQuerySourceFactNarrowsUpstream(t *testing.T) {
+	a, b := sourceFactBackends(t)
+	var mu sync.Mutex
+	var got []string
+	h3Only := map[*fakeBackend]string{
+		a: `[` + factEnv("h3", "osfamily", "RedHat", "prod") + `]`,
+		b: `[` + factEnv("h3", "osfamily", "Debian", "dev") + `]`,
+	}
+	for fb, body := range h3Only {
+		fb.handle = func(w http.ResponseWriter, r *http.Request) bool {
+			if r.URL.Path != factsPath {
+				return false
+			}
+			q := r.URL.Query().Get("query")
+			mu.Lock()
+			got = append(got, q)
+			mu.Unlock()
+			if q == `["=","certname","h3"]` {
+				_, _ = w.Write([]byte(body))
+				return true
+			}
+			return false
+		}
+	}
+	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeFreshness))
+
+	query := `["and",["=","certname","h3"],["=","environment","dev"],["=","name","` + defaultSourceFact + `"]]`
+	rec := doGet(t, srv.Handler(), factsPath, query)
+	if vals, n := sourceValues(t, rec.Body.Bytes(), defaultSourceFact); n != 1 || vals["h3"] != "b" {
+		t.Fatalf("got %v (%d records), want h3=b: %s", vals, n, rec.Body.String())
+	}
+	for _, q := range got {
+		if q == "" {
+			t.Fatalf("an upstream /facts fetch was unfiltered: %q", got)
+		}
+	}
+	if !slices.Contains(got, `["=","certname","h3"]`) {
+		t.Fatalf("synthetic fetch was not narrowed to the certname: %q", got)
+	}
+}
+
+// A backend lost between the two fetches is reported as missing.
+func TestHandler_FactsQuerySourceFactCountsSecondFetch(t *testing.T) {
+	a, b := sourceFactBackends(t)
+	var calls atomic.Int32
+	b.handle = func(w http.ResponseWriter, r *http.Request) bool {
+		if r.URL.Path == factsPath && calls.Add(1) > 1 {
+			http.Error(w, "boom", http.StatusInternalServerError)
+			return true
+		}
+		return false
+	}
+	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeFreshness))
+
+	rec := doGet(t, srv.Handler(), factsPath, `["=","name","`+defaultSourceFact+`"]`)
+	if h := rec.Header().Get(backendsHeader); h != "1/2" {
+		t.Errorf("%s = %q, want 1/2", backendsHeader, h)
 	}
 }

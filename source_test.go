@@ -234,7 +234,8 @@ func TestHandler_UpstreamSourceFactSuppressedOnEveryGateState(t *testing.T) {
 	}{
 		{"injection on", "", "a"},
 		{"gated by extract", `["extract",["certname","name","value"],["=","certname","h1"]]`, ""},
-		{"gated by name filter", `["=","name","` + defaultSourceFact + `"]`, ""},
+		{"gated by name filter", `["or",["=","name","role"],["=","name","os"]]`, ""},
+		{"selected by name filter", `["or",["=","name","role"],["=","name","` + defaultSourceFact + `"]]`, "a"},
 		{"gated by nested extract", `["and",["=","certname","h1"],["extract",["certname"]]]`, ""},
 	}
 	for _, tc := range tests {
@@ -391,7 +392,6 @@ func TestHandler_SourceNotInjectedWhenNameFiltered(t *testing.T) {
 	for _, q := range []string{
 		`["=","name","role"]`,
 		`["and",["=","certname","h1"],["=","name","role"]]`,
-		`["=","name","` + defaultSourceFact + `"]`,
 	} {
 		rec := doGet(t, srv.Handler(), factsPath, q)
 		if _, n := sourceValues(t, rec.Body.Bytes(), defaultSourceFact); n != 0 {
@@ -566,5 +566,96 @@ func TestMergeFacts_SourceOrderedAfterOwnersFacts(t *testing.T) {
 	want := []string{"h1:role=web-a", "h1:kernel=Linux", "h1:" + defaultSourceFact + "=a"}
 	if !slices.Equal(got, want) {
 		t.Errorf("merged = %v, want %v", got, want)
+	}
+}
+
+func TestMatchFact(t *testing.T) {
+	f := factFields{Certname: "h1", Environment: "prod", Name: defaultSourceFact, Value: "a"}
+	tests := []struct {
+		query     string
+		match, ok bool
+	}{
+		{`["=","name","` + defaultSourceFact + `"]`, true, true},
+		{`["=","name","osfamily"]`, false, true},
+		{`["=","value","a"]`, true, true},
+		{`["=","value",1]`, false, true},
+		{`["=","value",{"a":1}]`, false, true},
+		{`["~","value","^a$"]`, true, true},
+		{`["~","certname","^h"]`, true, true},
+		{`["not",["=","value","a"]]`, false, true},
+		{`["in","name",["array",["osfamily","` + defaultSourceFact + `"]]]`, true, true},
+		{`["in","name",["array",["osfamily"]]]`, false, true},
+		{`["and",["=","certname","h1"],["=","environment","prod"]]`, true, true},
+		{`["and",["=","certname","h1"],["=","environment","dev"]]`, false, true},
+		{`["or",["=","certname","h2"],["=","environment","prod"]]`, true, true},
+		{`["and"]`, true, true},
+		{`["or"]`, false, true},
+		{`["and",["=","name","` + defaultSourceFact + `"],["null?","value",false]]`, false, false},
+		{`["in","certname",["extract",["certname"],["select_nodes",["=","certname","h1"]]]]`, false, false},
+		{`["=","fact_contents","x"]`, false, false},
+		{`["~","value","("]`, false, false},
+		{`["<","value","b"]`, false, false},
+		{`["extract",["certname"],["=","name","x"]]`, false, false},
+	}
+	for _, tc := range tests {
+		var ast []json.RawMessage
+		if err := json.Unmarshal([]byte(tc.query), &ast); err != nil {
+			t.Fatal(err)
+		}
+		if m, ok := matchFact(ast, f); m != tc.match || ok != tc.ok {
+			t.Errorf("matchFact(%s) = %v, %v; want %v, %v", tc.query, m, ok, tc.match, tc.ok)
+		}
+	}
+}
+
+func TestSourceInjector_SourceQuery(t *testing.T) {
+	si := &sourceInjector{name: defaultSourceFact}
+	tests := []struct {
+		query string
+		want  bool
+	}{
+		{`["=","name","` + defaultSourceFact + `"]`, true},
+		{`["and",["=","name","` + defaultSourceFact + `"]]`, true},
+		{`["and",["or",["=","name","ipaddress"],["=","name","` + defaultSourceFact + `"]]]`, true},
+		{`["and",["=","name","` + defaultSourceFact + `"],["not",["~","value","new"]]]`, true},
+		{`["in","name",["array",["ipaddress","` + defaultSourceFact + `"]]]`, true},
+		{`["~","name","^pdbmux"]`, true},
+		{`["=","name","ipaddress"]`, false},
+		{`["=","certname","h1"]`, false},
+		{`["=","value","` + defaultSourceFact + `"]`, false},
+		{`["and",["=","name","` + defaultSourceFact + `"],["in","certname",["extract",["certname"],["select_nodes",["=","certname","h1"]]]]]`, false},
+		{``, false},
+		{`not json`, false},
+	}
+	for _, tc := range tests {
+		if got := si.sourceQuery(tc.query) != nil; got != tc.want {
+			t.Errorf("sourceQuery(%s) = %v, want %v", tc.query, got, tc.want)
+		}
+	}
+	var off *sourceInjector
+	if off.sourceQuery(`["=","name","`+defaultSourceFact+`"]`) != nil {
+		t.Error("disabled injector selected a query")
+	}
+}
+
+func TestCertnameScope(t *testing.T) {
+	tests := map[string]string{
+		`["=","name","x"]`: ``,
+		`["and",["=","name","x"],["=","environment","prod"]]`:                                    ``,
+		`["or",["=","certname","h1"],["=","name","x"]]`:                                          ``,
+		`["and",["not",["=","certname","h1"]],["=","name","x"]]`:                                 ``,
+		`["and",["=","certname","h1"],["=","name","x"]]`:                                         `["=","certname","h1"]`,
+		`["and",["~","certname","["],["=","name","x"]]`:                                          ``,
+		`["and",["in","certname",["extract","certname",["=","a","b"]]],["=","name","x"]]`:        ``,
+		`["and",["in","certname",["array",["h1","h2"]]],["~","certname","^h"],["=","name","x"]]`: `["and",["in","certname",["array",["h1","h2"]]],["~","certname","^h"]]`,
+	}
+	for in, want := range tests {
+		var ast []json.RawMessage
+		if err := json.Unmarshal([]byte(in), &ast); err != nil {
+			t.Fatal(err)
+		}
+		if got := certnameScope(ast); got != want {
+			t.Errorf("certnameScope(%s) = %q, want %q", in, got, want)
+		}
 	}
 }
