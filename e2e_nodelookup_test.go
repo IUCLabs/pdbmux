@@ -84,8 +84,8 @@ func TestNodeLookupShowsProvenance(t *testing.T) {
 		if !strings.Contains(line, defaultSourceFact) {
 			continue
 		}
-		if !strings.Contains(line, backendBName) {
-			t.Fatalf("node-lookup reports %q for %s, want the owning backend %q", strings.TrimSpace(line), nodeShared, backendBName)
+		if !strings.Contains(line, backendBHost) {
+			t.Fatalf("node-lookup reports %q for %s, want the owning backend %q", strings.TrimSpace(line), nodeShared, backendBHost)
 		}
 		return
 	}

@@ -42,6 +42,9 @@ func fixtureTime(offset time.Duration) string {
 const (
 	backendAName = "pdb-a"
 	backendBName = "pdb-b"
+	// The source fact's value is the backend host, so each backend gets its own.
+	backendAHost = backendAName + ".localhost"
+	backendBHost = backendBName + ".localhost"
 )
 
 type nodeFixture struct {

@@ -77,8 +77,8 @@ func TestBackendDeathAndRecovery(t *testing.T) {
 		if got, _ := factValue(facts, nodeShared, "owner"); got != backendAName {
 			t.Errorf("owner of %s with %s down = %v, want %q", nodeShared, h.b.name, got, backendAName)
 		}
-		if got, _ := factValue(facts, nodeShared, defaultSourceFact); got != backendAName {
-			t.Errorf("%s for %s with %s down = %v, want %q", defaultSourceFact, nodeShared, h.b.name, got, backendAName)
+		if got, _ := factValue(facts, nodeShared, defaultSourceFact); got != backendAHost {
+			t.Errorf("%s for %s with %s down = %v, want %q", defaultSourceFact, nodeShared, h.b.name, got, backendAHost)
 		}
 	})
 

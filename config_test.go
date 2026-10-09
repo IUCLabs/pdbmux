@@ -15,7 +15,7 @@ func testConfigValid() Config {
 	cfg := DefaultConfig()
 	cfg.Backends = []Backend{
 		{Name: "a", URL: "http://localhost:18080"},
-		{Name: "b", URL: "http://localhost:18081"},
+		{Name: "b", URL: "http://127.0.0.1:18081"},
 	}
 	return cfg
 }
@@ -57,7 +57,7 @@ func TestLoad_NoBackendsLoadsButFailsValidation(t *testing.T) {
 func TestLoad_BackendsKeepConfiguredOrder(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	clearEnv(t)
-	t.Setenv(envPrefix+"BACKENDS", "a=http://localhost:18080,b=http://localhost:18081")
+	t.Setenv(envPrefix+"BACKENDS", "a=http://localhost:18080,b=http://127.0.0.1:18081")
 
 	cfg, err := Load("")
 	if err != nil {
@@ -229,8 +229,20 @@ func TestValidate(t *testing.T) {
 	}{
 		{"ok", func(*Config) {}, false},
 		{"no backends", func(c *Config) { c.Backends = nil }, true},
-		{"dup name", func(c *Config) { c.Backends = append(c.Backends, Backend{Name: "a", URL: "x"}) }, true},
+		{"dup name", func(c *Config) { c.Backends = append(c.Backends, Backend{Name: "a", URL: "http://c"}) }, true},
 		{"missing url", func(c *Config) { c.Backends[0].URL = "" }, true},
+		{"url without host", func(c *Config) { c.Backends[0].URL = "localhost:18080" }, true},
+		{"shared host on another port", func(c *Config) { c.Backends[1].URL = "http://localhost:18081" }, true},
+		{"same host differing by scheme", func(c *Config) { c.Backends[1].URL = "https://localhost" }, true},
+		{"same host differing by case", func(c *Config) { c.Backends[1].URL = "http://LocalHost:18081" }, true},
+		{"shared host while source fact disabled", func(c *Config) {
+			c.SourceFactEnabled = false
+			c.Backends[1].URL = "http://localhost:18081"
+		}, false},
+		{"url without host while source fact disabled", func(c *Config) {
+			c.SourceFactEnabled = false
+			c.Backends[0].URL = "localhost:18080"
+		}, false},
 		{"bad merge", func(c *Config) { c.Merge = "wrong" }, true},
 		{"zero timeout", func(c *Config) { c.Timeout = 0 }, true},
 		{"empty source fact while enabled", func(c *Config) { c.SourceFact = "" }, true},
@@ -510,5 +522,17 @@ func clearEnv(t *testing.T) {
 		"HEALTH_PROBE_ENABLED", "HEALTH_PROBE_PATH", "HEALTH_PROBE_INTERVAL", "HEALTH_PROBE_TIMEOUT",
 		"HEALTH_PROBE_FAILURES", "HEALTH_PROBE_SUCCESSES"} {
 		t.Setenv(envPrefix+k, "")
+	}
+}
+
+func TestBackendHost(t *testing.T) {
+	for raw, want := range map[string]string{
+		"https://PuppetDB.Example:8081/x": "puppetdb.example",
+		"http://[::1]:8080":               "::1",
+		"localhost:8080":                  "",
+	} {
+		if got := backendHost(raw); got != want {
+			t.Errorf("backendHost(%q) = %q, want %q", raw, got, want)
+		}
 	}
 }
