@@ -6,6 +6,8 @@ import (
 	"net/url"
 	"reflect"
 	"slices"
+	"sync"
+	"sync/atomic"
 	"testing"
 )
 
@@ -767,5 +769,67 @@ func TestHandler_FactsQuerySourceFactDisabled(t *testing.T) {
 	rec := doGet(t, srv.Handler(), factsPath, `["=","name","`+defaultSourceFact+`"]`)
 	if _, n := sourceValues(t, rec.Body.Bytes(), defaultSourceFact); n != 0 {
 		t.Errorf("disabled feature synthesised %d records: %s", n, rec.Body.String())
+	}
+}
+
+// The synthetic set is fetched with the query's top-level certname conjuncts
+// only, so a single-host lookup never pulls the whole estate.
+func TestHandler_FactsQuerySourceFactNarrowsUpstream(t *testing.T) {
+	a, b := sourceFactBackends(t)
+	var mu sync.Mutex
+	var got []string
+	h3Only := map[*fakeBackend]string{
+		a: `[` + factEnv("h3", "osfamily", "RedHat", "prod") + `]`,
+		b: `[` + factEnv("h3", "osfamily", "Debian", "dev") + `]`,
+	}
+	for fb, body := range h3Only {
+		fb.handle = func(w http.ResponseWriter, r *http.Request) bool {
+			if r.URL.Path != factsPath {
+				return false
+			}
+			q := r.URL.Query().Get("query")
+			mu.Lock()
+			got = append(got, q)
+			mu.Unlock()
+			if q == `["=","certname","h3"]` {
+				_, _ = w.Write([]byte(body))
+				return true
+			}
+			return false
+		}
+	}
+	srv := newTestServer(hostedConfig(a.srv.URL, b.srv.URL, mergeFreshness))
+
+	query := `["and",["=","certname","h3"],["=","environment","dev"],["=","name","` + defaultSourceFact + `"]]`
+	rec := doGet(t, srv.Handler(), factsPath, query)
+	if vals, n := sourceValues(t, rec.Body.Bytes(), defaultSourceFact); n != 1 || vals["h3"] != hostB {
+		t.Fatalf("got %v (%d records), want h3=%s: %s", vals, n, hostB, rec.Body.String())
+	}
+	for _, q := range got {
+		if q == "" {
+			t.Fatalf("an upstream /facts fetch was unfiltered: %q", got)
+		}
+	}
+	if !slices.Contains(got, `["=","certname","h3"]`) {
+		t.Fatalf("synthetic fetch was not narrowed to the certname: %q", got)
+	}
+}
+
+// A backend lost between the two fetches is reported as missing.
+func TestHandler_FactsQuerySourceFactCountsSecondFetch(t *testing.T) {
+	a, b := sourceFactBackends(t)
+	var calls atomic.Int32
+	b.handle = func(w http.ResponseWriter, r *http.Request) bool {
+		if r.URL.Path == factsPath && calls.Add(1) > 1 {
+			http.Error(w, "boom", http.StatusInternalServerError)
+			return true
+		}
+		return false
+	}
+	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeFreshness))
+
+	rec := doGet(t, srv.Handler(), factsPath, `["=","name","`+defaultSourceFact+`"]`)
+	if h := rec.Header().Get(backendsHeader); h != "1/2" {
+		t.Errorf("%s = %q, want 1/2", backendsHeader, h)
 	}
 }

@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -404,8 +405,9 @@ func (s *Server) serveFacts(w http.ResponseWriter, r *http.Request) {
 
 // serveSourceFactQuery answers a /facts query that selects the owned fact by
 // name. The query still goes upstream for the real facts it selects; the
-// synthetic records come from the same merge serveSourceFact uses and are
-// filtered by the query locally, since no backend holds them.
+// synthetic records come from the same merge serveSourceFact uses, fetched for
+// the query's certname scope, and are filtered by the query locally, since no
+// backend holds them.
 func (s *Server) serveSourceFactQuery(w http.ResponseWriter, r *http.Request, inject *sourceInjector, ast []json.RawMessage) {
 	params := queryParams(r.URL.Query().Get("query"))
 	s.serveCached(w, r, factsPath, params, func(ctx context.Context) (cachedResponse, error) {
@@ -414,7 +416,7 @@ func (s *Server) serveSourceFactQuery(w http.ResponseWriter, r *http.Request, in
 			return cachedResponse{}, err
 		}
 		recs := s.mergeFactsWith(inject)(alive)
-		synth, _, err := s.sourceFacts(ctx, s.newSourceInjector("", true), nil)
+		synth, scoped, err := s.sourceFacts(ctx, s.newSourceInjector("", true), queryParams(certnameScope(ast)))
 		if err != nil {
 			return cachedResponse{}, err
 		}
@@ -428,9 +430,19 @@ func (s *Server) serveSourceFactQuery(w http.ResponseWriter, r *http.Request, in
 			}
 		}
 		resp := cachedResponse{Body: encodeRecords(recs), Records: -1}
-		s.countBackends(&resp, alive)
+		s.countBackends(&resp, aliveInBoth(alive, scoped))
 		return resp, nil
 	})
+}
+
+func aliveInBoth(a, b []backendResult) []backendResult {
+	var out []backendResult
+	for _, x := range a {
+		if slices.ContainsFunc(b, func(y backendResult) bool { return y.name == x.name }) {
+			out = append(out, x)
+		}
+	}
+	return out
 }
 
 // sourceFacts is the owned fact's synthetic record set for the nodes params
