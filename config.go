@@ -296,7 +296,7 @@ func backendHost(raw string) string {
 	if err != nil {
 		return ""
 	}
-	return u.Hostname()
+	return strings.ToLower(u.Hostname())
 }
 
 func (c Config) Validate() error {
@@ -314,6 +314,9 @@ func (c Config) Validate() error {
 			return fmt.Errorf("duplicate backend name %q", b.Name)
 		}
 		seen[b.Name] = true
+		if !c.SourceFactEnabled {
+			continue
+		}
 		host := backendHost(b.URL)
 		if host == "" {
 			return fmt.Errorf("backend %q url %q has no host", b.Name, b.URL)

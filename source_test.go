@@ -560,10 +560,11 @@ func TestMergeFacts_GatedSuppressesUpstream(t *testing.T) {
 func TestMergeFacts_SourceOrderedAfterOwnersFacts(t *testing.T) {
 	a := recs(t, "a", fact("h1", "role", "web-a", ""), fact("h1", "kernel", "Linux", ""))
 	b := recs(t, "b", fact("h1", "role", "web-b", ""))
-	merged := mergeFacts([]backendResult{a, b}, nil, &sourceInjector{name: defaultSourceFact, inject: true})
+	si := &sourceInjector{name: defaultSourceFact, hosts: map[string]string{"a": "a.example", "b": "b.example"}, inject: true}
+	merged := mergeFacts([]backendResult{a, b}, nil, si)
 
 	got := factValues(t, merged)
-	want := []string{"h1:role=web-a", "h1:kernel=Linux", "h1:" + defaultSourceFact + "=a"}
+	want := []string{"h1:role=web-a", "h1:kernel=Linux", "h1:" + defaultSourceFact + "=a.example"}
 	if !slices.Equal(got, want) {
 		t.Errorf("merged = %v, want %v", got, want)
 	}

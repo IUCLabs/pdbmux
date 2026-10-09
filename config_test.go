@@ -234,6 +234,15 @@ func TestValidate(t *testing.T) {
 		{"url without host", func(c *Config) { c.Backends[0].URL = "localhost:18080" }, true},
 		{"shared host on another port", func(c *Config) { c.Backends[1].URL = "http://localhost:18081" }, true},
 		{"same host differing by scheme", func(c *Config) { c.Backends[1].URL = "https://localhost" }, true},
+		{"same host differing by case", func(c *Config) { c.Backends[1].URL = "http://LocalHost:18081" }, true},
+		{"shared host while source fact disabled", func(c *Config) {
+			c.SourceFactEnabled = false
+			c.Backends[1].URL = "http://localhost:18081"
+		}, false},
+		{"url without host while source fact disabled", func(c *Config) {
+			c.SourceFactEnabled = false
+			c.Backends[0].URL = "localhost:18080"
+		}, false},
 		{"bad merge", func(c *Config) { c.Merge = "wrong" }, true},
 		{"zero timeout", func(c *Config) { c.Timeout = 0 }, true},
 		{"empty source fact while enabled", func(c *Config) { c.SourceFact = "" }, true},
@@ -513,5 +522,17 @@ func clearEnv(t *testing.T) {
 		"HEALTH_PROBE_ENABLED", "HEALTH_PROBE_PATH", "HEALTH_PROBE_INTERVAL", "HEALTH_PROBE_TIMEOUT",
 		"HEALTH_PROBE_FAILURES", "HEALTH_PROBE_SUCCESSES"} {
 		t.Setenv(envPrefix+k, "")
+	}
+}
+
+func TestBackendHost(t *testing.T) {
+	for raw, want := range map[string]string{
+		"https://PuppetDB.Example:8081/x": "puppetdb.example",
+		"http://[::1]:8080":               "::1",
+		"localhost:8080":                  "",
+	} {
+		if got := backendHost(raw); got != want {
+			t.Errorf("backendHost(%q) = %q, want %q", raw, got, want)
+		}
 	}
 }

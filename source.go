@@ -13,7 +13,7 @@ import (
 // callers need no branch.
 type sourceInjector struct {
 	name string
-	// hosts maps backend name to the value emitted; an unmapped name is emitted as-is.
+	// hosts maps backend name to the value emitted.
 	hosts map[string]string
 	// inject is false when the query shape rules synthesis out. Suppression of an
 	// upstream fact of the same name does not depend on it.
@@ -36,13 +36,6 @@ func (s *Server) newSourceInjector(query string, factEntity bool) *sourceInjecto
 // does not depend on the query gate.
 func (si *sourceInjector) claims(factName string) bool {
 	return si != nil && factName != "" && factName == si.name
-}
-
-func (si *sourceInjector) value(backend string) string {
-	if h, ok := si.hosts[backend]; ok {
-		return h
-	}
-	return backend
 }
 
 // injects reports whether this response may carry the synthetic record.
@@ -79,7 +72,7 @@ func (si *sourceInjector) factRecord(certname, backend, environment string) json
 		Environment string `json:"environment"`
 		Name        string `json:"name"`
 		Value       string `json:"value"`
-	}{Certname: certname, Environment: environment, Name: si.name, Value: si.value(backend)})
+	}{Certname: certname, Environment: environment, Name: si.name, Value: si.hosts[backend]})
 	if err != nil {
 		return nil
 	}
@@ -96,7 +89,7 @@ func (si *sourceInjector) stamp(raw json.RawMessage, backend string) json.RawMes
 	if json.Unmarshal(raw, &obj) != nil || obj == nil {
 		return raw
 	}
-	value, err := json.Marshal(si.value(backend))
+	value, err := json.Marshal(si.hosts[backend])
 	if err != nil {
 		return raw
 	}
