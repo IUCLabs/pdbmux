@@ -637,3 +637,25 @@ func TestSourceInjector_SourceQuery(t *testing.T) {
 		t.Error("disabled injector selected a query")
 	}
 }
+
+func TestCertnameScope(t *testing.T) {
+	tests := map[string]string{
+		`["=","name","x"]`: ``,
+		`["and",["=","name","x"],["=","environment","prod"]]`:                                    ``,
+		`["or",["=","certname","h1"],["=","name","x"]]`:                                          ``,
+		`["and",["not",["=","certname","h1"]],["=","name","x"]]`:                                 ``,
+		`["and",["=","certname","h1"],["=","name","x"]]`:                                         `["=","certname","h1"]`,
+		`["and",["~","certname","["],["=","name","x"]]`:                                          ``,
+		`["and",["in","certname",["extract","certname",["=","a","b"]]],["=","name","x"]]`:        ``,
+		`["and",["in","certname",["array",["h1","h2"]]],["~","certname","^h"],["=","name","x"]]`: `["and",["in","certname",["array",["h1","h2"]]],["~","certname","^h"]]`,
+	}
+	for in, want := range tests {
+		var ast []json.RawMessage
+		if err := json.Unmarshal([]byte(in), &ast); err != nil {
+			t.Fatal(err)
+		}
+		if got := certnameScope(ast); got != want {
+			t.Errorf("certnameScope(%s) = %q, want %q", in, got, want)
+		}
+	}
+}

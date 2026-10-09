@@ -210,8 +210,9 @@ func constrainsField(parts []json.RawMessage, field string) bool {
 // sourceQuery returns the parsed /facts query when one of its name comparisons
 // selects the owned fact and the whole query can be evaluated locally against a
 // fact record; nil otherwise, which leaves the query on the gated path.
-// ponytail: a negated name match (["not",["=","name","x"]]) does not select the
-// owned fact; add three-valued evaluation if a client needs it.
+// ponytail: only a name match that is true for the owned fact selects it, so
+// ["not",["=","name","osfamily"]] stays on the gated path and synthesises
+// nothing; widen namesFact if a client needs negated selections.
 func (si *sourceInjector) sourceQuery(query string) []json.RawMessage {
 	if si == nil {
 		return nil
@@ -345,4 +346,34 @@ func matchFact(parts []json.RawMessage, f factFields) (match, ok bool) {
 		return slices.Contains(values, any(got)), true
 	}
 	return false, false
+}
+
+// certnameScope returns the top-level and's certname comparisons as a query,
+// or "" when there are none. Pushing them upstream keeps every record of a
+// selected node on every backend, so the merge's ownership is unchanged; an
+// environment comparison is not pushed because it can hide the owner's records
+// when backends disagree on a node's environment.
+func certnameScope(ast []json.RawMessage) string {
+	var op string
+	if len(ast) < 2 || json.Unmarshal(ast[0], &op) != nil || op != "and" {
+		return ""
+	}
+	var keep []string
+	for _, p := range ast[1:] {
+		var sub []json.RawMessage
+		var field string
+		if json.Unmarshal(p, &sub) != nil || len(sub) != 3 || json.Unmarshal(sub[1], &field) != nil || field != "certname" {
+			continue
+		}
+		if _, ok := matchFact(sub, factFields{}); ok {
+			keep = append(keep, string(p))
+		}
+	}
+	switch len(keep) {
+	case 0:
+		return ""
+	case 1:
+		return keep[0]
+	}
+	return `["and",` + strings.Join(keep, ",") + `]`
 }
