@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -289,12 +290,22 @@ func (c Config) configHint() string {
 	return ConfigPath()
 }
 
+// backendHost is the upstream's hostname, the value of the source fact.
+func backendHost(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	return u.Hostname()
+}
+
 func (c Config) Validate() error {
 	if len(c.Backends) == 0 {
 		return fmt.Errorf("no backends configured: set %sBACKENDS to \"name=url,name=url\" or add a backends list to %s",
 			envPrefix, c.configHint())
 	}
 	seen := map[string]bool{}
+	hosts := map[string]string{}
 	for _, b := range c.Backends {
 		if b.Name == "" || b.URL == "" {
 			return fmt.Errorf("backend requires both name and url: %+v", b)
@@ -303,6 +314,14 @@ func (c Config) Validate() error {
 			return fmt.Errorf("duplicate backend name %q", b.Name)
 		}
 		seen[b.Name] = true
+		host := backendHost(b.URL)
+		if host == "" {
+			return fmt.Errorf("backend %q url %q has no host", b.Name, b.URL)
+		}
+		if other, dup := hosts[host]; dup {
+			return fmt.Errorf("backends %q and %q share host %q; %s values would collide", other, b.Name, host, c.SourceFact)
+		}
+		hosts[host] = b.Name
 	}
 	switch c.Merge {
 	case mergeFreshness, mergeStatic:

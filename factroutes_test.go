@@ -257,15 +257,15 @@ func TestHandler_FactsBySourceNamePathSynthesisesOneRecordPerNode(t *testing.T) 
 	for _, merge := range []string{mergeStatic, mergeFreshness} {
 		t.Run(merge, func(t *testing.T) {
 			a, b := sourceFactBackends(t)
-			srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, merge))
+			srv := newTestServer(hostedConfig(a.srv.URL, b.srv.URL, merge))
 
 			// h3 lives in both: static keeps the first configured backend, freshness
 			// the one holding its newer report.
-			wantH3 := "a"
+			wantH3 := hostA
 			if merge == mergeFreshness {
-				wantH3 = "b"
+				wantH3 = hostB
 			}
-			want := map[string]string{"h1": "a", "h2": "b", "h3": wantH3}
+			want := map[string]string{"h1": hostA, "h2": hostB, "h3": wantH3}
 
 			rec := doGet(t, srv.Handler(), sourceFactURL, "")
 			if rec.Code != http.StatusOK {
@@ -313,20 +313,21 @@ func TestHandler_FactsBySourceNamePathCarriesTheOwnersEnvironment(t *testing.T) 
 	}
 }
 
-// The pinned value names a backend, so the sub-route is the drilldown filtered
-// by owner; a value naming no backend matches nothing.
+// The pinned value is a backend host, so the sub-route is the drilldown filtered
+// by owner; any other value, a backend's name included, matches nothing.
 func TestHandler_FactsBySourceNameAndValueFiltersByOwner(t *testing.T) {
 	for _, tc := range []struct {
 		value string
 		want  map[string]string
 	}{
-		{"a", map[string]string{"h1": "a"}},
-		{"b", map[string]string{"h2": "b", "h3": "b"}},
+		{hostA, map[string]string{"h1": hostA}},
+		{hostB, map[string]string{"h2": hostB, "h3": hostB}},
+		{"a", map[string]string{}},
 		{"nosuchbackend", map[string]string{}},
 	} {
 		t.Run(tc.value, func(t *testing.T) {
 			a, b := sourceFactBackends(t)
-			srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeFreshness))
+			srv := newTestServer(hostedConfig(a.srv.URL, b.srv.URL, mergeFreshness))
 
 			rec := doGet(t, srv.Handler(), sourceFactURL+"/"+tc.value, "")
 			got, n := sourceValues(t, rec.Body.Bytes(), defaultSourceFact)
@@ -375,15 +376,15 @@ func TestHandler_FactsBySourceNameUnknownValueSkipsFanOut(t *testing.T) {
 func TestHandler_FactsBySourceNameValuesFilterOneFetch(t *testing.T) {
 	a := newCountingBackend(t, map[string]string{factsPath: `[` + fact("h1", "osfamily", "RedHat", "") + `]`})
 	b := newCountingBackend(t, map[string]string{factsPath: `[` + fact("h2", "osfamily", "Debian", "") + `]`})
-	srv, _ := newCachedServer(t, cacheTestConfig(a.srv.URL, b.srv.URL))
+	srv, _ := newCachedServer(t, cacheTestConfig(withHost(a.srv.URL, hostA), withHost(b.srv.URL, hostB)))
 
 	for _, tc := range []struct {
 		path string
 		want map[string]string
 	}{
-		{sourceFactURL + "/a", map[string]string{"h1": "a"}},
-		{sourceFactURL + "/b", map[string]string{"h2": "b"}},
-		{sourceFactURL, map[string]string{"h1": "a", "h2": "b"}},
+		{sourceFactURL + "/" + hostA, map[string]string{"h1": hostA}},
+		{sourceFactURL + "/" + hostB, map[string]string{"h2": hostB}},
+		{sourceFactURL, map[string]string{"h1": hostA, "h2": hostB}},
 	} {
 		rec := doGet(t, srv.Handler(), tc.path, "")
 		got, n := sourceValues(t, rec.Body.Bytes(), defaultSourceFact)
@@ -432,12 +433,12 @@ func TestHandler_FactsBySourceNamePathRespectsQuery(t *testing.T) {
 	a, b := sourceFactBackends(t)
 	a.bodies[factsPath] = `[` + factEnv("h1", "osfamily", "RedHat", "prod") + `]`
 	b.bodies[factsPath] = `[]`
-	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeFreshness))
+	srv := newTestServer(hostedConfig(a.srv.URL, b.srv.URL, mergeFreshness))
 
 	const q = `["=","certname","h1"]`
 	rec := doGet(t, srv.Handler(), sourceFactURL, q)
 	got, n := sourceValues(t, rec.Body.Bytes(), defaultSourceFact)
-	if n != 1 || got["h1"] != "a" {
+	if n != 1 || got["h1"] != hostA {
 		t.Fatalf("%s?query=%s = %v (%d records), want only h1: %s", sourceFactURL, q, got, n, rec.Body.String())
 	}
 	// The query has to reach the backends for them to narrow anything.
@@ -455,11 +456,11 @@ func TestHandler_FactsBySourceNamePathSuppressesUpstream(t *testing.T) {
 	a.bodies[factsPath] = `[` + factEnv("h1", "osfamily", "RedHat", "prod") + `,` +
 		fact("h1", defaultSourceFact, "stale", "") + `]`
 	b.bodies[factsPath] = `[]`
-	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeFreshness))
+	srv := newTestServer(hostedConfig(a.srv.URL, b.srv.URL, mergeFreshness))
 
 	rec := doGet(t, srv.Handler(), sourceFactURL, "")
 	got, n := sourceValues(t, rec.Body.Bytes(), defaultSourceFact)
-	if n != 1 || got["h1"] != "a" {
+	if n != 1 || got["h1"] != hostA {
 		t.Fatalf("%s = %v (%d records), want exactly the synthetic one: %s", sourceFactURL, got, n, rec.Body.String())
 	}
 }
@@ -712,20 +713,21 @@ func TestHandler_FactsQuerySelectsSourceFact(t *testing.T) {
 		query string
 		want  map[string]string
 	}{
-		{`["=","name","` + src + `"]`, map[string]string{"h1": "a", "h2": "b", "h3": "b"}},
-		{`["and",["=","name","` + src + `"]]`, map[string]string{"h1": "a", "h2": "b", "h3": "b"}},
-		{`["and",["=","name","` + src + `"],["=","value","b"]]`, map[string]string{"h2": "b", "h3": "b"}},
-		{`["and",["=","name","` + src + `"],["not",["~","value","^b$"]]]`, map[string]string{"h1": "a"}},
-		{`["and",["=","certname","h3"],["=","name","` + src + `"]]`, map[string]string{"h3": "b"}},
-		{`["and",["or",["=","name","osfamily"],["=","name","` + src + `"]]]`, map[string]string{"h1": "a", "h2": "b", "h3": "b"}},
-		{`["in","name",["array",["osfamily","` + src + `"]]]`, map[string]string{"h1": "a", "h2": "b", "h3": "b"}},
-		{`["and",["or",["=","name","` + src + `"]],["=","environment","prod"]]`, map[string]string{"h1": "a"}},
+		{`["=","name","` + src + `"]`, map[string]string{"h1": hostA, "h2": hostB, "h3": hostB}},
+		{`["and",["=","name","` + src + `"]]`, map[string]string{"h1": hostA, "h2": hostB, "h3": hostB}},
+		{`["and",["=","name","` + src + `"],["=","value","` + hostB + `"]]`, map[string]string{"h2": hostB, "h3": hostB}},
+		{`["and",["=","name","` + src + `"],["=","value","b"]]`, map[string]string{}},
+		{`["and",["=","name","` + src + `"],["not",["~","value","^b\\.localhost$"]]]`, map[string]string{"h1": hostA}},
+		{`["and",["=","certname","h3"],["=","name","` + src + `"]]`, map[string]string{"h3": hostB}},
+		{`["and",["or",["=","name","osfamily"],["=","name","` + src + `"]]]`, map[string]string{"h1": hostA, "h2": hostB, "h3": hostB}},
+		{`["in","name",["array",["osfamily","` + src + `"]]]`, map[string]string{"h1": hostA, "h2": hostB, "h3": hostB}},
+		{`["and",["or",["=","name","` + src + `"]],["=","environment","prod"]]`, map[string]string{"h1": hostA}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.query, func(t *testing.T) {
 			a, b := sourceFactBackends(t)
 			a.bodies[factsPath] = `[` + factEnv("h1", "osfamily", "RedHat", "prod") + `,` + fact("h1", src, "stale", "") + `]`
-			srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeFreshness))
+			srv := newTestServer(hostedConfig(a.srv.URL, b.srv.URL, mergeFreshness))
 
 			rec := doGet(t, srv.Handler(), factsPath, tc.query)
 			if rec.Code != http.StatusOK {

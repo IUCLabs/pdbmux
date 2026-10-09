@@ -632,7 +632,7 @@ func TestHandler_LeaderDisconnectDoesNotFailFollowers(t *testing.T) {
 	body := `[` + node("h1", "2026-01-01T00:00:00.000Z") + `]`
 	a := newCountingBackend(t, map[string]string{nodesPath: body})
 	b := newCountingBackend(t, map[string]string{nodesPath: `[]`})
-	srv, _ := newCachedServer(t, cacheTestConfig(a.srv.URL, b.srv.URL))
+	srv, _ := newCachedServer(t, cacheTestConfig(withHost(a.srv.URL, hostA), withHost(b.srv.URL, hostB)))
 	h := srv.Handler()
 
 	release := make(chan struct{})
@@ -673,7 +673,7 @@ func TestHandler_LeaderDisconnectDoesNotFailFollowers(t *testing.T) {
 	}
 	// The leader built this body, so its provenance names the backend that
 	// answered the leader's fan-out.
-	want := `[` + stamped(t, node("h1", "2026-01-01T00:00:00.000Z"), defaultSourceFact, "a") + `]`
+	want := `[` + stamped(t, node("h1", "2026-01-01T00:00:00.000Z"), defaultSourceFact, hostA) + `]`
 	if got := strings.TrimSpace(follower.Body.String()); !sameJSON(t, got, want) {
 		t.Errorf("follower body = %s, want %s", got, want)
 	}
@@ -1488,16 +1488,16 @@ func stamped(t *testing.T, raw, field, value string) string {
 func TestHandler_CachedNodesKeepSourceStamp(t *testing.T) {
 	a := newCountingBackend(t, map[string]string{nodesPath: `[` + node("h1", "2026-01-02T00:00:00.000Z") + `]`})
 	b := newCountingBackend(t, map[string]string{nodesPath: `[` + node("h1", "2026-01-01T00:00:00.000Z") + `]`})
-	srv, _ := newCachedServer(t, cacheTestConfig(a.srv.URL, b.srv.URL))
+	srv, _ := newCachedServer(t, cacheTestConfig(withHost(a.srv.URL, hostA), withHost(b.srv.URL, hostB)))
 	h := srv.Handler()
 
 	first := doGet(t, h, nodesPath, "")
-	if got := nodeSources(t, first.Body.Bytes(), defaultSourceFact); got["h1"] != "a" {
+	if got := nodeSources(t, first.Body.Bytes(), defaultSourceFact); got["h1"] != hostA {
 		t.Fatalf("first request stamp = %v, want h1 -> a", got)
 	}
 
 	second := doGet(t, h, nodesPath, "")
-	want := `[` + stamped(t, node("h1", "2026-01-02T00:00:00.000Z"), defaultSourceFact, "a") + `]`
+	want := `[` + stamped(t, node("h1", "2026-01-02T00:00:00.000Z"), defaultSourceFact, hostA) + `]`
 	if got := strings.TrimSpace(second.Body.String()); !sameJSON(t, got, want) {
 		t.Errorf("cached body = %s, want %s", got, want)
 	}
@@ -1512,7 +1512,7 @@ func TestHandler_CachedNodesKeepSourceStamp(t *testing.T) {
 func TestHandler_CachedSourceAgesWithItsData(t *testing.T) {
 	a := newCountingBackend(t, map[string]string{nodesPath: `[` + node("h1", "2026-01-01T00:00:00.000Z") + `]`})
 	b := newCountingBackend(t, map[string]string{nodesPath: `[]`})
-	srv, clk := newCachedServer(t, cacheTestConfig(a.srv.URL, b.srv.URL))
+	srv, clk := newCachedServer(t, cacheTestConfig(withHost(a.srv.URL, hostA), withHost(b.srv.URL, hostB)))
 	h := srv.Handler()
 
 	doGet(t, h, nodesPath, "")
@@ -1522,7 +1522,7 @@ func TestHandler_CachedSourceAgesWithItsData(t *testing.T) {
 	b.setBody(nodesPath, `[`+node("h1", "2026-01-01T00:00:00.000Z")+`]`)
 
 	cached := doGet(t, h, nodesPath, "")
-	if got := nodeSources(t, cached.Body.Bytes(), defaultSourceFact); got["h1"] != "a" {
+	if got := nodeSources(t, cached.Body.Bytes(), defaultSourceFact); got["h1"] != hostA {
 		t.Errorf("cached stamp = %v, want h1 -> a: the body and its attribution come from the same fetch", got)
 	}
 	if got := a.hitCount(nodesPath); got != 1 {
@@ -1531,7 +1531,7 @@ func TestHandler_CachedSourceAgesWithItsData(t *testing.T) {
 
 	clk.advance(31 * time.Second)
 	rebuilt := doGet(t, h, nodesPath, "")
-	if got := nodeSources(t, rebuilt.Body.Bytes(), defaultSourceFact); got["h1"] != "b" {
+	if got := nodeSources(t, rebuilt.Body.Bytes(), defaultSourceFact); got["h1"] != hostB {
 		t.Errorf("rebuilt stamp = %v, want h1 -> b once the entry expired", got)
 	}
 }

@@ -52,7 +52,9 @@ var errAllBackendsFailed = errors.New("all backends failed")
 const jsonContentType = "application/json;charset=utf-8"
 
 type Server struct {
-	cfg    Config
+	cfg Config
+	// hosts maps backend name to the hostname the source fact reports.
+	hosts  map[string]string
 	client *http.Client
 	log    *log.Logger
 
@@ -82,6 +84,10 @@ func NewServer(cfg Config, logger *log.Logger) *Server {
 		client: &http.Client{Timeout: cfg.Timeout},
 		log:    logger,
 		now:    time.Now,
+		hosts:  map[string]string{},
+	}
+	for _, b := range cfg.Backends {
+		s.hosts[b.Name] = backendHost(b.URL)
 	}
 	if cfg.cacheEnabled() {
 		s.nodeCache = newMemoryCache(cfg.FactsTTL, cfg.CacheBytes)
@@ -464,10 +470,10 @@ func (s *Server) serveFactsByName(w http.ResponseWriter, r *http.Request) {
 // value would be a fresh cache key, a fresh flight and a fresh whole-estate
 // fan-out.
 func (s *Server) serveSourceFact(w http.ResponseWriter, r *http.Request, inject *sourceInjector, value string, valued bool) {
-	// The synthetic record's value is always a backend name, so any other value
+	// The synthetic record's value is always a backend host, so any other value
 	// matches zero records. The response is complete rather than degraded, so it
 	// reports every configured backend.
-	if valued && !s.hasBackend(value) {
+	if valued && !s.hasBackendHost(value) {
 		n := len(s.cfg.Backends)
 		writeCached(w, cachedResponse{Records: -1, Backends: n, Configured: n})
 		return
@@ -493,9 +499,9 @@ func (s *Server) serveSourceFact(w http.ResponseWriter, r *http.Request, inject 
 	})
 }
 
-func (s *Server) hasBackend(name string) bool {
-	for _, b := range s.cfg.Backends {
-		if b.Name == name {
+func (s *Server) hasBackendHost(host string) bool {
+	for _, h := range s.hosts {
+		if h == host {
 			return true
 		}
 	}

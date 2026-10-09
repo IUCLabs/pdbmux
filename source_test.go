@@ -77,7 +77,7 @@ func TestHandler_FactsSourceFollowsMergeOwner(t *testing.T) {
 	b := newFakeBackend(t,
 		`[`+node("h1", "2026-07-01T00:00:00Z")+`,`+node("h2", "2026-07-20T00:00:00Z")+`]`,
 		`[`+factEnv("h1", "role", "web-b", "staging")+`,`+factEnv("h2", "role", "db-b", "staging")+`]`)
-	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeFreshness))
+	srv := newTestServer(hostedConfig(a.srv.URL, b.srv.URL, mergeFreshness))
 
 	rec := doGet(t, srv.Handler(), factsPath, "")
 	if rec.Code != http.StatusOK {
@@ -87,7 +87,7 @@ func TestHandler_FactsSourceFollowsMergeOwner(t *testing.T) {
 	if n != 2 {
 		t.Fatalf("expected one %s record per certname, got %d: %s", defaultSourceFact, n, rec.Body.String())
 	}
-	if got["h1"] != "a" || got["h2"] != "b" {
+	if got["h1"] != hostA || got["h2"] != hostB {
 		t.Errorf("provenance must name the backend that won the merge, got %v", got)
 	}
 }
@@ -127,14 +127,14 @@ func TestHandler_NodesSourceStamped(t *testing.T) {
 	a := newFakeBackend(t,
 		`[`+node("h1", "2026-07-01T00:00:00Z")+`,`+node("h2", "2026-07-20T00:00:00Z")+`]`, `[]`)
 	b := newFakeBackend(t, `[`+node("h1", "2026-07-20T00:00:00Z")+`]`, `[]`)
-	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic))
+	srv := newTestServer(hostedConfig(a.srv.URL, b.srv.URL, mergeStatic))
 
 	rec := doGet(t, srv.Handler(), nodesPath, "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
 	}
 	got := nodeSources(t, rec.Body.Bytes(), defaultSourceFact)
-	if got["h1"] != "b" || got["h2"] != "a" {
+	if got["h1"] != hostB || got["h2"] != hostA {
 		t.Errorf("node provenance = %v, want h1=b h2=a", got)
 	}
 }
@@ -186,13 +186,13 @@ func TestHandler_SourceFactNameOverride(t *testing.T) {
 	a := newFakeBackend(t, `[`+node("h1", "2026-07-20T00:00:00Z")+`]`,
 		`[`+fact("h1", "role", "web", "")+`]`)
 	b := newFakeBackend(t, `[]`, `[]`)
-	cfg := testConfig(a.srv.URL, b.srv.URL, mergeStatic)
+	cfg := hostedConfig(a.srv.URL, b.srv.URL, mergeStatic)
 	cfg.SourceFact = "origin_pdb"
 	srv := newTestServer(cfg)
 
 	facts := doGet(t, srv.Handler(), factsPath, "")
 	got, n := sourceValues(t, facts.Body.Bytes(), "origin_pdb")
-	if n != 1 || got["h1"] != "a" {
+	if n != 1 || got["h1"] != hostA {
 		t.Errorf("override name not honoured: %s", facts.Body.String())
 	}
 	if _, n := sourceValues(t, facts.Body.Bytes(), defaultSourceFact); n != 0 {
@@ -200,7 +200,7 @@ func TestHandler_SourceFactNameOverride(t *testing.T) {
 	}
 
 	nodes := doGet(t, srv.Handler(), nodesPath, "")
-	if got := nodeSources(t, nodes.Body.Bytes(), "origin_pdb"); got["h1"] != "a" {
+	if got := nodeSources(t, nodes.Body.Bytes(), "origin_pdb"); got["h1"] != hostA {
 		t.Errorf("override name not honoured on /nodes: %v", got)
 	}
 }
@@ -211,14 +211,14 @@ func TestHandler_UpstreamSourceFactOverridden(t *testing.T) {
 	a := newFakeBackend(t, `[`+node("h1", "2026-07-20T00:00:00Z")+`]`,
 		`[`+fact("h1", "role", "web", "")+`,`+fact("h1", defaultSourceFact, "stale-value", "")+`]`)
 	b := newFakeBackend(t, `[]`, `[]`)
-	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic))
+	srv := newTestServer(hostedConfig(a.srv.URL, b.srv.URL, mergeStatic))
 
 	rec := doGet(t, srv.Handler(), factsPath, "")
 	got, n := sourceValues(t, rec.Body.Bytes(), defaultSourceFact)
 	if n != 1 {
 		t.Fatalf("expected exactly 1 %s record, got %d: %s", defaultSourceFact, n, rec.Body.String())
 	}
-	if got["h1"] != "a" {
+	if got["h1"] != hostA {
 		t.Errorf("upstream value survived: %v", got)
 	}
 }
@@ -232,10 +232,10 @@ func TestHandler_UpstreamSourceFactSuppressedOnEveryGateState(t *testing.T) {
 		query string
 		want  string // synthetic value, or "" when the gate blocks injection
 	}{
-		{"injection on", "", "a"},
+		{"injection on", "", hostA},
 		{"gated by extract", `["extract",["certname","name","value"],["=","certname","h1"]]`, ""},
 		{"gated by name filter", `["or",["=","name","role"],["=","name","os"]]`, ""},
-		{"selected by name filter", `["or",["=","name","role"],["=","name","` + defaultSourceFact + `"]]`, "a"},
+		{"selected by name filter", `["or",["=","name","role"],["=","name","` + defaultSourceFact + `"]]`, hostA},
 		{"gated by nested extract", `["and",["=","certname","h1"],["extract",["certname"]]]`, ""},
 	}
 	for _, tc := range tests {
@@ -243,7 +243,7 @@ func TestHandler_UpstreamSourceFactSuppressedOnEveryGateState(t *testing.T) {
 			a := newFakeBackend(t, `[`+node("h1", "2026-07-20T00:00:00Z")+`]`,
 				`[`+fact("h1", "role", "web", "")+`,`+fact("h1", defaultSourceFact, upstream, "")+`]`)
 			b := newFakeBackend(t, `[]`, `[]`)
-			srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeStatic))
+			srv := newTestServer(hostedConfig(a.srv.URL, b.srv.URL, mergeStatic))
 
 			rec := doGet(t, srv.Handler(), factsPath, tc.query)
 			if rec.Code != http.StatusOK {
@@ -635,5 +635,24 @@ func TestSourceInjector_SourceQuery(t *testing.T) {
 	var off *sourceInjector
 	if off.sourceQuery(`["=","name","`+defaultSourceFact+`"]`) != nil {
 		t.Error("disabled injector selected a query")
+	}
+}
+
+// The value is the backend URL's hostname alone; the backend name is not used.
+func TestSourceInjector_ValueIsBackendHostname(t *testing.T) {
+	cfg := testConfig("http://puppetdb.puppet.svc.cluster.local:8080", "https://puppetdb.example.com/pdb", mergeStatic)
+	srv := newTestServer(cfg)
+	si := srv.newSourceInjector("", true)
+	for backend, want := range map[string]string{"a": "puppetdb.puppet.svc.cluster.local", "b": "puppetdb.example.com"} {
+		var rec factFields
+		if err := json.Unmarshal(si.factRecord("h1", backend, ""), &rec); err != nil {
+			t.Fatal(err)
+		}
+		if rec.Value != want {
+			t.Errorf("fact value for %s = %q, want %q", backend, rec.Value, want)
+		}
+		if got := nodeSources(t, []byte(`[`+string(si.stamp([]byte(`{"certname":"h1"}`), backend))+`]`), defaultSourceFact); got["h1"] != want {
+			t.Errorf("node stamp for %s = %v, want %q", backend, got, want)
+		}
 	}
 }

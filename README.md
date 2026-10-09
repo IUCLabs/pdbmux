@@ -24,7 +24,7 @@ not PQL) is forwarded verbatim.
 
 | Path | Behaviour |
 |---|---|
-| `GET /pdb/query/v4/nodes` | Fan out to all backends, dedupe by `certname`, keep the record with the newer `report_timestamp`, stamped with the winning backend's name (see provenance). An `extract` query with a `function` column is **combined** instead. |
+| `GET /pdb/query/v4/nodes` | Fan out to all backends, dedupe by `certname`, keep the record with the newer `report_timestamp`, stamped with the winning backend's host (see provenance). An `extract` query with a `function` column is **combined** instead. |
 | `GET /pdb/query/v4/facts` | Fan out to all, and per `certname` keep **all** facts from the backend that owns that node (see merge semantics), plus a synthetic `pdbmux_source` fact naming it. An `extract` query with a `function` column is **combined** instead. |
 | `GET /pdb/query/v4/facts/<name>[/<value>]` | Same fan-out and merge as `/facts`, and an `extract` query with a `function` column is **combined** the same way. The path segment is a `name` constraint, so no synthetic `pdbmux_source` record is added — except on the fact's own path, which is **synthesised** from the `/facts` merge (see provenance). |
 | `GET /pdb/query/v4/fact-names` | Fan out to all and serve the **union** of the flat name arrays, deduped and re-sorted, re-paged across backends, plus the `pdbmux_source` name while injection is on. `order_by` is only valid on `name`. |
@@ -205,8 +205,10 @@ response itself, so nothing has to query each backend to find out:
 
 - **`/facts`** gains one extra fact record per `certname`, alongside the node's
   real facts, in the shape of a real fact record — `certname`, `name`, `value`,
-  `environment` — with `value` set to the **backend name** from `backends` /
-  `PDBMUX_BACKENDS`. `environment` is copied from that node's own facts (all
+  `environment` — with `value` set to the **hostname** of the backend's URL from
+  `backends` / `PDBMUX_BACKENDS` (no scheme or port), e.g.
+  `puppetdb.puppet.svc.cluster.local` for `new=http://puppetdb.puppet.svc.cluster.local:8080`.
+  Two backends may therefore not share a hostname; config validation rejects it. `environment` is copied from that node's own facts (all
   four keys are always present, since clients index them directly).
 - **`/nodes`** gains a `pdbmux_source` **key** on each merged node record. A
   node record carries no facts, so this is a synthetic field, not a fact — the
@@ -266,10 +268,10 @@ response reports, and lets the request's own `query` narrow the result upstream.
 That costs one `/facts` fan-out per request — the widest fan-out `pdbmux`
 makes — on a rare, user-initiated path.
 
-`/facts/pdbmux_source/<value>` pins the backend name, so it answers with the
+`/facts/pdbmux_source/<value>` pins the backend host, so it answers with the
 nodes that backend owns. The `<value>` segment never reaches that fan-out: the
-synthetic record's value is always a backend name, so a value naming none is
-answered `[]` from the configured names alone, with no fan-out at all, and a
+synthetic record's value is always a backend host, so any other value — a
+backend's name included — is answered `[]` from the configured hosts alone, with no fan-out at all, and a
 value naming one filters a record set fetched under a key the value is not part
 of. The record set is a property of the estate rather than of the filter, so
 every value of it — and the unfiltered path — share one entry and one fetch.

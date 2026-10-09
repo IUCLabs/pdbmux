@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -156,6 +157,27 @@ func truncate(t *testing.T, body, limit string) string {
 		t.Fatalf("re-marshal truncated body: %v", err)
 	}
 	return string(out)
+}
+
+// Test backends are reached as hostA/hostB, since the source fact's value is the
+// backend host and both httptest servers listen on 127.0.0.1.
+const (
+	hostA = "a.localhost"
+	hostB = "b.localhost"
+)
+
+func withHost(rawURL, host string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Port() == "" {
+		return rawURL
+	}
+	u.Host = net.JoinHostPort(host, u.Port())
+	return u.String()
+}
+
+// hostedConfig is testConfig with the backends reached as hostA and hostB.
+func hostedConfig(aURL, bURL, merge string) Config {
+	return testConfig(withHost(aURL, hostA), withHost(bURL, hostB), merge)
 }
 
 func testConfig(aURL, bURL, merge string) Config {
