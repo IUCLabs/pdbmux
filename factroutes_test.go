@@ -703,3 +703,67 @@ func TestHandler_FactRoutesAreNotCached(t *testing.T) {
 		})
 	}
 }
+
+// PuppetDB clients and puppetboard filter /facts by name with an AST rather than the
+// drilldown path; those queries select the synthetic records the path serves.
+func TestHandler_FactsQuerySelectsSourceFact(t *testing.T) {
+	src := defaultSourceFact
+	tests := []struct {
+		query string
+		want  map[string]string
+	}{
+		{`["=","name","` + src + `"]`, map[string]string{"h1": "a", "h2": "b", "h3": "b"}},
+		{`["and",["=","name","` + src + `"]]`, map[string]string{"h1": "a", "h2": "b", "h3": "b"}},
+		{`["and",["=","name","` + src + `"],["=","value","b"]]`, map[string]string{"h2": "b", "h3": "b"}},
+		{`["and",["=","name","` + src + `"],["not",["~","value","^b$"]]]`, map[string]string{"h1": "a"}},
+		{`["and",["=","certname","h3"],["=","name","` + src + `"]]`, map[string]string{"h3": "b"}},
+		{`["and",["or",["=","name","osfamily"],["=","name","` + src + `"]]]`, map[string]string{"h1": "a", "h2": "b", "h3": "b"}},
+		{`["in","name",["array",["osfamily","` + src + `"]]]`, map[string]string{"h1": "a", "h2": "b", "h3": "b"}},
+		{`["and",["or",["=","name","` + src + `"]],["=","environment","prod"]]`, map[string]string{"h1": "a"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.query, func(t *testing.T) {
+			a, b := sourceFactBackends(t)
+			a.bodies[factsPath] = `[` + factEnv("h1", "osfamily", "RedHat", "prod") + `,` + fact("h1", src, "stale", "") + `]`
+			srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeFreshness))
+
+			rec := doGet(t, srv.Handler(), factsPath, tc.query)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+			}
+			got, n := sourceValues(t, rec.Body.Bytes(), src)
+			if n != len(tc.want) || !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("got %v (%d records), want %v: %s", got, n, tc.want, rec.Body.String())
+			}
+		})
+	}
+}
+
+// The query still reaches the backends, so the real facts it names come back
+// beside the synthetic ones.
+func TestHandler_FactsQueryMixedNamesKeepsRealFacts(t *testing.T) {
+	a, b := sourceFactBackends(t)
+	srv := newTestServer(testConfig(a.srv.URL, b.srv.URL, mergeFreshness))
+
+	rec := doGet(t, srv.Handler(), factsPath, `["in","name",["array",["osfamily","`+defaultSourceFact+`"]]]`)
+	if os, _ := sourceValues(t, rec.Body.Bytes(), "osfamily"); len(os) != 3 {
+		t.Errorf("osfamily = %v, want all three nodes: %s", os, rec.Body.String())
+	}
+	if h := rec.Header().Get(backendsHeader); h != "2/2" {
+		t.Errorf("%s = %q, want 2/2", backendsHeader, h)
+	}
+}
+
+// With the feature off the name is an ordinary fact, so the query is fanned out
+// untouched and nothing is synthesised.
+func TestHandler_FactsQuerySourceFactDisabled(t *testing.T) {
+	a, b := sourceFactBackends(t)
+	cfg := testConfig(a.srv.URL, b.srv.URL, mergeFreshness)
+	cfg.SourceFactEnabled = false
+	srv := newTestServer(cfg)
+
+	rec := doGet(t, srv.Handler(), factsPath, `["=","name","`+defaultSourceFact+`"]`)
+	if _, n := sourceValues(t, rec.Body.Bytes(), defaultSourceFact); n != 0 {
+		t.Errorf("disabled feature synthesised %d records: %s", n, rec.Body.String())
+	}
+}
