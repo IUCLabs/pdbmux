@@ -154,7 +154,7 @@ func startBackend(ctx context.Context, t fatalf, name, netName string) *backend 
 		fail("starting openvoxdb for %s: %v", name, err)
 	}
 
-	return &backend{name: name, url: fmt.Sprintf("http://127.0.0.1:%d", port), pg: pg, pdb: pdb}
+	return &backend{name: name, url: fmt.Sprintf("http://%s.localhost:%d", name, port), pg: pg, pdb: pdb}
 }
 
 // waitForPuppetDBRunning gates on the trapperkeeper status service reporting

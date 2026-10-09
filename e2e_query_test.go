@@ -286,8 +286,8 @@ func TestSharedNodeResolvesToTheFresherBackend(t *testing.T) {
 	if got := node["report_timestamp"]; got != tsSharedOnB {
 		t.Errorf("merged /nodes report_timestamp for %s = %v, want the fresher %q", nodeShared, got, tsSharedOnB)
 	}
-	if got := node[defaultSourceFact]; got != backendBName {
-		t.Errorf("merged /nodes %s for %s = %v, want %q", defaultSourceFact, nodeShared, got, backendBName)
+	if got := node[defaultSourceFact]; got != backendBHost {
+		t.Errorf("merged /nodes %s for %s = %v, want %q", defaultSourceFact, nodeShared, got, backendBHost)
 	}
 
 	rows := get(t, factsPath, query(`["=","certname","`+nodeShared+`"]`)).rows(t)
@@ -769,10 +769,10 @@ func TestSourceFactInjectionAndGating(t *testing.T) {
 	t.Run("facts carry one source record per node", func(t *testing.T) {
 		rows := get(t, factsPath, nil).rows(t)
 		want := map[string]string{
-			nodeAlpha:  backendAName,
-			nodeBeta:   backendBName,
-			nodeGamma:  backendBName,
-			nodeShared: backendBName, // won on freshness, not on configured order
+			nodeAlpha:  backendAHost,
+			nodeBeta:   backendBHost,
+			nodeGamma:  backendBHost,
+			nodeShared: backendBHost, // won on freshness, not on configured order
 		}
 		got := map[string]int{}
 		for _, row := range rows {
@@ -839,10 +839,10 @@ func TestSourceFactInjectionAndGating(t *testing.T) {
 // records /facts carries rather than the empty set the backends hold.
 func TestSourceFactDrilldown(t *testing.T) {
 	want := map[string]string{
-		nodeAlpha:  backendAName,
-		nodeBeta:   backendBName,
-		nodeGamma:  backendBName,
-		nodeShared: backendBName, // won on freshness, not on configured order
+		nodeAlpha:  backendAHost,
+		nodeBeta:   backendBHost,
+		nodeGamma:  backendBHost,
+		nodeShared: backendBHost, // won on freshness, not on configured order
 	}
 	path := factsPath + "/" + defaultSourceFact
 
@@ -882,8 +882,8 @@ func TestSourceFactDrilldown(t *testing.T) {
 			value string
 			want  []string
 		}{
-			{backendAName, []string{nodeAlpha}},
-			{backendBName, []string{nodeBeta, nodeGamma, nodeShared}},
+			{backendAHost, []string{nodeAlpha}},
+			{backendBHost, []string{nodeBeta, nodeGamma, nodeShared}},
 			{"nosuchbackend", nil},
 		} {
 			rows := get(t, path+"/"+tc.value, nil).rows(t)
