@@ -1,0 +1,6 @@
+defaultBaseImage: gcr.io/distroless/static-debian12:nonroot
+builds:
+  - id: pdbmux
+    main: .
+    ldflags:
+      - -s -w -X main.version={{.Env.VERSION}}

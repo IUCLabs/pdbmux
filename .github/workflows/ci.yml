@@ -1,0 +1,45 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions: {}
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  ci:
+    uses: IUCLabs/workflows/.github/workflows/pre-commit.yml@v0.1.1
+    permissions:
+      contents: read
+    with:
+      go_version_file: go.mod
+
+  actions:
+    uses: IUCLabs/workflows/.github/workflows/actions.yml@v0.1.1
+    permissions:
+      contents: read
+
+  go:
+    uses: IUCLabs/workflows/.github/workflows/go-ci.yml@v0.1.1
+    permissions:
+      contents: read
+      pull-requests: read
+    with:
+      # e2e tests sit behind the e2e build tag and need Docker, so they stay out
+      test_args: -race -count=1 ./...
+
+  image:
+    uses: IUCLabs/workflows/.github/workflows/release-go-image.yml@v0.1.1
+    # the called job declares packages: write for the push; push: false uses none of it
+    permissions:
+      contents: read
+      packages: write
+    with:
+      main: .
+      push: false
+      runs_on: ubuntu-latest

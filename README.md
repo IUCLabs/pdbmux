@@ -585,6 +585,8 @@ curl -s --get http://localhost:8080/pdb/query/v4/nodes \
 
 ## Build
 
+Source: <https://github.com/IUCLabs/pdbmux>.
+
 `make build` (static binary into `dist/`), `make test`, `make lint`. Requires Go 1.25+.
 
 ## End-to-end tests
@@ -614,11 +616,13 @@ Every test asserts; the suite records no known gaps.
 
 ## Deployment
 
-Container image only — no OS package. Every `v*` tag builds and pushes the image
-(the release pipeline); registry and repository are pipeline settings. Tag
-with `make patch` / `minor` / `major`.
+Container image only — no OS package: `ghcr.io/iuclabs/pdbmux:<tag>` (and
+`latest`). Every `v*` tag builds it with ko (`.ko.yaml`) and pushes it via
+`.github/workflows/release.yml`. `make patch` / `minor` / `major` publishes a
+GitHub release with generated notes, then pushes the tag; it needs `gh`.
 
-A static (`CGO_ENABLED=0`) binary on a distroless base. Configure it with
+A static (`CGO_ENABLED=0`) binary on a distroless nonroot base; the entrypoint
+runs `serve` by default. Configure it with
 `PDBMUX_*` env vars (at minimum `PDBMUX_BACKENDS`), or mount a config file — a
 configmap at `/etc/pdbmux/config.yaml` is picked up with no env var at all, and
 any other mount path works via `PDBMUX_CONFIG`. Env vars still override file

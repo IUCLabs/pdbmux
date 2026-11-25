@@ -1,0 +1,16 @@
+name: release
+
+on:
+  push:
+    tags: ["v[0-9]*"]
+
+permissions: {}
+
+jobs:
+  release:
+    uses: IUCLabs/workflows/.github/workflows/release-go-image.yml@v0.1.1
+    permissions:
+      contents: read
+      packages: write
+    with:
+      main: .
