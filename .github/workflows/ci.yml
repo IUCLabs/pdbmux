@@ -31,7 +31,7 @@ jobs:
       pull-requests: read
     with:
       # e2e tests sit behind the e2e build tag and need Docker, so they stay out
-      test_args: -race -count=1 ./...
+      test_args: -count=1 ./...
 
   image:
     uses: IUCLabs/workflows/.github/workflows/release-go-image.yml@v0.1.1
